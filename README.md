@@ -176,9 +176,9 @@ To turn this into a defensible research comparison:
 
 ## License & citation
 
-Licensed under **CC BY-NC 4.0** (see `LICENSE`): you may use, share and adapt the
-material **with attribution**, for **non-commercial** purposes only. If you use
-this work, please cite it via `CITATION.cff`.
+Licensed under **CC BY 4.0** (see `LICENSE`): you may use, share and adapt the
+material, including commercially, **with attribution**. If you use this work,
+please cite it via `CITATION.cff`.
 
-Note: CC licenses are intended for creative works rather than software; this choice
-restricts commercial use by design.
+Note: CC licenses are intended for creative works rather than software; for a pure
+software project, Apache-2.0 or MIT is the more conventional choice.

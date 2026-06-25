@@ -5,7 +5,7 @@ authors:
   - family-names: "Mimouni"
     given-names: "A."
 repository-code: "https://github.com/Tomahawk888/cuda-codebook"
-license: CC-BY-NC-4.0
+license: CC-BY-4.0
 version: "0.1.0"
 date-released: "2026-06-25"
 keywords:
