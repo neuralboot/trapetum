@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "cuda-codebook: fused CUDA kernels for codebook-quantized LLM linear layers"
+authors:
+  - family-names: "Mimouni"
+    given-names: "A."
+repository-code: "https://github.com/Tomahawk888/cuda-codebook"
+license: CC-BY-NC-4.0
+version: "0.1.0"
+date-released: "2026-06-25"
+keywords:
+  - CUDA
+  - GPU kernels
+  - LLM inference
+  - weight quantization
+  - codebook quantization
+abstract: >
+  A kernel-level study of fused dequantization plus matmul for codebook
+  (non-uniform / k-means) weight quantization of LLM linear layers. The lookup is
+  folded into the GEMV/GEMM so the dequantized weight matrix is never materialized.
+  Throughput is benchmarked against cuBLAS fp16 on synthetic data with fixed seed.
+  This repository measures kernel performance only; it does not evaluate model
+  accuracy.

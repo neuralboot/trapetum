@@ -1,0 +1,7 @@
+# benchmark.py uses the Python standard library only (Python 3.8+).
+# There are no pip dependencies.
+#
+# System requirements (not installable via pip):
+#   - an NVIDIA GPU (compute capability sm_80 or newer for the mma.sync / cp.async paths)
+#   - the CUDA toolkit with `nvcc` on PATH (tested with CUDA 11.8)
+#   - `nvidia-smi` on PATH (used to capture GPU / driver info)

@@ -1,0 +1,36 @@
+Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)
+
+SPDX-License-Identifier: CC-BY-NC-4.0
+
+Copyright (c) 2026 A. Mimouni
+
+This work (the "cuda-codebook" repository: source code, kernels, documentation and
+benchmark results) is licensed under the Creative Commons
+Attribution-NonCommercial 4.0 International License.
+
+You are free to:
+  - Share  : copy and redistribute the material in any medium or format.
+  - Adapt  : remix, transform, and build upon the material.
+
+Under the following terms:
+  - Attribution : You must give appropriate credit (cite the author and this
+    repository), provide a link to the license, and indicate if changes were made.
+  - NonCommercial : You may not use the material for commercial purposes.
+  - No additional restrictions : You may not apply legal terms or technological
+    measures that legally restrict others from doing anything the license permits.
+
+THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.
+
+The full, authoritative legal text governing this license is published by Creative
+Commons and available at:
+
+  https://creativecommons.org/licenses/by-nc/4.0/legalcode
+
+Human-readable summary (not a substitute for the license):
+
+  https://creativecommons.org/licenses/by-nc/4.0/
+
+Note: To have GitHub auto-detect the license, you may replace this file with the
+full official CC BY-NC 4.0 legal code (available verbatim from GitHub's
+"Add a license" template picker or the URL above). This notice applies the same
+license regardless.
