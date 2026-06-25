@@ -1,0 +1,15 @@
+# compiled binaries / objects
+*.o
+*.out
+*.exe
+.DS_Store
+*.swp
+# compiled executables built from the .cu sources (no extension)
+bench
+gemv
+gemv4
+prof
+p[0-9]*
+prof[0-9]*
+# never ignore source files
+!*.cu
