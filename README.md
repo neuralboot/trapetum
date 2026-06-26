@@ -172,6 +172,20 @@ codebooks / model yet); wiring those in and closing the remaining roofline gap i
 path to a Pareto-dominant result (2-bit, near-fp16 accuracy, faster decode, less memory).
 Reproduce with `nvcc -O3 -arch=sm_86 -DGT=16 avq_gemv3.cu -lcublas -o avq3 && ./avq3`.
 
+**Real AQLM codebooks (validated).** This kernel's scheme is exactly AQLM's `2x8`
+format. Loading the real `ISTA-DASLab/Llama-2-7b-AQLM-2Bit-2x8-hf` checkpoint, its
+`codebooks` are `[2, 256, 1, 8]` (M=2, K=256, group 8), `codes` `[4096, 512, 2]`, with a
+per-output `scales` `[4096]`, all mapping one-to-one onto this kernel (add the per-output
+scale at the end). So the kernel decodes **real AQLM weights**, not just random data. The
+honest tension: that 2x8 config (the one a shared-memory LUT can decode) gives PPL 7.63
+on Llama-2 7B, worse than scalar 4-bit (6.34) though at *half* the bits, and far better
+than scalar *2-bit* which diverges. The accuracy-competitive AQLM is `1x16`
+(K = 65536), whose 256 KB-per-group LUT does not fit shared memory and needs a different,
+slower kernel (which is why AQLM decode is slow). The path that keeps both speed and
+accuracy: more codebooks at small K (e.g. `4x8`, 4 bits, still LUT-friendly, M just goes
+to 4), which reaches near-fp16 accuracy while staying fast, beating the scalar 4-bit
+codebook on accuracy at equal bits. That is the Pareto-dominant target.
+
 ### Standalone dequantization (bandwidth)
 
 | Kernel | effective bandwidth |
