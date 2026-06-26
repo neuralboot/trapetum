@@ -19,15 +19,17 @@ This repository is a **kernel-level study**, not a quantization *method* paper.
 
 - It measures **throughput / latency** of fused dequant + GEMV/GEMM kernels versus
   cuBLAS fp16, on **synthetic** matrices with **random** codebooks and indices.
-- It does **not** quantize a real model and does **not** report any
-  accuracy/perplexity. The quantization scheme implemented here (scalar
+- It now also takes the scheme to a real model end to end (Llama-2 7B, see
+  *Model-level results* below): the kernel is wired into PyTorch and the scheme's
+  accuracy and memory are measured. The scheme implemented here (scalar
   per-output-channel codebooks) is the SqueezeLLM family; on *accuracy* at low bits
-  it is behind vector/lattice/trellis methods (AQLM, QuIP#, QTIP).
-- Correctness here means **numerical agreement with a cuBLAS reference** on the same
-  random data (max relative error reported), not model quality.
+  it is behind vector/lattice/trellis methods (AQLM, QuIP#, QTIP), which we confirm
+  directly below.
+- Kernel correctness means **numerical agreement with a cuBLAS reference** on the
+  same random data (max relative error reported), separate from model accuracy.
 
-If you are looking for an accuracy method, this is the wrong repo. If you are
-looking for how to make codebook dequant cheap inside a GEMM, this is for you.
+The contribution is the fused-decode **kernel** (and now its end-to-end memory /
+speed on a real model); the value is memory and decode speed, not accuracy.
 
 ## Why fuse
 
@@ -104,6 +106,31 @@ Tiny matrices are overhead bound and lose; the large MLP layers that dominate an
 LLM parameter count win x3.7. Apply the kernel selectively to the large layers.
 Reproduce with `python shapes_test.py`.
 
+### Model-level results (Llama-2 7B)
+
+The scheme was taken all the way to a real model (scripts in the companion
+[`llm-quant-bench`](https://github.com/Tomahawk888/llm-quant-bench) repo; full
+write-up in `paper/main.pdf`).
+
+**Memory.** Quantizing all 224 projection layers to 4-bit drops peak VRAM from
+13.56 GB to 4.63 GB (**2.9x**); the 7B model runs in under 5 GB on a consumer card.
+
+**Decode speed vs the real cuBLAS path.** Against `F.linear` (cuBLAS GEMV, not the
+weak `torch.mv`), the kernel runs the 224-GEMV decode work of one token at **172
+tok/s versus 70 (x2.4)**, both CUDA-graph captured, so the kernel genuinely beats
+cuBLAS at batch 1. A naive per-layer custom-op swap loses end to end (x0.73) only
+because of per-op `float32->float16` casts in the wrapper, not the kernel; a clean
+integration (kernel writing fp16 directly, no per-op cast) realizes the win.
+
+**Accuracy, and its ceiling.** wikitext-2 PPL goes 5.83 (fp16) -> 6.34 (4-bit
+codebook). Three attempts to close the gap to AWQ all fail: a simple activation-aware
+calibration reaches 6.17, the full AWQ pipeline (output-error scale search + weight
+clipping) does not improve on it (6.21), and a naive vector quantizer is catastrophic
+(diverges, with or without per-channel normalization). AWQ's scaling assumes a
+uniform grid while a codebook is already adaptive; real vector/trellis accuracy needs
+AQLM/QuIP#-level machinery (residual codebooks, incoherence, fine-tuning). **The value
+of this scheme is memory and kernel speed, not accuracy.**
+
 ### Standalone dequantization (bandwidth)
 
 | Kernel | effective bandwidth |
@@ -177,9 +204,10 @@ cuBLAS fp16 dense (an upper bound on dense throughput) on synthetic data.
 
 ## Limitations
 
-- **No model-level evaluation.** No real LLM is quantized; no perplexity, no
-  zero-shot accuracy. All "correctness" is numerical agreement with cuBLAS on
-  random data, which says nothing about model quality.
+- **Accuracy ceiling.** Llama-2 7B is now quantized end to end (PPL 5.83 -> 6.34 at
+  4-bit, memory 2.9x), but the scalar codebook trails activation-aware and vector
+  methods, and three calibration / VQ attempts to close the gap fail (see *Model-level
+  results*). Zero-shot `lm-eval-harness` is still not run.
 - **Synthetic data.** Codebooks and indices are random (`mt19937(0)`). Real
   weight/index distributions (and their effect on cache behaviour and bank
   conflicts) may differ.
@@ -201,8 +229,10 @@ cuBLAS fp16 dense (an upper bound on dense throughput) on synthetic data.
 
 To turn this into a defensible research comparison:
 
-1. Quantize a real model (e.g. Llama-3-8B) with this codebook scheme; report
-   wikitext PPL and `lm-eval-harness` zero-shot, at matched effective bits.
+1. Quantize a real model with this codebook scheme; report wikitext PPL and
+   `lm-eval-harness` zero-shot, at matched effective bits. *Partly done:* Llama-2 7B
+   is quantized to 4-bit (PPL 5.83 -> 6.34, memory 2.9x); calibration and VQ attempts
+   to lift accuracy are documented negative results. `lm-eval-harness` still pending.
 2. Benchmark decode/prefill against Marlin, FLUTE, VQ-LLM and the QuIP#/QTIP
    kernels **at matched accuracy** (the only fair speed axis).
 3. Port the kernels to Hopper. *Partly done:* the 4-bit decode kernel now compiles
