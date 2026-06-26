@@ -260,9 +260,14 @@ adds only about 6 percent over eager, so launch overhead is not the dominant cos
 Against the real cuBLAS GEMV path (F.linear), the kernel runs the 224-GEMV decode
 work at 172 tok/s versus 70 (2.4x), both CUDA-graphed, so the kernel genuinely beats
 cuBLAS at batch 1. The end-to-end 0.73x came from the naive wrapper's per-op
-float32-to-float16 cast and copy, not the kernel: a clean integration (the kernel
-writing fp16 directly, no per-op cast) realizes the win. The memory win is immediate;
-the speed win needs that clean integration, of the kind serving engines provide.
+float32-to-float16 cast and copy, not the kernel. We then built the clean integration:
+the kernel writes fp16 into preallocated buffers (no per-op cast or allocation) and the
+decode step is captured as a single CUDA graph over a static-cache decode loop, the way
+serving engines run. Under this integration the codebook model decodes 123.4 versus
+61.6 tok/s against fp16 on an RTX 4090 (2.0x end-to-end) at 4.73 versus 13.58 GB. So the
+op-level 2.4x is realized as a 2.0x end-to-end decode speedup once the per-token python
+overhead is removed; the arc is 0.73x (naive) to 0.85x (cast-free eager) to 2.0x
+(CUDA-graphed). The kernel makes a real 7B decode twice as fast at a third of the memory.
 
 \section{Negative results}
 We keep failed variants in the repository, because they constrain the design space.
