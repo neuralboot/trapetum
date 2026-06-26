@@ -85,6 +85,25 @@ thread-block-cluster distributed shared memory (`gemv_codebook_hopper.cu`) came 
 remote DSMEM. Kept in the repo as a documented dead end, alongside an L2-codebook /
 X-staging sweep (`gemv_codebook_hopper_v3.cu`) where every variant regressed.
 
+### PyTorch binding and per-layer speedup
+
+`quant_demo.py` wraps the kernel as a torch custom op (`codebook_gemv`) plus a
+per-column k-means quantize recipe, verified end to end on a real weight (rel. err
+2.3e-7 vs the reconstruction). The decode speedup vs a torch dense fp16 mat-vec
+(`torch.mv`, the batch-1 path a real fp16 `Linear` runs) grows with layer size,
+measured on an RTX 4090:
+
+| layer (IC x OC) | speedup vs torch dense fp16 |
+|---|---:|
+| 3072 x 768 (small)        | x0.58 (loses, overhead bound) |
+| 4096 x 4096               | x2.10 |
+| 11008 x 4096 (MLP down)   | x3.70 |
+| 4096 x 11008 (MLP up)     | x3.77 |
+
+Tiny matrices are overhead bound and lose; the large MLP layers that dominate an
+LLM parameter count win x3.7. Apply the kernel selectively to the large layers.
+Reproduce with `python shapes_test.py`.
+
 ### Standalone dequantization (bandwidth)
 
 | Kernel | effective bandwidth |
@@ -204,6 +223,11 @@ To turn this into a defensible research comparison:
 - `gemv_codebook_hopper_v3.cu` - H100 tuning sweep (L2 codebook / X-staging); all
   knobs regress vs v2.
 - `plot_speedup.py` - renders `gpu_speedup.png` from the measured per-GPU numbers.
+- `quant_demo.py` - PyTorch custom op (`codebook_gemv`) + per-column quantize recipe,
+  verified end to end on a real GPT-2 weight.
+- `shapes_test.py` - speedup of the torch op vs dense fp16 across layer shapes.
+- `gemv_codebook_v2decode.cu` - atomic-free two-pass decode experiment (recorded
+  negative result: even with the atomic version, the atomic was not the bottleneck).
 - `gemv_codebook.cu` - decode GEMV, uint8 indices (K <= 256).
 - `codebook_quant.cu` - reference on-the-fly dequant kernel + first fused GEMV.
 - `bench.cu` - decode + dequant benchmark harness vs cuBLAS.
