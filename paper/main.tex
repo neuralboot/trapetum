@@ -225,7 +225,10 @@ k-means) and evaluated end to end on an RTX 4090.
 \textbf{Accuracy.} wikitext-2 perplexity goes from 5.83 (fp16) to 6.34 (codebook
 4-bit), a 0.51 increase. The model stays usable, but the scheme trails
 activation-aware AWQ (about 0.1 PPL at 4 bits), as expected for a scalar codebook
-trained on raw weight error without calibration or outlier handling.
+trained on raw weight error without calibration or outlier handling. A simple
+activation-aware calibration (weighting the per-column k-means by mean activation
+magnitude, the core idea of AWQ) closes about a third of the gap, from 6.34 to 6.17;
+a full scale search would close more.
 
 \textbf{Memory.} Peak VRAM drops from 13.56~GB to 4.63~GB (2.9x), so the 7B model
 runs in under 5~GB on a consumer card.
@@ -235,8 +238,12 @@ layer shapes (Section 5.1). But a naive per-layer custom-op swap is overhead bou
 end-to-end decode goes from 44 to 32 tok/s (0.73x). The per-op launch and dispatch
 overhead, paid 224 times per token, dominates, while the fp16 baseline uses a fused
 optimized path. Realizing the per-GEMV speedup at the model level needs framework
-integration (CUDA graphs, fused dispatch), not a per-layer swap. The memory win is
-immediate; the speed win needs the integration that serving engines provide.
+integration (CUDA graphs, fused dispatch), not a per-layer swap. We verified the
+kernel is CUDA-graph compatible (capture is numerically correct once the kernel
+launches on the captured stream), but in an isolated 224-GEMV decode loop a graph
+adds only about 6 percent over eager, so launch overhead is not the dominant cost;
+the per-op casts and the fused fp16 reference are. The memory win is immediate; the
+speed win needs the fused integration that serving engines provide.
 
 \section{Negative results}
 We keep failed variants in the repository, because they constrain the design space.
