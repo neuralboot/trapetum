@@ -150,21 +150,27 @@ C_m[k]>` is built once in shared memory, then `y[o] = sum_g sum_m LUT[m][code_m[
 The kernel reads the **codes**, never the dense weight: at 2 bits (M=2, K=256, D=8) that
 is 4.2 MB of codes vs 33.6 MB of fp16 weight.
 
-Measured at `4096x4096`, batch 1, vs a live cuBLAS fp16 GEMV (rel. err 2.3e-4):
+Measured at `4096x4096`, batch 1, vs a live cuBLAS fp16 GEMV (rel. err 2.3e-4, all
+verified):
 
 | GPU | additive-VQ 2-bit vs cuBLAS fp16 |
 |---|---:|
-| RTX 4090 (~1.0 TB/s) | x1.25 |
-| A40 (~0.7 TB/s) | **x2.39** |
+| RTX 4090 (~1.0 TB/s) | x1.71 |
+| A40 (~0.7 TB/s) | **x4.30** |
 
-So a fused **2-bit** decode kernel already beats cuBLAS, more so on bandwidth-bound
-GPUs (the same bandwidth law), at a bit rate where accuracy is near fp16. This is the
-combination the scalar scheme could not reach (accuracy *and* speed). It is a first,
-unoptimized cut (sync / occupancy bound, far from the ~4 MB memory roofline), and uses
-random codebooks (no real AQLM codebooks / model yet). Tuning it toward the roofline and
-wiring real additive codebooks into a model is the path to a Pareto-dominant result
-(2-bit, near-fp16 accuracy, faster decode, less memory). Reproduce with
-`nvcc -O3 -arch=sm_86 -DGS=64 avq_gemv.cu -lcublas -o avq && ./avq`.
+So a fused **2-bit** decode kernel beats cuBLAS by up to **4.3x**, more so on
+bandwidth-bound GPUs (the same bandwidth law), at a bit rate where accuracy is near
+fp16. This is the combination the scalar scheme could not reach (accuracy *and* speed).
+
+Tuning trail (`avq_gemv.cu` v1 -> `avq_gemv2.cu` -> `avq_gemv3.cu`): the first cut sat
+at ~22% of the memory roofline. Reducing syncs (v2, group-tile LUT) did *not* help, the
+bottleneck was the 1-byte code reads, not synchronization. Reading 4 codes per thread as
+one **uint32** (v3) lifted the A40 from x2.35 to **x4.30** (153 -> 277 GB/s effective,
+~40% roofline). Optimal group tile GT=16 (GT>=20 overflows static shared memory and
+silently fails to launch, an easy trap). Still uses random codebooks (no real AQLM
+codebooks / model yet); wiring those in and closing the remaining roofline gap is the
+path to a Pareto-dominant result (2-bit, near-fp16 accuracy, faster decode, less memory).
+Reproduce with `nvcc -O3 -arch=sm_86 -DGT=16 avq_gemv3.cu -lcublas -o avq3 && ./avq3`.
 
 ### Standalone dequantization (bandwidth)
 
@@ -280,8 +286,10 @@ To turn this into a defensible research comparison:
 ## File guide
 
 - `gemv_codebook_4bit.cu` - decode GEMV, 4-bit packed indices (K <= 16). Fastest scalar.
-- `avq_gemv.cu` - fused additive vector-quantization (AQLM-style) decode GEMV, LUT-based,
-  2-bit; beats cuBLAS (x2.39 on A40). The accuracy-frontier direction (preliminary).
+- `avq_gemv.cu` / `avq_gemv2.cu` / `avq_gemv3.cu` - fused additive vector-quantization
+  (AQLM-style) decode GEMV, LUT-based, 2-bit. v1 (split-K) -> v2 (group-tile LUT, sync
+  reduction, no help) -> v3 (vectorized uint32 code reads, **x4.30 on A40**). The
+  accuracy-frontier + speed direction (preliminary, random codebooks).
 - `gemv_codebook_hopper_v2.cu` - the 4-bit decode GEMV with a live cuBLAS baseline,
   built per-arch (`sm_89`/`sm_90`/...); prints the device name + speedup. Source of
   the cross-GPU table above.
