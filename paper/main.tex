@@ -228,10 +228,16 @@ activation-aware AWQ (about 0.1 PPL at 4 bits), as expected for a scalar codeboo
 trained on raw weight error without calibration or outlier handling. A simple
 activation-aware calibration (weighting the per-column k-means by mean activation
 magnitude, the core idea of AWQ) closes about a third of the gap, from 6.34 to 6.17.
-A fuller per-channel AWQ-style scale search (grid over the scale exponent) did not
-improve on this (6.18): the simple weighting already captures the activation-aware
-gain. Closing the remaining gap to AWQ needs the full pipeline (output-error
-calibration, weight clipping, and outlier handling), not just a scale search.
+Going further does not help. A per-channel scale search (grid over the scale
+exponent) lands at 6.18, and the complete AWQ pipeline, per-channel scaling and
+weight clipping both selected by the real output error on cached activations, does
+not improve either (6.21, marginally worse). The reason is structural: AWQ's
+per-channel scaling is designed for a fixed uniform quantization grid, where it
+redistributes resolution toward important channels. A codebook is already adaptive
+per column (k-means places centroids on each column's distribution), so the scaling
+buys little and the extra calibration only adds noise. Closing the gap to vector and
+trellis methods (AQLM, QTIP) needs a better quantizer, not AWQ's tricks bolted onto a
+scalar codebook.
 
 \textbf{Memory.} Peak VRAM drops from 13.56~GB to 4.63~GB (2.9x), so the 7B model
 runs in under 5~GB on a consumer card.
