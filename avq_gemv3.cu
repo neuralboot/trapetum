@@ -12,7 +12,9 @@
 #include <random>
 #include <vector>
 
-#define M 2
+#ifndef M
+#define M 2          // additive codebooks (M=2 -> 2-bit, M=4 -> 4-bit at K=256, D=8)
+#endif
 #define K 256
 #define D 8
 #define CPB 256

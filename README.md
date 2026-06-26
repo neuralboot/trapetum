@@ -181,10 +181,16 @@ honest tension: that 2x8 config (the one a shared-memory LUT can decode) gives P
 on Llama-2 7B, worse than scalar 4-bit (6.34) though at *half* the bits, and far better
 than scalar *2-bit* which diverges. The accuracy-competitive AQLM is `1x16`
 (K = 65536), whose 256 KB-per-group LUT does not fit shared memory and needs a different,
-slower kernel (which is why AQLM decode is slow). The path that keeps both speed and
-accuracy: more codebooks at small K (e.g. `4x8`, 4 bits, still LUT-friendly, M just goes
-to 4), which reaches near-fp16 accuracy while staying fast, beating the scalar 4-bit
-codebook on accuracy at equal bits. That is the Pareto-dominant target.
+slower kernel (which is why AQLM decode is slow). We tested the `4x8` path (M=4, 4 bits). The kernel stays fast (M=4 decodes at **x2.39**
+on the A40, GT=4, verified), but a *greedy* additive (residual) fit only **ties** the
+scalar 4-bit codebook on accuracy (PPL 6.32 vs 6.34), and at 2-bit a greedy fit diverges
+(PPL ~1900, far worse than AQLM's *trained* 2x8 at 7.63). So the additive *structure*
+alone does not beat scalar; AQLM's accuracy comes from its *training* (calibration +
+beam-search code assignment), not the structure, and reproducing that is a separate
+effort. Honest state: this kernel is the fast-decode path for additive VQ and decodes
+real AQLM weights, but a Pareto win needs trained codebooks at a kernel-friendly config,
+which greedy fitting does not reach. The genuine niche today is making *usable* low-bit
+decode fast: AQLM-2x8 2-bit runs at x4.27 where the scalar 2-bit codebook diverges.
 
 ### Standalone dequantization (bandwidth)
 
