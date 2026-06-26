@@ -119,8 +119,11 @@ write-up in `paper/main.pdf`).
 weak `torch.mv`), the kernel runs the 224-GEMV decode work of one token at **172
 tok/s versus 70 (x2.4)**, both CUDA-graph captured, so the kernel genuinely beats
 cuBLAS at batch 1. A naive per-layer custom-op swap loses end to end (x0.73) only
-because of per-op `float32->float16` casts in the wrapper, not the kernel; a clean
-integration (kernel writing fp16 directly, no per-op cast) realizes the win.
+because of per-op `float32->float16` casts in the wrapper, not the kernel. Building
+the clean integration (kernel writes fp16 into preallocated buffers, decode step
+captured as one CUDA graph over a static-cache loop) **realizes the win: the codebook
+model decodes 123.4 vs 61.6 tok/s vs fp16 (x2.0 end-to-end) at 4.73 vs 13.58 GB.** The
+arc is x0.73 (naive) -> x0.85 (cast-free eager) -> **x2.0 (CUDA-graphed)**.
 
 **Accuracy, and its ceiling.** wikitext-2 PPL goes 5.83 (fp16) -> 6.34 (4-bit
 codebook). Three attempts to close the gap to AWQ all fail: a simple activation-aware
