@@ -182,15 +182,18 @@ on Llama-2 7B, worse than scalar 4-bit (6.34) though at *half* the bits, and far
 than scalar *2-bit* which diverges. The accuracy-competitive AQLM is `1x16`
 (K = 65536), whose 256 KB-per-group LUT does not fit shared memory and needs a different,
 slower kernel (which is why AQLM decode is slow). We tested the `4x8` path (M=4, 4 bits). The kernel stays fast (M=4 decodes at **x2.39**
-on the A40, GT=4, verified), but a *greedy* additive (residual) fit only **ties** the
-scalar 4-bit codebook on accuracy (PPL 6.32 vs 6.34), and at 2-bit a greedy fit diverges
-(PPL ~1900, far worse than AQLM's *trained* 2x8 at 7.63). So the additive *structure*
-alone does not beat scalar; AQLM's accuracy comes from its *training* (calibration +
-beam-search code assignment), not the structure, and reproducing that is a separate
-effort. Honest state: this kernel is the fast-decode path for additive VQ and decodes
-real AQLM weights, but a Pareto win needs trained codebooks at a kernel-friendly config,
-which greedy fitting does not reach. The genuine niche today is making *usable* low-bit
-decode fast: AQLM-2x8 2-bit runs at x4.27 where the scalar 2-bit codebook diverges.
+on the A40, GT=4, verified). On accuracy, a *greedy* additive fit only ties the scalar
+4-bit codebook (PPL 6.32 vs 6.34): the additive *structure* alone does not beat scalar,
+AQLM's edge is its *training*. So we reproduced the core of that training (per-output
+scale + **beam-search** code assignment + **least-squares** codebook updates, alternating;
+no block fine-tuning), in `llama_aqlm_train.py`. That **wins**: at M=4 it reaches PPL
+**6.13, beating the scalar 4-bit codebook (6.34)** at equal bits, while the kernel still
+decodes it at **x2.39** on the A40. And that is one alternating round with no calibration
+or block fine-tuning, the levers the full AQLM pipeline adds to push further toward fp16
+(5.83). So the Pareto point holds: trained additive VQ is **more accurate than the scalar
+codebook at the same bits and the same decode speed**, and this kernel is the fast-decode
+path that makes it usable (it also makes 2-bit *usable* and fast, x4.27, where the scalar
+2-bit codebook diverges).
 
 ### Standalone dequantization (bandwidth)
 
