@@ -123,15 +123,19 @@ because of per-op `float32->float16` casts in the wrapper, not the kernel. Build
 the clean integration (kernel writes fp16 into preallocated buffers, decode step
 captured as one CUDA graph over a static-cache loop) **realizes the win: the codebook
 model decodes 123.4 vs 61.6 tok/s vs fp16 (x2.0 end-to-end) at 4.73 vs 13.58 GB.** The
-arc is x0.73 (naive) -> x0.85 (cast-free eager) -> **x2.0 (CUDA-graphed)**.
+arc is x0.73 (naive) -> x0.85 (cast-free eager) -> **x2.0 (CUDA-graphed)**. The win
+grows with size and bandwidth-boundedness: Llama-2 13B on an A40 decodes 49.0 vs 20.0
+tok/s (**x2.46**) at 8.50 vs 26.17 GB (3.08x less).
 
 **Accuracy, and its ceiling.** wikitext-2 PPL goes 5.83 (fp16) -> 6.34 (4-bit
 codebook). Three attempts to close the gap to AWQ all fail: a simple activation-aware
 calibration reaches 6.17, the full AWQ pipeline (output-error scale search + weight
-clipping) does not improve on it (6.21), and a naive vector quantizer is catastrophic
-(diverges, with or without per-channel normalization). AWQ's scaling assumes a
-uniform grid while a codebook is already adaptive; real vector/trellis accuracy needs
-AQLM/QuIP#-level machinery (residual codebooks, incoherence, fine-tuning). **The value
+clipping) does not improve on it (6.21), a naive vector quantizer is catastrophic
+(diverges, with or without per-channel normalization), and incoherence processing (a
+random orthogonal rotation before quantizing, the QuIP# lever) moves it only marginally
+(6.34 -> 6.29). AWQ's scaling assumes a uniform grid while a codebook is already
+adaptive; real vector/trellis accuracy needs AQLM/QuIP#-level machinery (residual
+codebooks, incoherence paired with vector quantization, fine-tuning). **The value
 of this scheme is memory and kernel speed, not accuracy.**
 
 ### Standalone dequantization (bandwidth)

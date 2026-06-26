@@ -242,8 +242,14 @@ pairs of weights against a single shared 256-entry codebook (iso-bit at 4 bits) 
 catastrophic on Llama-2 7B (perplexity diverges, with or without per-channel
 normalization), because one shared codebook cannot match the per-column adaptivity of
 the scalar scheme and lacks the incoherence processing and multi-codebook structure
-that make AQLM and QuIP\# work. The accuracy frontier is a separate research program,
-not a quick add-on; the value of this scheme is memory and kernel speed.
+that make AQLM and QuIP\# work. Even incoherence processing (a random orthogonal
+rotation on the input dimension before quantizing, the QuIP\# lever, with the inverse
+folded back into the effective weight) moves the scalar codebook only marginally, from
+6.34 to 6.29, short of the simple calibration (6.17): incoherence pays off paired with
+vector or lattice quantization, not on a scalar codebook alone. The served model is
+otherwise healthy (it generates coherent on-topic text at PPL 6.34). The accuracy
+frontier is a separate research program, not a quick add-on; the value of this scheme
+is memory and kernel speed.
 
 \textbf{Memory.} Peak VRAM drops from 13.56~GB to 4.63~GB (2.9x), so the 7B model
 runs in under 5~GB on a consumer card.
@@ -267,7 +273,10 @@ serving engines run. Under this integration the codebook model decodes 123.4 ver
 61.6 tok/s against fp16 on an RTX 4090 (2.0x end-to-end) at 4.73 versus 13.58 GB. So the
 op-level 2.4x is realized as a 2.0x end-to-end decode speedup once the per-token python
 overhead is removed; the arc is 0.73x (naive) to 0.85x (cast-free eager) to 2.0x
-(CUDA-graphed). The kernel makes a real 7B decode twice as fast at a third of the memory.
+(CUDA-graphed). The kernel makes a real 7B decode twice as fast at a third of the
+memory. The win grows with model size and bandwidth-boundedness: Llama-2 13B on an A40
+decodes 49.0 versus 20.0 tok/s (2.46x) at 8.50 versus 26.17 GB (3.08x less), consistent
+with the bandwidth law (bigger weights read, more bandwidth-limited GPU, larger gain).
 
 \section{Negative results}
 We keep failed variants in the repository, because they constrain the design space.
