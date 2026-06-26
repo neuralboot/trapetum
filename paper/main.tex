@@ -237,7 +237,13 @@ redistributes resolution toward important channels. A codebook is already adapti
 per column (k-means places centroids on each column's distribution), so the scaling
 buys little and the extra calibration only adds noise. Closing the gap to vector and
 trellis methods (AQLM, QTIP) needs a better quantizer, not AWQ's tricks bolted onto a
-scalar codebook.
+scalar codebook. A naive vector quantizer confirms this from the other side: quantizing
+pairs of weights against a single shared 256-entry codebook (iso-bit at 4 bits) is
+catastrophic on Llama-2 7B (perplexity diverges, with or without per-channel
+normalization), because one shared codebook cannot match the per-column adaptivity of
+the scalar scheme and lacks the incoherence processing and multi-codebook structure
+that make AQLM and QuIP\# work. The accuracy frontier is a separate research program,
+not a quick add-on; the value of this scheme is memory and kernel speed.
 
 \textbf{Memory.} Peak VRAM drops from 13.56~GB to 4.63~GB (2.9x), so the 7B model
 runs in under 5~GB on a consumer card.
