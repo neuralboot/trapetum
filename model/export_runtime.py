@@ -120,9 +120,10 @@ def main():
     model = model.half().cuda().eval()
     ids = tok(args.prompt, return_tensors="pt").input_ids.cuda()
     print("prompt:", repr(args.prompt), "->", ids.tolist(), flush=True)
-    out = model(ids)
-    logits = out.logits[0].float().cpu().numpy().astype("<f4")  # [P, vocab]
-    gen = model.generate(ids, max_new_tokens=args.gen, do_sample=False)
+    with torch.no_grad():
+        out = model(ids)
+        logits = out.logits[0].detach().float().cpu().numpy().astype("<f4")  # [P, vocab]
+        gen = model.generate(ids, max_new_tokens=args.gen, do_sample=False)
     cont = gen[0, ids.shape[1]:].cpu().numpy().astype("<i4")
     print("continuation:", repr(tok.decode(cont)), flush=True)
 
