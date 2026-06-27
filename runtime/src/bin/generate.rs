@@ -7,7 +7,7 @@
 //!   prompt.bin: P  i32 token ids
 //!   ref.bin   : P*vocab f32 reference logits (HF on the dequantized weights)
 //!   cont.bin  : N  i32 HF greedy continuation token ids
-use codebook_runtime::Model;
+use trapetum::Model;
 use std::env;
 use std::fs::File;
 use std::io::Read;

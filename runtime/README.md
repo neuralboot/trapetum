@@ -1,4 +1,4 @@
-# codebook-runtime (Rust)
+# Trapetum (Rust runtime)
 
 A minimal **Rust** inference runtime that hosts the fused 4-bit codebook decode CUDA
 kernel, with **no Python in the loop**. This is the bootstrap of a deployable, single
@@ -10,7 +10,7 @@ a batch-1 decode GEMV through the kernel. The weight matrix is never materialize
 the 4-bit codes are read.
 
 ```rust
-use codebook_runtime::QuantLinear;
+use trapetum::QuantLinear;
 
 // packed: (ic, oc/2) 4-bit indices; codebook: (K=16, oc) f32
 let layer = QuantLinear::new(&packed, &codebook, ic, oc);

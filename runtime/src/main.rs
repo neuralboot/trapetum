@@ -2,7 +2,7 @@
 //! as a captured CUDA graph. The graph replays the chain with near-zero CPU launch
 //! overhead, the Rust-runtime version of the paper's end-to-end lever. Verified against
 //! a CPU reconstruction. No Python.
-use codebook_runtime::{sync, DevF32, DevHalf, Graph, QuantLinear, K};
+use trapetum::{sync, DevF32, DevHalf, Graph, QuantLinear, K};
 use half::f16;
 use std::time::Instant;
 
@@ -60,7 +60,7 @@ fn time_ms(iters: usize, mut f: impl FnMut()) -> f64 {
 
 fn main() {
     let (ic, oc) = (4096usize, 4096usize);
-    println!("codebook-runtime: 2 layers {ic}x{oc} on-device, eager vs CUDA graph, 4-bit (K={K})");
+    println!("trapetum: 2 layers {ic}x{oc} on-device, eager vs CUDA graph, 4-bit (K={K})");
 
     let mut s: u64 = 0x1234_5678_9abc_def1;
     let mut next = || {

@@ -1,10 +1,10 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "cuda-codebook: fused CUDA kernels for codebook-quantized LLM linear layers"
+title: "Trapetum: fused codebook-quantization kernels and a pure-Rust LLM runtime"
 authors:
   - family-names: "Mimouni"
     given-names: "A."
-repository-code: "https://github.com/Tomahawk888/cuda-codebook"
+repository-code: "https://github.com/Tomahawk888/trapetum"
 license: CC-BY-4.0
 version: "0.1.0"
 date-released: "2026-06-25"

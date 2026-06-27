@@ -2,7 +2,7 @@
 //! growing KV cache -> batch-1 attention -> o codebook projection -> residual), decoding
 //! T tokens on the GPU through the Rust runtime, verified against a CPU reference that
 //! replicates RoPE, softmax and the fp16 rounding at every step. No Python.
-use codebook_runtime::{sync, AttnBlock, DevHalf, Graph, K};
+use trapetum::{sync, AttnBlock, DevHalf, Graph, K};
 use half::f16;
 use std::time::Instant;
 
@@ -125,7 +125,7 @@ fn main() {
     let (hidden, n_heads, hd) = (4096usize, 32usize, 128usize); // Llama-2 7B MHA
     let n_kv = n_heads;
     let (tokens, max_seq) = (6usize, 8usize);
-    println!("codebook-runtime: Llama attention block, hidden={hidden} heads={n_heads} head_dim={hd}, {tokens} tokens");
+    println!("trapetum: Llama attention block, hidden={hidden} heads={n_heads} head_dim={hd}, {tokens} tokens");
 
     let mut s: u64 = 0x0bad_f00d_1357_9bdf;
     let mut next = || {

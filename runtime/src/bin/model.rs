@@ -3,7 +3,7 @@
 //! runtime, decoding several tokens on the GPU and verified end-to-end against a CPU
 //! reference. Synthetic GQA config (n_kv != n_heads), so it exercises grouped-query
 //! attention before the real model. No Python.
-use codebook_runtime::{sync, AttnBlock, Layer, MlpBlock, Model, K};
+use trapetum::{sync, AttnBlock, Layer, MlpBlock, Model, K};
 use half::f16;
 use std::time::Instant;
 
@@ -150,7 +150,7 @@ fn main() {
     let c = Cfg { hidden: 512, n_heads: 8, n_kv: 4, hd: 64, inter: 768, vocab: 512 };
     let (n_layers, max_seq, tokens) = (2usize, 16usize, 5usize);
     println!(
-        "codebook-runtime: full model, {n_layers} layers, hidden={} heads={}/{} kv head_dim={} inter={} vocab={}, GQA",
+        "trapetum: full model, {n_layers} layers, hidden={} heads={}/{} kv head_dim={} inter={} vocab={}, GQA",
         c.hidden, c.n_heads, c.n_kv, c.hd, c.inter, c.vocab
     );
     let kv_dim = c.n_kv * c.hd;

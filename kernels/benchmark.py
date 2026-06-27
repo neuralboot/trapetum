@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reproducible benchmark harness for the cuda-codebook kernels.
+Reproducible benchmark harness for the trapetum kernels.
 
 Compiles the CUDA sources with a fixed configuration, runs them, captures the
 environment (GPU, driver, CUDA toolkit) and the raw kernel output, then writes
@@ -142,7 +142,7 @@ def write_markdown(report, path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Reproducible cuda-codebook benchmark harness")
+    ap = argparse.ArgumentParser(description="Reproducible trapetum benchmark harness")
     ap.add_argument("--arch", default=None,
                     help="CUDA arch (sm_80/sm_86/sm_89/sm_90). Auto-detected if omitted.")
     ap.add_argument("--out", default="results.json")

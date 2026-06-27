@@ -2,7 +2,7 @@
 //! SwiGLU -> down codebook GEMV -> residual), run on the GPU through the Rust runtime,
 //! eagerly and as one captured CUDA graph, verified against a CPU reference that
 //! emulates the GPU's fp16 rounding at every step. No Python.
-use codebook_runtime::{sync, DevHalf, Graph, MlpBlock, K};
+use trapetum::{sync, DevHalf, Graph, MlpBlock, K};
 use half::f16;
 use std::time::Instant;
 
@@ -75,7 +75,7 @@ fn rel_err(y: &[f32], r: &[f32]) -> f64 {
 
 fn main() {
     let (hid, int) = (4096usize, 11008usize); // Llama-2 7B dims
-    println!("codebook-runtime: Llama-style MLP block, hidden={hid} inter={int}, 4-bit (K={K})");
+    println!("trapetum: Llama-style MLP block, hidden={hid} inter={int}, 4-bit (K={K})");
 
     let mut s: u64 = 0xdead_beef_cafe_1234;
     let mut next = || {

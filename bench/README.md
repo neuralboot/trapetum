@@ -1,6 +1,6 @@
 # Quantization benchmark and model-level experiments
 
-Part of [cuda-codebook](../). Benchmark scripts live here in `bench/`; the model-level
+Part of [trapetum](../). Benchmark scripts live here in `bench/`; the model-level
 codebook scripts referenced below live in [`../model/`](../model/).
 
 A fair, reproducible **speed vs accuracy vs memory** benchmark of LLM
@@ -85,7 +85,7 @@ images ship an old torch / CUDA 11.8 while modern quant libs need torch 2.4 / CU
 ## Codebook scheme on a real model
 
 This repo also hosts the model-level experiments for the fused codebook kernel from
-[`cuda-codebook`](https://github.com/Tomahawk888/cuda-codebook): quantizing Llama-2
+[`trapetum`](https://github.com/Tomahawk888/trapetum): quantizing Llama-2
 7B with the scalar per-output-channel codebook and measuring it end to end. All on
 the same harness, fixed seed, RTX 4090 / H100.
 

@@ -1,8 +1,15 @@
-# cuda-codebook
+# Trapetum
 
-Fused CUDA kernels for **codebook (non-uniform / k-means) weight quantization** of
-LLM linear layers. The "index to weight" lookup is folded into the matmul, so the
-dequantized weight matrix `W` is never materialized in global memory.
+*Press the model, keep the oil.* A **trapetum** is the Roman olive press: it crushes the
+whole fruit to extract the concentrated essence. This project does the same to an LLM,
+pressing the weights down to a small **codebook** and decoding them straight inside the
+matmul, so the dequantized weight matrix `W` is never materialized in global memory.
+
+It is fused CUDA kernels for **codebook (non-uniform / k-means) weight quantization** plus
+a pure-Rust runtime. A real Llama-2-7B, quantized to 4-bit, runs end-to-end in Rust with
+**no Python at runtime**, reproducing HuggingFace token for token (16/16) at 135 tok/s on
+an RTX 4090, in 3.5 GB instead of 13, at 2.1x less energy per token than fp16
+(see [`bench/PARETO.md`](bench/PARETO.md)).
 
 ```
 W_deq[i, j] = codebook[ indices[i, j], j ]            # per-output-channel codebooks
