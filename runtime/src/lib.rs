@@ -17,6 +17,10 @@ extern "C" {
     fn dev_cast_f32_to_half(d_half: *mut c_void, d_f32: *const c_void, n: i32);
     fn dev_download_f32(x: *mut f32, d_f32: *const c_void, n: i32);
     fn dev_sync();
+    fn graph_begin();
+    fn graph_end() -> *mut c_void;
+    fn graph_launch(exec: *mut c_void);
+    fn graph_free(exec: *mut c_void);
 }
 
 /// Number of codebook entries (4-bit indices).
@@ -121,4 +125,34 @@ impl Drop for QuantLinear {
 /// Block until all queued GPU work completes (call before stopping a timer).
 pub fn sync() {
     unsafe { dev_sync() };
+}
+
+/// A captured CUDA graph of a GPU op sequence, replayable with near-zero CPU launch
+/// overhead. This is how serving engines turn a per-op kernel speedup into an
+/// end-to-end one.
+pub struct Graph {
+    exec: *mut c_void,
+}
+
+impl Graph {
+    /// Capture the GPU work issued inside `f` into a replayable graph. Every buffer `f`
+    /// touches must be stable (allocated once); replay reuses the same device memory.
+    pub fn capture(f: impl FnOnce()) -> Self {
+        unsafe { graph_begin() };
+        f();
+        let exec = unsafe { graph_end() };
+        assert!(!exec.is_null(), "CUDA graph capture failed");
+        Self { exec }
+    }
+
+    /// Replay the captured graph.
+    pub fn launch(&self) {
+        unsafe { graph_launch(self.exec) };
+    }
+}
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        unsafe { graph_free(self.exec) };
+    }
 }
