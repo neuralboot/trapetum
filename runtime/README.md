@@ -46,9 +46,21 @@ CPU reconstruction** that emulates the GPU's fp16 rounding, and times the chain.
   rotary, KV cache), no real weight loading. The kernel launches are not yet captured in
   a CUDA graph (each forward still pays Rust/launch dispatch).
 
+## CUDA graph and the Python-overhead finding
+
+The decode chain is also captured as a single CUDA graph and replayed (correct to the
+eager result, rel err identical). At two layers the graph is only ~1.09x over eager, and
+that is the point: the paper's 2.0x end-to-end lever was about removing **Python**
+per-token overhead, and a Rust eager loop has none (each chain is a few FFI calls). So in
+Rust the graph is a refinement, not a transformation; its benefit is the accumulated
+launch dispatch, which grows with model depth (a full 224-layer-per-token model issues
+far more launches than two). The Rust runtime is, by construction, the demonstration that
+the overhead was Python.
+
 ## Roadmap
 
 1. Activations on the device, layers chained, no per-call copies. **(done)**
-2. Capture the decode chain as a CUDA graph (the paper's 2.0x end-to-end lever).
+2. Capture the decode chain as a CUDA graph. **(done)**
 3. Swap in the additive vector-quantization kernel (`avq_gemv`) for AQLM-accuracy weights.
-4. Load real weights (safetensors) and wire a full transformer block.
+4. Load real weights (safetensors) and wire a full transformer block (attention, RMSNorm,
+   rotary, KV cache) to measure end-to-end tokens/s on a real model.

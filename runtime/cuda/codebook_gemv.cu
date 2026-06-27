@@ -48,6 +48,11 @@ __global__ void cast_f2h(const float* __restrict__ src, __half* __restrict__ dst
     if (i < n) dst[i] = __float2half(src[i]);
 }
 
+// One dedicated stream for all device ops, so the decode chain can be CUDA-graph
+// captured (launches MUST be on the captured stream, else they are not recorded).
+static cudaStream_t g_stream = 0;
+static void ensure_stream() { if (!g_stream) cudaStreamCreate(&g_stream); }
+
 struct QLinear { unsigned char* d_packed; __half* d_cb; int IC, OC; };
 
 extern "C" {
@@ -71,10 +76,11 @@ void* qlinear_create(const unsigned char* packed, const float* cb_f32, int IC, i
 // d_x: device half (IC,), d_y: device f32 (OC,). No host copies; fully on-device.
 void qlinear_forward_dev(void* handle, const void* d_x, void* d_y) {
     QLinear* q = (QLinear*)handle;
-    cudaMemsetAsync(d_y, 0, (size_t)q->OC*sizeof(float));
+    ensure_stream();
+    cudaMemsetAsync(d_y, 0, (size_t)q->OC*sizeof(float), g_stream);
     size_t smem = (size_t)K*CPB*sizeof(__half) + (size_t)TY*CPB*sizeof(float);
     dim3 grid(q->OC/CPB, GS), block(32, TY);
-    gemv4<<<grid, block, smem>>>((const __half*)d_x, q->d_packed, q->d_cb, (float*)d_y, q->IC, q->OC);
+    gemv4<<<grid, block, smem, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, (float*)d_y, q->IC, q->OC);
 }
 
 void qlinear_free(void* handle) {
@@ -97,7 +103,8 @@ void dev_upload_to_half(void* d_half, const float* x, int n) {
 
 // device cast f32 -> half (the inter-layer conversion, fully on-device)
 void dev_cast_f32_to_half(void* d_half, const void* d_f32, int n) {
-    cast_f2h<<<(n+255)/256, 256>>>((const float*)d_f32, (__half*)d_half, n);
+    ensure_stream();
+    cast_f2h<<<(n+255)/256, 256, 0, g_stream>>>((const float*)d_f32, (__half*)d_half, n);
 }
 
 void dev_download_f32(float* x, const void* d_f32, int n) {
@@ -105,5 +112,31 @@ void dev_download_f32(float* x, const void* d_f32, int n) {
 }
 
 void dev_sync() { cudaDeviceSynchronize(); }
+
+// --- CUDA graph capture of the decode chain ---------------------------------------
+// graph_begin() starts capturing on g_stream; run the chain (forward/cast queue onto
+// g_stream); graph_end() instantiates a replayable graph; graph_launch() replays it
+// with near-zero CPU launch overhead.
+void graph_begin() {
+    ensure_stream();
+    cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeThreadLocal);
+}
+
+void* graph_end() {
+    cudaGraph_t graph;
+    cudaStreamEndCapture(g_stream, &graph);
+    cudaGraphExec_t exec;
+    cudaGraphInstantiate(&exec, graph, 0);
+    cudaGraphDestroy(graph);
+    return (void*)exec;
+}
+
+void graph_launch(void* exec) {
+    cudaGraphLaunch((cudaGraphExec_t)exec, g_stream);
+}
+
+void graph_free(void* exec) {
+    cudaGraphExecDestroy((cudaGraphExec_t)exec);
+}
 
 } // extern "C"
