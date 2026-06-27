@@ -13,6 +13,18 @@ Y[m, j]     = sum_i  X[m, i] * W_deq[i, j]
 - `codebook`: `[K, OC]`, `fp16` (small per-column table, `K` in 16..256)
 - `X`       : activations `fp16`; `Y`: output `fp16`
 
+## Repository layout
+
+- root `*.cu` and `quant_demo.py` / `shapes_test.py` / `benchmark.py`: the CUDA kernels
+  (scalar decode, prefill, and the additive vector-quantization kernel `avq_gemv*.cu`)
+  plus their PyTorch binding and microbenchmarks.
+- [`model/`](model/): model-level scripts on Llama-2: the cast-free CUDA-graph serving
+  integration that realizes the 2.0x/2.46x end-to-end decode speedup, the AQLM-style
+  additive-VQ training that beats the scalar codebook, and the accuracy probes.
+- [`bench/`](bench/): a fair single-harness speed vs accuracy vs memory benchmark of
+  fp16, AWQ and AQLM (the `pareto`/`mem70` figures and `results*.json`).
+- [`paper/`](paper/): the write-up (`main.pdf`).
+
 ## Scope (read this first)
 
 This repository is a **kernel-level study**, not a quantization *method* paper.
@@ -108,8 +120,7 @@ Reproduce with `python shapes_test.py`.
 
 ### Model-level results (Llama-2 7B)
 
-The scheme was taken all the way to a real model (scripts in the companion
-[`llm-quant-bench`](https://github.com/Tomahawk888/llm-quant-bench) repo; full
+The scheme was taken all the way to a real model (scripts in [`model/`](model/); full
 write-up in `paper/main.pdf`).
 
 **Memory.** Quantizing all 224 projection layers to 4-bit drops peak VRAM from
