@@ -51,7 +51,7 @@ fn main() {
     let refs = read_f32s(rp);
 
     let t0 = Instant::now();
-    let mut model = Model::load_cbk(mp, 512).unwrap();
+    let mut model = Model::load_cbk(mp, 1024).unwrap();
     let vocab = model.vocab();
     println!("loaded {mp} in {:.1}s, vocab={vocab}, prompt={} tokens", t0.elapsed().as_secs_f64(), prompt.len());
 
@@ -93,5 +93,24 @@ fn main() {
         println!("OK");
     } else {
         println!("MISMATCH (matched={matched}/{}, worst rel err {worst:.2e})", cont.len());
+    }
+
+    // optional energy bench (5th arg = #tokens): a long pure-decode window bracketed by
+    // markers so an external power sampler can isolate steady-state decode energy.
+    if let Some(nb) = a.get(5).and_then(|s| s.parse::<usize>().ok()) {
+        let mut pos = prompt.len() + cont.len();
+        let mut t = tok;
+        for _ in 0..8 {
+            t = argmax(&model.forward(t, pos));
+            pos += 1;
+        } // warmup
+        println!("READY_DECODE");
+        let t0 = Instant::now();
+        for _ in 0..nb {
+            t = argmax(&model.forward(t, pos));
+            pos += 1;
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / nb as f64;
+        println!("DONE_DECODE {:.4} {:.2}", ms, 1e3 / ms);
     }
 }
