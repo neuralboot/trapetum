@@ -1,0 +1,12 @@
+{
+  "machine": "RTX 4090 (RunPod)",
+  "model": "NousResearch/Llama-2-7b-hf",
+  "regime": "batch-1 decode; Wikitext-2 PPL over 30k tokens, ctx 2048; energy via pynvml power.draw",
+  "rows": [
+    {"method": "fp16",          "bits": 16.0, "mem_gb": 13.48, "ppl": 5.28, "tok_s": 49.9, "j_per_token": 5.57, "note": "HF cuBLAS dense baseline"},
+    {"method": "codebook-4bit", "bits": 4.05, "mem_gb": 3.81,  "ppl": 5.92, "tok_s": 30.8, "j_per_token": 4.57, "note": "ours, via a Python custom-op per linear (overhead-bound, not the kernel)"},
+    {"method": "aqlm-2bit",     "bits": 2.0,  "mem_gb": 2.15,  "ppl": 7.01, "tok_s": 23.9, "j_per_token": 4.86, "note": "ISTA-DASLab/Llama-2-7b-AQLM-2Bit-2x8-hf, official aqlm kernel"},
+    {"method": "codebook-4bit (Rust runtime)", "bits": 4.05, "mem_gb": 3.5, "ppl": 5.92, "tok_s": 135.0, "j_per_token": null, "note": "SAME quantized weights, pure-Rust runtime, no Python at runtime; J/token not yet power-sampled"}
+  ],
+  "todo": ["energy of the Rust runtime (power-sampled)", "avq-2bit via our kernel (torch binding)", "Marlin uniform 4-bit (GPTQ/vLLM)", "batched throughput (GEMM path, open problem)"]
+}
