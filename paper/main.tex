@@ -55,7 +55,7 @@ therefore \emph{bytes read per token}, which is exactly why weight quantization
 helps decode.
 
 This report measures, rather than assumes, how much a fused low-bit kernel
-actually buys, and where. We make three contributions:
+actually buys, and where. We contribute:
 \begin{enumerate}
   \item A fused 4-bit codebook GEMV kernel that reads one quarter of the weight
         bytes and decodes \textbf{2.2 to 2.34x} faster than cuBLAS fp16 on
@@ -64,6 +64,15 @@ actually buys, and where. We make three contributions:
   \item A \emph{bandwidth law}: the speedup shrinks to parity on bandwidth rich
         GPUs (H100), where fp16 GEMV is already near peak. The win lives on the
         hardware most users actually run.
+  \item An end-to-end realization. A naive per-layer integration \emph{loses}
+        (0.73x); captured as a single CUDA graph over a static-cache decode loop,
+        the way serving engines run, the kernel reaches a \textbf{2.0x} (Llama-2 7B)
+        to \textbf{2.46x} (13B) end-to-end decode speedup at about a third of the
+        memory, and we show exactly why the naive path fails.
+  \item An extension to additive (AQLM-style) vector codebooks: a fused decode
+        kernel that beats cuBLAS at 2 bits (\textbf{4.30x} on A40) and decodes real
+        AQLM weights, where the trained scheme beats the scalar codebook on accuracy
+        at equal bits and equal decode speed.
   \item A fair speed vs accuracy vs memory benchmark of quantization methods,
         plus honest negative results from kernel variants that did not work.
 \end{enumerate}
@@ -259,8 +268,8 @@ is memory and kernel speed.
 \textbf{Memory.} Peak VRAM drops from 13.56~GB to 4.63~GB (2.9x), so the 7B model
 runs in under 5~GB on a consumer card.
 
-\textbf{Speed.} Per GEMV the kernel is 2.1x to 3.7x faster than dense fp16 on these
-layer shapes (Section 5.1). But a naive per-layer custom-op swap is overhead bound:
+\textbf{Speed.} Per GEMV the kernel is faster than dense fp16 on the large layer
+shapes that dominate an LLM. But a naive per-layer custom-op swap is overhead bound:
 end-to-end decode goes from 44 to 32 tok/s (0.73x). The per-op launch and dispatch
 overhead, paid 224 times per token, dominates, while the fp16 baseline uses a fused
 optimized path. Realizing the per-GEMV speedup at the model level needs framework
@@ -303,12 +312,12 @@ GEMV at $4096 \times 4096$ (relative error $2.3 \times 10^{-4}$, verified):
 
 \begin{center}
 \begin{tabular}{lrr}
-\hline
+\toprule
 GPU & 2-bit ($M=2$) & 4-bit ($M=4$) \\
-\hline
+\midrule
 RTX 4090 ($\sim$1.0 TB/s) & 1.71x & -- \\
 A40 ($\sim$0.7 TB/s)      & \textbf{4.30x} & 2.39x \\
-\hline
+\bottomrule
 \end{tabular}
 \end{center}
 
@@ -328,14 +337,14 @@ alternating; no block fine-tuning): at $M=4$ this reaches PPL 6.13, beating the 
 
 \begin{center}
 \begin{tabular}{lr}
-\hline
+\toprule
 scheme (4-bit, Llama-2 7B) & wikitext-2 PPL \\
-\hline
+\midrule
 scalar codebook                 & 6.34 \\
 greedy additive                 & 6.32 \\
 beam-search + LSQ (this work)   & \textbf{6.13} \\
 fp16                            & 5.83 \\
-\hline
+\bottomrule
 \end{tabular}
 \end{center}
 
@@ -392,11 +401,15 @@ driver, CUDA version, and seed in their outputs.
 At batch one, decode is bandwidth bound and the arithmetic units are nearly idle.
 A fused 4-bit codebook GEMV that reads one quarter of the weight bytes turns that
 idle headroom into a 2.2 to 2.34x decode speedup on the GPUs most people run, while
-tying cuBLAS on bandwidth rich datacenter parts. The complementary quantization
-benchmark shows the same theme from the model side: low-bit quantization is a
-memory lever first, and on large models it is what makes the model runnable at all,
-a 2-bit 70B on a single consumer card. The honest negative results map where the
-easy speedups are not.
+tying cuBLAS on bandwidth rich datacenter parts. Captured as a CUDA graph the way
+serving engines run, this becomes a 2.0x (7B) to 2.46x (13B) end-to-end decode
+speedup on real models, where a naive per-layer integration instead loses. Extending
+the kernel to additive vector codebooks, the trained scheme beats the scalar codebook
+at equal bits and equal speed, a step toward fast and accurate low-bit decode. The
+complementary quantization benchmark shows the same theme from the model side: low-bit
+quantization is a memory lever first, and on large models it is what makes the model
+runnable at all, a 2-bit 70B on a single consumer card. The honest negative results
+map where the easy speedups are not.
 
 \begin{thebibliography}{9}
 \bibitem{zhao2025} J. Zhao, M. Wang, M. Zhang, Y. Shang, X. Liu, Y. Wang, M. Zhang,
