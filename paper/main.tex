@@ -48,8 +48,8 @@ At batch size one, LLM text generation reads every model weight from high
 bandwidth memory (HBM) once per output token. The cost is dominated by byte
 movement, not arithmetic. On an H100 (about 3.3~TB/s, roughly 1~PFLOP/s in half
 precision), a 7B model in fp16 needs about $14~\text{GB} / 3.3~\text{TB/s}
-\approx 4.2$~ms to read its weights per token, against about $1.4{\times}10^{10}
-~\text{FLOP} / 10^{15}~\text{FLOP/s} \approx 14~\mu$s of compute. The arithmetic
+\approx 4.2$~ms to read its weights per token, against about $14~\mu$s of compute
+($1.4{\times}10^{10}$~FLOP at $10^{15}$~FLOP/s). The arithmetic
 units are idle more than 99\% of the time. The lever for decode latency is
 therefore \emph{bytes read per token}, which is exactly why weight quantization
 helps decode.
