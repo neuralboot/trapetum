@@ -276,14 +276,26 @@ def main():
                          note="unavailable: " + str(e)[:120]))
         print("aqlm skipped:", str(e)[:160], flush=True)
 
+    # gCO2 is a DERIVED, secondary axis: J/token x grid intensity. We do NOT know RunPod's
+    # actual grid mix, so this is a projection at a stated intensity, not a measurement.
+    # Reported per 1000 tokens for readability, at France-like (~50) and US-like (~400) grids.
+    def gco2_per_ktok(jpt, intensity):
+        return None if not isinstance(jpt, (int, float)) else jpt / 3.6e6 * intensity * 1000
+    for r in rows:
+        r["gco2_per_ktok_fr50"] = gco2_per_ktok(r.get("jpt"), 50)
+        r["gco2_per_ktok_us400"] = gco2_per_ktok(r.get("jpt"), 400)
+
     json.dump(rows, open(os.path.join(args.out, "pareto.json"), "w"), indent=2)
-    print("\n| method | bits | mem GB | PPL | tok/s | J/token |", flush=True)
-    print("|---|---|---|---|---|---|", flush=True)
+    print("\n| method | bits | mem GB | PPL | tok/s | J/token | gCO2/1k tok (FR/US) |", flush=True)
+    print("|---|---|---|---|---|---|---|", flush=True)
     for r in rows:
         def f(x, p="{:.2f}"):
             return p.format(x) if isinstance(x, (int, float)) else "n/a"
-        print(f"| {r['method']} | {f(r['bits'])} | {f(r['gb'])} | {f(r['ppl'])} | {f(r['tps'],'{:.1f}')} | {f(r['jpt'],'{:.2f}')} |", flush=True)
-    print("\nNOTE batch-1 decode; Marlin (uniform 4-bit) column and batched throughput are TODO.", flush=True)
+        co2 = f"{f(r['gco2_per_ktok_fr50'],'{:.3f}')} / {f(r['gco2_per_ktok_us400'],'{:.2f}')}"
+        print(f"| {r['method']} | {f(r['bits'])} | {f(r['gb'])} | {f(r['ppl'])} | {f(r['tps'],'{:.1f}')} | {f(r['jpt'],'{:.2f}')} | {co2} |", flush=True)
+    print("\nNOTE J/token is the measured primary axis. gCO2/1k-tok = J/token x grid intensity", flush=True)
+    print("(FR ~50, US ~400 gCO2/kWh) -- a projection, not a measurement (RunPod grid mix unknown).", flush=True)
+    print("Batch-1 decode; Marlin (uniform 4-bit) and batched throughput are TODO.", flush=True)
 
 
 if __name__ == "__main__":
