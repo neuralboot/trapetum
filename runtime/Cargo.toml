@@ -1,0 +1,18 @@
+[package]
+name = "codebook-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal Rust runtime hosting the fused 4-bit codebook decode CUDA kernel, no Python in the loop"
+license = "CC-BY-4.0"
+
+[lib]
+name = "codebook_runtime"
+path = "src/lib.rs"
+
+[[bin]]
+name = "demo"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -24,6 +24,8 @@ Y[m, j]     = sum_i  X[m, i] * W_deq[i, j]
 - [`bench/`](bench/): a fair single-harness speed vs accuracy vs memory benchmark of
   fp16, AWQ and AQLM (the `pareto`/`mem70` figures and `results*.json`).
 - [`paper/`](paper/): the write-up (`fused-codebook-decode.pdf`).
+- [`runtime/`](runtime/): a minimal **Rust** runtime that hosts the CUDA kernel with no
+  Python in the loop (the bootstrap of a deployable, single-binary inference path).
 
 ## Scope (read this first)
 
