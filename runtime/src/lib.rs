@@ -371,6 +371,64 @@ impl Layer {
     }
 }
 
+/// A full decoder model: token embedding, a stack of [`Layer`]s with a shared growing KV
+/// cache, a final RMSNorm, and a codebook-quantized LM head. `forward(token, pos)` returns
+/// the next-token logits. Pure Rust, on-device, no Python.
+pub struct Model {
+    embedding: Vec<f32>, // host, vocab*hidden (one row uploaded per token)
+    layers: Vec<Layer>,
+    final_norm: DevF32,
+    lm_head: QuantLinear,
+    h: DevHalf,
+    normed: DevHalf,
+    logits: DevF32,
+    hidden: usize,
+    vocab: usize,
+    eps: f32,
+}
+
+impl Model {
+    pub fn new(
+        hidden: usize,
+        vocab: usize,
+        embedding: Vec<f32>,
+        layers: Vec<Layer>,
+        final_norm_w: &[f32],
+        lm_head: (&[u8], &[f32]),
+        eps: f32,
+    ) -> Self {
+        assert_eq!(embedding.len(), vocab * hidden, "embedding must be vocab*hidden");
+        Self {
+            embedding,
+            layers,
+            final_norm: DevF32::from_host(final_norm_w),
+            lm_head: QuantLinear::new(lm_head.0, lm_head.1, hidden, vocab),
+            h: DevHalf::zeros(hidden),
+            normed: DevHalf::zeros(hidden),
+            logits: DevF32::zeros(vocab),
+            hidden,
+            vocab,
+            eps,
+        }
+    }
+
+    /// Process one token at position `pos`, returning the `vocab` next-token logits.
+    pub fn forward(&mut self, token: usize, pos: usize) -> Vec<f32> {
+        let row = &self.embedding[token * self.hidden..(token + 1) * self.hidden];
+        self.h.upload(row);
+        for l in &mut self.layers {
+            l.forward(&mut self.h, pos);
+        }
+        rmsnorm(&self.h, &self.final_norm, &mut self.normed, self.eps);
+        self.lm_head.forward_into(&self.normed, &mut self.logits);
+        self.logits.to_host()
+    }
+
+    pub fn vocab(&self) -> usize {
+        self.vocab
+    }
+}
+
 /// Block until all queued GPU work completes (call before stopping a timer).
 pub fn sync() {
     unsafe { dev_sync() };
