@@ -19,3 +19,5 @@ prof[0-9]*
 # local submission helpers (endorsement code, arXiv form text, X thread draft)
 paper/*.txt
 paper/*.tex
+__pycache__/
+*.pyc
