@@ -4,6 +4,9 @@
 //! live in caller-owned device buffers ([`DevHalf`], [`DevF32`]), so layers chain
 //! **on-device** with no host<->device copy between them: the kernel writes f32 and
 //! [`DevHalf::copy_cast_from`] converts it to half for the next layer. No Python.
+use half::f16;
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::os::raw::c_void;
 
 extern "C" {
@@ -427,6 +430,71 @@ impl Model {
     pub fn vocab(&self) -> usize {
         self.vocab
     }
+
+    /// Load a model exported in the `.cbk` format (see `model/export_runtime.py`):
+    /// magic, config, fp16 embedding, then per layer the RMSNorm weights and the seven
+    /// codebook-quantized projections, then the final norm and codebook LM head.
+    pub fn load_cbk(path: &str, max_seq: usize) -> std::io::Result<Model> {
+        let mut r = BufReader::new(File::open(path)?);
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        assert_eq!(&magic, b"CBK1", "bad magic (not a .cbk file)");
+        let c: Vec<usize> = (0..7).map(|_| rd_i32(&mut r) as usize).collect();
+        let (n_layers, hidden, n_heads, n_kv, head_dim, inter, vocab) =
+            (c[0], c[1], c[2], c[3], c[4], c[5], c[6]);
+        let eps = rd_f32(&mut r);
+        let base = rd_f32(&mut r);
+        let embedding = rd_f16_vec(&mut r, vocab * hidden);
+        let qdim = n_heads * head_dim;
+        let kvdim = n_kv * head_dim;
+        let mut layers = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            let an = rd_f32_vec(&mut r, hidden);
+            let (qp, qc) = (rd_u8_vec(&mut r, hidden * qdim / 2), rd_f32_vec(&mut r, K * qdim));
+            let (kp, kc) = (rd_u8_vec(&mut r, hidden * kvdim / 2), rd_f32_vec(&mut r, K * kvdim));
+            let (vp, vc) = (rd_u8_vec(&mut r, hidden * kvdim / 2), rd_f32_vec(&mut r, K * kvdim));
+            let (op, oc) = (rd_u8_vec(&mut r, qdim * hidden / 2), rd_f32_vec(&mut r, K * hidden));
+            let pn = rd_f32_vec(&mut r, hidden);
+            let (gp, gc) = (rd_u8_vec(&mut r, hidden * inter / 2), rd_f32_vec(&mut r, K * inter));
+            let (up, uc) = (rd_u8_vec(&mut r, hidden * inter / 2), rd_f32_vec(&mut r, K * inter));
+            let (dp, dc) = (rd_u8_vec(&mut r, inter * hidden / 2), rd_f32_vec(&mut r, K * hidden));
+            let attn = AttnBlock::new(
+                hidden, n_heads, n_kv, head_dim, max_seq, &an,
+                (&qp, &qc), (&kp, &kc), (&vp, &vc), (&op, &oc), eps, base,
+            );
+            let mlp = MlpBlock::new(hidden, inter, &pn, &gp, &gc, &up, &uc, &dp, &dc, eps);
+            layers.push(Layer::new(attn, mlp));
+        }
+        let final_norm = rd_f32_vec(&mut r, hidden);
+        let (lmp, lmc) = (rd_u8_vec(&mut r, hidden * vocab / 2), rd_f32_vec(&mut r, K * vocab));
+        Ok(Model::new(hidden, vocab, embedding, layers, &final_norm, (&lmp, &lmc), eps))
+    }
+}
+
+fn rd_i32(r: &mut impl Read) -> i32 {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b).unwrap();
+    i32::from_le_bytes(b)
+}
+fn rd_f32(r: &mut impl Read) -> f32 {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b).unwrap();
+    f32::from_le_bytes(b)
+}
+fn rd_f32_vec(r: &mut impl Read, n: usize) -> Vec<f32> {
+    let mut b = vec![0u8; n * 4];
+    r.read_exact(&mut b).unwrap();
+    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+fn rd_f16_vec(r: &mut impl Read, n: usize) -> Vec<f32> {
+    let mut b = vec![0u8; n * 2];
+    r.read_exact(&mut b).unwrap();
+    b.chunks_exact(2).map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect()
+}
+fn rd_u8_vec(r: &mut impl Read, n: usize) -> Vec<u8> {
+    let mut b = vec![0u8; n];
+    r.read_exact(&mut b).unwrap();
+    b
 }
 
 /// Block until all queued GPU work completes (call before stopping a timer).
