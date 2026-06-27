@@ -9,6 +9,13 @@ fn main() {
     let arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_80".to_string());
     let cuda = env::var("CUDA_PATH").unwrap_or_else(|_| "/usr/local/cuda".to_string());
 
+    // SKIP_CUDA lets you `cargo check` the Rust on a machine without nvcc (no linking).
+    if env::var("SKIP_CUDA").is_ok() {
+        println!("cargo:warning=SKIP_CUDA set: not compiling the CUDA kernel");
+        println!("cargo:rerun-if-changed=cuda/codebook_gemv.cu");
+        return;
+    }
+
     let obj = format!("{out}/codebook_gemv.o");
     let ok = Command::new("nvcc")
         .args([

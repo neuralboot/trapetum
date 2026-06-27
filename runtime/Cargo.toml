@@ -5,6 +5,9 @@ edition = "2021"
 description = "Minimal Rust runtime hosting the fused 4-bit codebook decode CUDA kernel, no Python in the loop"
 license = "CC-BY-4.0"
 
+[dependencies]
+half = "2"   # only for the CPU reference (emulate the fp16 rounding the GPU does)
+
 [lib]
 name = "codebook_runtime"
 path = "src/lib.rs"

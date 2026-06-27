@@ -1,16 +1,17 @@
 // C-ABI wrapper around the fused 4-bit codebook decode GEMV, for the Rust runtime.
-// A QLinear holds the quantized weights (packed 4-bit indices + per-output codebook)
-// resident on the GPU; forward() uploads only the activation vector and runs the kernel.
-// Host side speaks f32 + u8; half conversion and all CUDA memory live here.
+//
+// A QLinear holds only the quantized weights (packed 4-bit indices + per-output
+// codebook) resident on the GPU. Activations live in caller-owned DEVICE buffers, so
+// layers chain on-device with no host<->device copy between them: the kernel writes f32,
+// a cast kernel converts it to half for the next layer. Host side speaks f32 + u8.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdlib>
-#include <cstring>
 
 #define K 16
 #define CPB 256
 #define TY 8
-#define GS 20   // split-K groups (optimum for 4-bit)
+#define GS 20
 
 __global__ void __launch_bounds__(32*TY)
 gemv4(const __half* __restrict__ X, const unsigned char* __restrict__ packed,
@@ -42,17 +43,16 @@ gemv4(const __half* __restrict__ X, const unsigned char* __restrict__ packed,
     }
 }
 
-struct QLinear {
-    unsigned char* d_packed;  // (IC, OC/2)
-    __half* d_cb;             // (K, OC)
-    __half* d_x;              // (IC,)  device activation buffer
-    float*  d_y;              // (OC,)  device output buffer
-    int IC, OC;
-};
+__global__ void cast_f2h(const float* __restrict__ src, __half* __restrict__ dst, int n) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
+}
+
+struct QLinear { unsigned char* d_packed; __half* d_cb; int IC, OC; };
 
 extern "C" {
 
-// packed: (IC*OC/2) bytes ; cb_f32: (K*OC) floats. Uploads weights to the GPU once.
+// upload the quantized weights once; activations are external device buffers
 void* qlinear_create(const unsigned char* packed, const float* cb_f32, int IC, int OC) {
     QLinear* q = (QLinear*)malloc(sizeof(QLinear));
     q->IC = IC; q->OC = OC;
@@ -65,29 +65,45 @@ void* qlinear_create(const unsigned char* packed, const float* cb_f32, int IC, i
     cudaMalloc(&q->d_cb, ncb*sizeof(__half));
     cudaMemcpy(q->d_cb, cb_h, ncb*sizeof(__half), cudaMemcpyHostToDevice);
     free(cb_h);
-    cudaMalloc(&q->d_x, (size_t)IC*sizeof(__half));
-    cudaMalloc(&q->d_y, (size_t)OC*sizeof(float));
     return q;
 }
 
-// x: (IC,) f32 in, y: (OC,) f32 out.
-void qlinear_forward(void* handle, const float* x, float* y) {
+// d_x: device half (IC,), d_y: device f32 (OC,). No host copies; fully on-device.
+void qlinear_forward_dev(void* handle, const void* d_x, void* d_y) {
     QLinear* q = (QLinear*)handle;
-    __half* xh = (__half*)malloc((size_t)q->IC*sizeof(__half));
-    for (int i = 0; i < q->IC; i++) xh[i] = __float2half(x[i]);
-    cudaMemcpy(q->d_x, xh, (size_t)q->IC*sizeof(__half), cudaMemcpyHostToDevice);
-    free(xh);
-    cudaMemset(q->d_y, 0, (size_t)q->OC*sizeof(float));
+    cudaMemsetAsync(d_y, 0, (size_t)q->OC*sizeof(float));
     size_t smem = (size_t)K*CPB*sizeof(__half) + (size_t)TY*CPB*sizeof(float);
     dim3 grid(q->OC/CPB, GS), block(32, TY);
-    gemv4<<<grid, block, smem>>>(q->d_x, q->d_packed, q->d_cb, q->d_y, q->IC, q->OC);
-    cudaMemcpy(y, q->d_y, (size_t)q->OC*sizeof(float), cudaMemcpyDeviceToHost);
+    gemv4<<<grid, block, smem>>>((const __half*)d_x, q->d_packed, q->d_cb, (float*)d_y, q->IC, q->OC);
 }
 
 void qlinear_free(void* handle) {
     QLinear* q = (QLinear*)handle;
-    cudaFree(q->d_packed); cudaFree(q->d_cb); cudaFree(q->d_x); cudaFree(q->d_y);
-    free(q);
+    cudaFree(q->d_packed); cudaFree(q->d_cb); free(q);
 }
+
+// device buffer helpers
+void* dev_alloc_half(int n) { void* p; cudaMalloc(&p, (size_t)n*sizeof(__half)); return p; }
+void* dev_alloc_f32(int n)  { void* p; cudaMalloc(&p, (size_t)n*sizeof(float));  return p; }
+void  dev_free(void* p)     { cudaFree(p); }
+
+// upload host f32 to a device half buffer (one-time input)
+void dev_upload_to_half(void* d_half, const float* x, int n) {
+    __half* h = (__half*)malloc((size_t)n*sizeof(__half));
+    for (int i = 0; i < n; i++) h[i] = __float2half(x[i]);
+    cudaMemcpy(d_half, h, (size_t)n*sizeof(__half), cudaMemcpyHostToDevice);
+    free(h);
+}
+
+// device cast f32 -> half (the inter-layer conversion, fully on-device)
+void dev_cast_f32_to_half(void* d_half, const void* d_f32, int n) {
+    cast_f2h<<<(n+255)/256, 256>>>((const float*)d_f32, (__half*)d_half, n);
+}
+
+void dev_download_f32(float* x, const void* d_f32, int n) {
+    cudaMemcpy(x, d_f32, (size_t)n*sizeof(float), cudaMemcpyDeviceToHost);
+}
+
+void dev_sync() { cudaDeviceSynchronize(); }
 
 } // extern "C"
