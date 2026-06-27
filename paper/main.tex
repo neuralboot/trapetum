@@ -29,12 +29,17 @@ same shapes, fixed seed, and verified for numerical correctness, the kernel
 reaches \textbf{2.20x} faster decode on an RTX 4090, \textbf{2.34x} on an A40, and
 \textbf{parity (0.99x)} on an H100. The speedup tracks how bandwidth limited the
 device is: on bandwidth rich parts the half precision GEMV is already near
-roofline and reading fewer bytes only saves memory. We pair this with a fair
-single harness benchmark of quantization methods (fp16, AWQ, AQLM, Llama-2 7B and
-70B, full wikitext-2 perplexity), where a 2-bit 70B model fits a single 24~GB
-consumer GPU and is more accurate than an fp16 7B at comparable memory. We also
-report negative results, including a Hopper thread block cluster variant that came
-out roughly 100x slower. All code, raw numbers, and figures are public and
+roofline and reading fewer bytes only saves memory. Integrated the way serving
+engines run, with the decode step captured as a CUDA graph, this realizes a
+\textbf{2.0x} (Llama-2 7B) to \textbf{2.46x} (13B) end-to-end decode speedup at
+roughly a third of the memory. We pair this with a fair single harness benchmark of
+quantization methods (fp16, AWQ, AQLM, Llama-2 7B and 70B, full wikitext-2
+perplexity), where a 2-bit 70B model fits a single 24~GB consumer GPU and is more
+accurate than an fp16 7B at comparable memory. We further extend the kernel to
+additive (AQLM-style) vector codebooks: it decodes real AQLM weights, and once the
+codebooks are trained with beam search, the scheme beats the scalar codebook on
+accuracy at equal bits and equal decode speed. We also report negative results,
+including a Hopper thread block cluster variant that came out roughly 100x slower. All code, raw numbers, and figures are public and
 reproducible with a single command.
 \end{abstract}
 
@@ -277,6 +282,73 @@ overhead is removed; the arc is 0.73x (naive) to 0.85x (cast-free eager) to 2.0x
 memory. The win grows with model size and bandwidth-boundedness: Llama-2 13B on an A40
 decodes 49.0 versus 20.0 tok/s (2.46x) at 8.50 versus 26.17 GB (3.08x less), consistent
 with the bandwidth law (bigger weights read, more bandwidth-limited GPU, larger gain).
+
+\section{Additive vector quantization: a fast kernel that beats the scalar codebook}
+
+The scalar codebook's accuracy ceiling is structural: per-output-channel scalar
+quantization cannot match vector and trellis methods (AQLM, QuIP\#, QTIP) at low bits.
+Those methods quantize a \emph{group} of weights jointly; AQLM reconstructs a group of
+$D$ input weights as a sum of $M$ codebook vectors, $w_g = \sum_{m=1}^{M} C_m[b_m]$,
+reaching near-fp16 quality at 2 bits. Their decode kernels are the bottleneck. We show the
+fused-decode idea transfers, the resulting kernel beats cuBLAS, and the scheme, once
+trained, beats the scalar codebook.
+
+\textbf{The kernel.} For $y[o] = \sum_g \langle x_g, w_g \rangle$ with the additive
+reconstruction, the dot product $\langle x_g, C_m[k] \rangle$ is independent of the output
+channel, so a per-group lookup table $\mathrm{LUT}[m][k] = \langle x_g, C_m[k] \rangle$ is
+built once in shared memory and $y[o] = \sum_g \sum_m \mathrm{LUT}[m][\,b_m(o,g)\,]$. The
+kernel reads the \emph{codes}, never the dense weight: at 2 bits ($M=2$, $K=256$, $D=8$)
+that is 4.2~MB of codes versus 33.6~MB of fp16 weight. Against a live cuBLAS fp16
+GEMV at $4096 \times 4096$ (relative error $2.3 \times 10^{-4}$, verified):
+
+\begin{center}
+\begin{tabular}{lrr}
+\hline
+GPU & 2-bit ($M=2$) & 4-bit ($M=4$) \\
+\hline
+RTX 4090 ($\sim$1.0 TB/s) & 1.71x & -- \\
+A40 ($\sim$0.7 TB/s)      & \textbf{4.30x} & 2.39x \\
+\hline
+\end{tabular}
+\end{center}
+
+The key optimization was vectorized 32-bit code reads (four 8-bit codes per thread), which
+lifted the A40 from 2.35x to 4.30x: the 1-byte reads, not synchronization, were the
+bottleneck. The format is exactly AQLM's \texttt{2x8}: loading a real
+\texttt{Llama-2-7b-AQLM-2Bit-2x8} checkpoint, its codebooks $[2,256,1,8]$, codes
+$[4096,512,2]$ and per-output scales $[4096]$ map one-to-one onto the kernel, so it decodes
+real AQLM weights.
+
+\textbf{Accuracy, beating the scalar codebook at equal bits.} The additive \emph{structure}
+alone is not enough: a greedy residual fit at $M=4$ (4 bits) only ties the scalar 4-bit
+codebook (PPL 6.32 vs 6.34). The accuracy comes from AQLM's \emph{training}. We reproduced
+its core (per-output scale, beam-search code assignment, least-squares codebook updates,
+alternating; no block fine-tuning): at $M=4$ this reaches PPL 6.13, beating the scalar
+4-bit codebook while the kernel still decodes it at 2.39x.
+
+\begin{center}
+\begin{tabular}{lr}
+\hline
+scheme (4-bit, Llama-2 7B) & wikitext-2 PPL \\
+\hline
+scalar codebook                 & 6.34 \\
+greedy additive                 & 6.32 \\
+beam-search + LSQ (this work)   & \textbf{6.13} \\
+fp16                            & 5.83 \\
+\hline
+\end{tabular}
+\end{center}
+
+So trained additive VQ is more accurate than the scalar codebook at the same bit rate and
+the same decode speed, a Pareto improvement.
+
+\textbf{Honest limits.} This is one alternating round without the levers that close the
+remaining gap to fp16 (5.83). A naive diagonal-Hessian calibration of ours actually
+\emph{regresses} (PPL 8.6), because AQLM uses the full Hessian in a sequential GPTQ-style
+error correction, not a diagonal MSE weighting; reproducing that, plus block fine-tuning,
+is a separate effort. What we establish is narrower and solid: a fused additive-VQ decode
+kernel that beats cuBLAS at AQLM bit rates and decodes real AQLM weights, and that the
+additive scheme, once trained, beats the scalar codebook at equal bits and equal speed.
 
 \section{Negative results}
 We keep failed variants in the repository, because they constrain the design space.
