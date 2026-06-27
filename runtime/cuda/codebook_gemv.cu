@@ -74,6 +74,55 @@ __global__ void resadd_k(__half* __restrict__ h, const float* __restrict__ delta
     if (i < n) h[i] = __float2half(__half2float(h[i]) + delta[i]);
 }
 
+// RoPE (HF Llama rotate-half): for each head and d in [0, head_dim/2), rotate the pair
+// (x[d], x[d+head_dim/2]) by angle = pos * base^(-2d/head_dim).
+__global__ void rope_k(__half* __restrict__ x, int pos, int n_heads, int head_dim, float base) {
+    int t = blockIdx.x*blockDim.x + threadIdx.x;
+    int half = head_dim/2;
+    if (t >= n_heads*half) return;
+    int h = t / half, d = t % half;
+    float angle = pos * powf(base, -2.0f*d/head_dim);
+    float c = cosf(angle), s = sinf(angle);
+    int i = h*head_dim + d, j = h*head_dim + d + half;
+    float x0 = __half2float(x[i]), x1 = __half2float(x[j]);
+    x[i] = __float2half(x0*c - x1*s);
+    x[j] = __float2half(x1*c + x0*s);
+}
+
+// Batch-1 decode attention. One block per query head, head_dim threads. Cache layout is
+// [t][kv_head*head_dim + d]. GQA: kv_head = h / (n_heads/n_kv); MHA: n_kv == n_heads.
+__global__ void attn_k(const __half* __restrict__ q, const __half* __restrict__ ck,
+                       const __half* __restrict__ cv, __half* __restrict__ out,
+                       int n_heads, int n_kv, int head_dim, int seqlen) {
+    int h = blockIdx.x;
+    int kvh = h / (n_heads / n_kv);
+    int d = threadIdx.x;                 // blockDim.x == head_dim
+    extern __shared__ float smem[];
+    float* red = smem;                   // head_dim
+    float* scores = smem + head_dim;     // seqlen
+    float qd = __half2float(q[h*head_dim + d]);
+    float scale = rsqrtf((float)head_dim);
+    for (int t = 0; t < seqlen; t++) {
+        red[d] = qd * __half2float(ck[(size_t)t*n_kv*head_dim + kvh*head_dim + d]);
+        __syncthreads();
+        for (int s = head_dim/2; s > 0; s >>= 1) { if (d < s) red[d] += red[d+s]; __syncthreads(); }
+        if (d == 0) scores[t] = red[0] * scale;
+        __syncthreads();
+    }
+    if (d == 0) {
+        float mx = -1e30f;
+        for (int t = 0; t < seqlen; t++) mx = fmaxf(mx, scores[t]);
+        float sum = 0;
+        for (int t = 0; t < seqlen; t++) { scores[t] = expf(scores[t]-mx); sum += scores[t]; }
+        for (int t = 0; t < seqlen; t++) scores[t] /= sum;
+    }
+    __syncthreads();
+    float acc = 0;
+    for (int t = 0; t < seqlen; t++)
+        acc += scores[t] * __half2float(cv[(size_t)t*n_kv*head_dim + kvh*head_dim + d]);
+    out[h*head_dim + d] = __float2half(acc);
+}
+
 // One dedicated stream for all device ops, so the decode chain can be CUDA-graph
 // captured (launches MUST be on the captured stream, else they are not recorded).
 static cudaStream_t g_stream = 0;
@@ -162,6 +211,26 @@ void op_silu_mul(const void* gate_f32, const void* up_f32, void* out_half, int n
 void op_residual_add(void* h_half, const void* delta_f32, int n) {
     ensure_stream();
     resadd_k<<<(n+255)/256, 256, 0, g_stream>>>((__half*)h_half, (const float*)delta_f32, n);
+}
+
+// attention-block ops
+void op_rope(void* x_half, int pos, int n_heads, int head_dim, float base) {
+    ensure_stream();
+    int total = n_heads * (head_dim/2);
+    rope_k<<<(total+127)/128, 128, 0, g_stream>>>((__half*)x_half, pos, n_heads, head_dim, base);
+}
+// append a (n_kv*head_dim) fp16 vector to a [max_seq][n_kv*head_dim] cache at row `pos`
+void op_cache_append(void* cache_half, const void* src_half, int pos, int dim) {
+    ensure_stream();
+    cudaMemcpyAsync((char*)cache_half + (size_t)pos*dim*sizeof(__half), src_half,
+                    (size_t)dim*sizeof(__half), cudaMemcpyDeviceToDevice, g_stream);
+}
+void op_attn(const void* q_half, const void* ck_half, const void* cv_half, void* out_half,
+             int n_heads, int n_kv, int head_dim, int seqlen) {
+    ensure_stream();
+    size_t smem = ((size_t)head_dim + seqlen) * sizeof(float);
+    attn_k<<<n_heads, head_dim, smem, g_stream>>>((const __half*)q_half, (const __half*)ck_half,
+        (const __half*)cv_half, (__half*)out_half, n_heads, n_kv, head_dim, seqlen);
 }
 
 void dev_sync() { cudaDeviceSynchronize(); }

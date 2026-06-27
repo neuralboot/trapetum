@@ -66,12 +66,20 @@ residual add, all on-device and captured as one CUDA graph. At the Llama-2 7B di
 emulates the fp16 rounding at every step) and runs in ~0.088 ms. The new kernels
 (`rmsnorm_k`, `silu_mul_k`, `resadd_k`) join the codebook GEMV, which is used three times.
 
+The **attention block** also runs (`cargo run --bin attn`): RMSNorm, q/k/v codebook
+projections, RoPE (HF rotate-half), a growing KV cache, batch-1 attention (QK^T, softmax,
+AV) and the o-projection, plus a residual. Decoding 6 tokens at the Llama-2 7B MHA dims
+(32 heads, head_dim 128) it is correct to rel err 7e-4 against a CPU reference that
+replicates RoPE, softmax and the fp16 rounding, and one step runs in ~0.079 ms. New
+kernels: `rope_k`, `attn_k` (one block per head). A full decoder layer is the composition
+of the two verified sub-blocks (`Layer = AttnBlock + MlpBlock`, ~0.17 ms/token).
+
 ## Roadmap
 
 1. Activations on the device, layers chained, no per-call copies. **(done)**
 2. Capture the decode chain as a CUDA graph. **(done)**
 3. The MLP block (RMSNorm + SwiGLU + residual, codebook GEMVs). **(done)**
-4. The attention block: RoPE, the KV cache, and batch-1 attention (QK^T, softmax, AV),
-   then a full layer = attention + MLP.
+4. The attention block (RoPE, KV cache, batch-1 attention) and a full layer = attention +
+   MLP. **(done)**
 5. Load real weights (safetensors, quantized by the Python `model/` scripts), and the
    additive-VQ kernel, to measure end-to-end tokens/s on a real model in pure Rust.

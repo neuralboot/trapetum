@@ -26,6 +26,18 @@ extern "C" {
     fn op_rmsnorm(x_half: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32);
     fn op_silu_mul(gate_f32: *const c_void, up_f32: *const c_void, out_half: *mut c_void, n: i32);
     fn op_residual_add(h_half: *mut c_void, delta_f32: *const c_void, n: i32);
+    fn op_rope(x_half: *mut c_void, pos: i32, n_heads: i32, head_dim: i32, base: f32);
+    fn op_cache_append(cache_half: *mut c_void, src_half: *const c_void, pos: i32, dim: i32);
+    fn op_attn(
+        q_half: *const c_void,
+        ck_half: *const c_void,
+        cv_half: *const c_void,
+        out_half: *mut c_void,
+        n_heads: i32,
+        n_kv: i32,
+        head_dim: i32,
+        seqlen: i32,
+    );
 }
 
 /// Number of codebook entries (4-bit indices).
@@ -216,6 +228,146 @@ impl MlpBlock {
         silu_mul(&self.g, &self.u, &mut self.act);
         self.down.forward_into(&self.act, &mut self.mlp);
         residual_add(h, &self.mlp);
+    }
+}
+
+/// RoPE (HF Llama rotate-half) in place on `x` (`n_heads * head_dim`) at position `pos`.
+pub fn rope(x: &mut DevHalf, pos: usize, n_heads: usize, head_dim: usize, base: f32) {
+    assert_eq!(x.n, n_heads * head_dim);
+    unsafe { op_rope(x.ptr, pos as i32, n_heads as i32, head_dim as i32, base) };
+}
+
+/// Append `src` (a `n_kv*head_dim` fp16 vector) to the KV cache at row `pos`.
+pub fn cache_append(cache: &mut DevHalf, src: &DevHalf, pos: usize) {
+    unsafe { op_cache_append(cache.ptr, src.ptr, pos as i32, src.n as i32) };
+}
+
+/// Batch-1 decode attention over `seqlen` cached positions.
+#[allow(clippy::too_many_arguments)]
+pub fn attention(
+    q: &DevHalf,
+    ck: &DevHalf,
+    cv: &DevHalf,
+    out: &mut DevHalf,
+    n_heads: usize,
+    n_kv: usize,
+    head_dim: usize,
+    seqlen: usize,
+) {
+    unsafe {
+        op_attn(q.ptr, ck.ptr, cv.ptr, out.ptr, n_heads as i32, n_kv as i32, head_dim as i32, seqlen as i32)
+    };
+}
+
+/// A Llama-style attention block: RMSNorm, q/k/v codebook projections, RoPE on q and k,
+/// a growing KV cache, batch-1 attention, the output codebook projection, and a residual.
+/// All on-device; the per-token forward can be captured as a CUDA graph (the cache row and
+/// RoPE angles change with `pos`, so capture per position).
+pub struct AttnBlock {
+    norm_w: DevF32,
+    q: QuantLinear,
+    k: QuantLinear,
+    v: QuantLinear,
+    o: QuantLinear,
+    cache_k: DevHalf,
+    cache_v: DevHalf,
+    norm: DevHalf,
+    qb: DevF32,
+    kb: DevF32,
+    vb: DevF32,
+    qh: DevHalf,
+    kh: DevHalf,
+    vh: DevHalf,
+    attn_out: DevHalf,
+    ob: DevF32,
+    n_heads: usize,
+    n_kv: usize,
+    head_dim: usize,
+    eps: f32,
+    base: f32,
+}
+
+impl AttnBlock {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        hidden: usize,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+        max_seq: usize,
+        norm_w: &[f32],
+        q: (&[u8], &[f32]),
+        k: (&[u8], &[f32]),
+        v: (&[u8], &[f32]),
+        o: (&[u8], &[f32]),
+        eps: f32,
+        base: f32,
+    ) -> Self {
+        let qdim = n_heads * head_dim; // = hidden for MHA
+        let kv_dim = n_kv * head_dim;
+        Self {
+            norm_w: DevF32::from_host(norm_w),
+            q: QuantLinear::new(q.0, q.1, hidden, qdim),
+            k: QuantLinear::new(k.0, k.1, hidden, kv_dim),
+            v: QuantLinear::new(v.0, v.1, hidden, kv_dim),
+            o: QuantLinear::new(o.0, o.1, qdim, hidden),
+            cache_k: DevHalf::zeros(max_seq * kv_dim),
+            cache_v: DevHalf::zeros(max_seq * kv_dim),
+            norm: DevHalf::zeros(hidden),
+            qb: DevF32::zeros(qdim),
+            kb: DevF32::zeros(kv_dim),
+            vb: DevF32::zeros(kv_dim),
+            qh: DevHalf::zeros(qdim),
+            kh: DevHalf::zeros(kv_dim),
+            vh: DevHalf::zeros(kv_dim),
+            attn_out: DevHalf::zeros(qdim),
+            ob: DevF32::zeros(hidden),
+            n_heads,
+            n_kv,
+            head_dim,
+            eps,
+            base,
+        }
+    }
+
+    /// One decode step at position `pos`: updates the cache and the residual stream `h`.
+    pub fn forward(&mut self, h: &mut DevHalf, pos: usize) {
+        rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
+        self.q.forward_into(&self.norm, &mut self.qb);
+        self.qh.copy_cast_from(&self.qb);
+        self.k.forward_into(&self.norm, &mut self.kb);
+        self.kh.copy_cast_from(&self.kb);
+        self.v.forward_into(&self.norm, &mut self.vb);
+        self.vh.copy_cast_from(&self.vb);
+        rope(&mut self.qh, pos, self.n_heads, self.head_dim, self.base);
+        rope(&mut self.kh, pos, self.n_kv, self.head_dim, self.base);
+        cache_append(&mut self.cache_k, &self.kh, pos);
+        cache_append(&mut self.cache_v, &self.vh, pos);
+        attention(
+            &self.qh, &self.cache_k, &self.cache_v, &mut self.attn_out,
+            self.n_heads, self.n_kv, self.head_dim, pos + 1,
+        );
+        self.o.forward_into(&self.attn_out, &mut self.ob);
+        residual_add(h, &self.ob);
+    }
+}
+
+/// A full Llama decoder layer: attention sub-block then MLP sub-block, both updating the
+/// residual stream in place. This is the composition of two independently verified blocks
+/// (`AttnBlock`, `MlpBlock`); one forward is a complete transformer layer.
+pub struct Layer {
+    pub attn: AttnBlock,
+    pub mlp: MlpBlock,
+}
+
+impl Layer {
+    pub fn new(attn: AttnBlock, mlp: MlpBlock) -> Self {
+        Self { attn, mlp }
+    }
+    /// One decode step at position `pos`: `h += attn(h); h += mlp(h)`.
+    pub fn forward(&mut self, h: &mut DevHalf, pos: usize) {
+        self.attn.forward(h, pos);
+        self.mlp.forward(h);
     }
 }
 
