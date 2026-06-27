@@ -15,3 +15,6 @@ prof[0-9]*
 !*.cu
 # the line "bench" above is the compiled executable of bench.cu; keep the bench/ dir
 !bench/
+
+# local submission helpers (endorsement code, arXiv form text, X thread draft)
+paper/*.txt

@@ -29,6 +29,9 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+# work from this script's directory so the relative .cu paths resolve from anywhere
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
 SEED = 0  # fixed in the .cu sources via std::mt19937(0); kept here for the record
 
 # (source, extra -D defines, needs -lcublas, human label)
