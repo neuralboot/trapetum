@@ -390,12 +390,13 @@ here. Prefill stays at about 0.21x cuBLAS, compute bound as expected. Numbers we
 taken at a single $4096\times4096$ shape and will differ at other shapes.
 
 \section{Reproducibility and code}
-Both repositories are public, single command to build and run, and capture GPU,
-driver, CUDA version, and seed in their outputs.
-\begin{itemize}
-  \item Kernels and cross-GPU benchmark:\\ \url{https://github.com/Tomahawk888/cuda-codebook}
-  \item Quantization speed vs accuracy benchmark:\\ \url{https://github.com/Tomahawk888/llm-quant-bench}
-\end{itemize}
+All code is public in a single repository, builds and runs with one command, and
+captures GPU, driver, CUDA version, and seed in its outputs. The CUDA kernels are at the
+root, the model-level scripts in \texttt{model/}, the quantization benchmark in
+\texttt{bench/}, and this paper in \texttt{paper/}.
+\begin{center}
+\url{https://github.com/Tomahawk888/cuda-codebook}
+\end{center}
 
 \section{Conclusion}
 At batch one, decode is bandwidth bound and the arithmetic units are nearly idle.
