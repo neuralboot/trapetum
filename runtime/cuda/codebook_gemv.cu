@@ -48,6 +48,32 @@ __global__ void cast_f2h(const float* __restrict__ src, __half* __restrict__ dst
     if (i < n) dst[i] = __float2half(src[i]);
 }
 
+// RMSNorm: out = x / sqrt(mean(x^2)+eps) * w. One block, 256 threads (n up to a few k).
+__global__ void rmsnorm_k(const __half* __restrict__ x, const float* __restrict__ w,
+                          __half* __restrict__ out, int n, float eps) {
+    __shared__ float red[256];
+    int tid = threadIdx.x;
+    float ss = 0;
+    for (int i = tid; i < n; i += 256) { float v = __half2float(x[i]); ss += v*v; }
+    red[tid] = ss; __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid+s]; __syncthreads(); }
+    float scale = rsqrtf(red[0]/n + eps);
+    for (int i = tid; i < n; i += 256) out[i] = __float2half(__half2float(x[i]) * scale * w[i]);
+}
+
+// SwiGLU activation: out = silu(gate) * up, gate/up are f32 (kernel outputs), out fp16.
+__global__ void silu_mul_k(const float* __restrict__ gate, const float* __restrict__ up,
+                           __half* __restrict__ out, int n) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) { float g = gate[i]; float s = g / (1.f + expf(-g)); out[i] = __float2half(s * up[i]); }
+}
+
+// residual: h += delta (h fp16 stream, delta f32), in place.
+__global__ void resadd_k(__half* __restrict__ h, const float* __restrict__ delta, int n) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) h[i] = __float2half(__half2float(h[i]) + delta[i]);
+}
+
 // One dedicated stream for all device ops, so the decode chain can be CUDA-graph
 // captured (launches MUST be on the captured stream, else they are not recorded).
 static cudaStream_t g_stream = 0;
@@ -109,6 +135,33 @@ void dev_cast_f32_to_half(void* d_half, const void* d_f32, int n) {
 
 void dev_download_f32(float* x, const void* d_f32, int n) {
     cudaMemcpy(x, d_f32, (size_t)n*sizeof(float), cudaMemcpyDeviceToHost);
+}
+
+// download a device half buffer to host f32
+void dev_download_half(float* x, const void* d_half, int n) {
+    __half* h = (__half*)malloc((size_t)n*sizeof(__half));
+    cudaMemcpy(h, d_half, (size_t)n*sizeof(__half), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < n; i++) x[i] = __half2float(h[i]);
+    free(h);
+}
+
+// upload host f32 to a device f32 buffer (e.g. an RMSNorm weight, one-time)
+void dev_upload_f32(void* d_f32, const float* x, int n) {
+    cudaMemcpy(d_f32, x, (size_t)n*sizeof(float), cudaMemcpyHostToDevice);
+}
+
+// transformer-block ops (all on g_stream, so the whole block is CUDA-graph capturable)
+void op_rmsnorm(const void* x_half, const void* w_f32, void* out_half, int n, float eps) {
+    ensure_stream();
+    rmsnorm_k<<<1, 256, 0, g_stream>>>((const __half*)x_half, (const float*)w_f32, (__half*)out_half, n, eps);
+}
+void op_silu_mul(const void* gate_f32, const void* up_f32, void* out_half, int n) {
+    ensure_stream();
+    silu_mul_k<<<(n+255)/256, 256, 0, g_stream>>>((const float*)gate_f32, (const float*)up_f32, (__half*)out_half, n);
+}
+void op_residual_add(void* h_half, const void* delta_f32, int n) {
+    ensure_stream();
+    resadd_k<<<(n+255)/256, 256, 0, g_stream>>>((__half*)h_half, (const float*)delta_f32, n);
 }
 
 void dev_sync() { cudaDeviceSynchronize(); }

@@ -57,10 +57,21 @@ launch dispatch, which grows with model depth (a full 224-layer-per-token model 
 far more launches than two). The Rust runtime is, by construction, the demonstration that
 the overhead was Python.
 
+## Transformer block
+
+A complete Llama-style gated **MLP block** runs in the runtime (`cargo run --bin mlp`):
+RMSNorm, gate and up codebook GEMVs, SwiGLU (`silu(gate)*up`), down codebook GEMV, and a
+residual add, all on-device and captured as one CUDA graph. At the Llama-2 7B dims
+(hidden 4096, inter 11008) it is correct to rel err 4.9e-4 against a CPU reference (which
+emulates the fp16 rounding at every step) and runs in ~0.088 ms. The new kernels
+(`rmsnorm_k`, `silu_mul_k`, `resadd_k`) join the codebook GEMV, which is used three times.
+
 ## Roadmap
 
 1. Activations on the device, layers chained, no per-call copies. **(done)**
 2. Capture the decode chain as a CUDA graph. **(done)**
-3. Swap in the additive vector-quantization kernel (`avq_gemv`) for AQLM-accuracy weights.
-4. Load real weights (safetensors) and wire a full transformer block (attention, RMSNorm,
-   rotary, KV cache) to measure end-to-end tokens/s on a real model.
+3. The MLP block (RMSNorm + SwiGLU + residual, codebook GEMVs). **(done)**
+4. The attention block: RoPE, the KV cache, and batch-1 attention (QK^T, softmax, AV),
+   then a full layer = attention + MLP.
+5. Load real weights (safetensors, quantized by the Python `model/` scripts), and the
+   additive-VQ kernel, to measure end-to-end tokens/s on a real model in pure Rust.
