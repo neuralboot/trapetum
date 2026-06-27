@@ -2,11 +2,12 @@
   "machine": "RTX 4090 (RunPod)",
   "model": "NousResearch/Llama-2-7b-hf",
   "regime": "batch-1 decode; Wikitext-2 PPL over 30k tokens, ctx 2048; energy via pynvml power.draw",
+  "carbon_note": "gCO2/1k-tok = J/token x grid intensity (FR ~50, US ~400 gCO2/kWh); DERIVED projection, RunPod grid mix unknown, not a measurement",
   "rows": [
-    {"method": "fp16",          "bits": 16.0, "mem_gb": 13.48, "ppl": 5.28, "tok_s": 49.9, "j_per_token": 5.57, "note": "HF cuBLAS dense baseline"},
-    {"method": "codebook-4bit", "bits": 4.05, "mem_gb": 3.81,  "ppl": 5.92, "tok_s": 30.8, "j_per_token": 4.57, "note": "ours, via a Python custom-op per linear (overhead-bound, not the kernel)"},
-    {"method": "aqlm-2bit",     "bits": 2.0,  "mem_gb": 2.15,  "ppl": 7.01, "tok_s": 23.9, "j_per_token": 4.86, "note": "ISTA-DASLab/Llama-2-7b-AQLM-2Bit-2x8-hf, official aqlm kernel"},
-    {"method": "codebook-4bit (Rust runtime)", "bits": 4.05, "mem_gb": 3.5, "ppl": 5.92, "tok_s": 135.0, "j_per_token": null, "note": "SAME quantized weights, pure-Rust runtime, no Python at runtime; J/token not yet power-sampled"}
+    {"method": "fp16",          "bits": 16.0, "mem_gb": 13.48, "ppl": 5.28, "tok_s": 49.9, "j_per_token": 5.57, "gco2_1ktok_fr": 0.077, "gco2_1ktok_us": 0.62, "note": "HF cuBLAS dense baseline; 128-token gen"},
+    {"method": "codebook-4bit", "bits": 4.05, "mem_gb": 3.81,  "ppl": 5.92, "tok_s": 30.8, "j_per_token": 4.57, "gco2_1ktok_fr": 0.063, "gco2_1ktok_us": 0.51, "note": "ours, Python custom-op per linear (overhead-bound); 128-token gen"},
+    {"method": "aqlm-2bit",     "bits": 2.0,  "mem_gb": 2.15,  "ppl": 7.01, "tok_s": 23.9, "j_per_token": 4.86, "gco2_1ktok_fr": 0.068, "gco2_1ktok_us": 0.54, "note": "ISTA-DASLab/Llama-2-7b-AQLM-2Bit-2x8-hf, official aqlm kernel; 128-token gen"},
+    {"method": "codebook-4bit (Rust runtime)", "bits": 4.05, "mem_gb": 4.73, "ppl": 5.92, "tok_s": 81.0, "tok_s_short_ctx": 135.0, "j_per_token": 2.58, "gco2_1ktok_fr": 0.036, "gco2_1ktok_us": 0.29, "power_mean_w": 209.0, "power_max_w": 262.7, "note": "SAME weights, pure-Rust runtime, no Python at runtime; J/token over a 512-token gen (context to ~540, 81 tok/s); 135 tok/s short-context; 4.73 GB measured peak (3.5 GB weights + KV cache)"}
   ],
-  "todo": ["energy of the Rust runtime (power-sampled)", "avq-2bit via our kernel (torch binding)", "Marlin uniform 4-bit (GPTQ/vLLM)", "batched throughput (GEMM path, open problem)"]
+  "todo": ["strictly iso-context J/token across all rows", "avq-2bit op-level vs aqlm::code2x8_matmat", "Marlin uniform 4-bit (GPTQ/vLLM)", "batched throughput (GEMM path, open problem)"]
 }
