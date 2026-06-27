@@ -59,6 +59,25 @@ Storing each weight as a small cluster index shrinks the layer 2x (uint8) to 4x
 bandwidth the quantization just saved. These kernels fold the lookup into the
 matmul so the dequantization adds no extra global traffic.
 
+## Does it run on your GPU?
+
+Trapetum is CUDA, so it runs on any modern **NVIDIA** GPU. Recompile the kernel for your
+architecture with one `-arch` flag, or ship a multi-arch build that covers them all in a
+single binary. The 4-bit memory saving is universal; only the speedup depends on the card
+(the bandwidth law: largest on bandwidth-bound consumer GPUs, parity on an H100).
+
+| Your GPU | Arch | Memory win | Decode speed |
+|---|---|---|---|
+| RTX 30 / 40 (3060, 3090, 4070, 4090, ...) | `sm_86` / `sm_89` | ~3.5x less | largest, up to 2.2x |
+| A100 / A40 / L40 | `sm_80` / `sm_86` / `sm_89` | ~3.5x less | strong, 2.34x on A40 |
+| H100 / H200 | `sm_90` | ~3.5x less | parity (fp16 already near roofline) |
+| Turing and older (GTX 16, RTX 20, V100) | `sm_70` / `sm_75` | ~3.5x less | untested, rebuild needed |
+| AMD, Apple Silicon, CPU | - | - | not supported (CUDA only) |
+
+The memory win (a 7B in ~3.5 GB, so it fits an 8 GB card) holds on every NVIDIA GPU.
+Validated on Ampere, Ada and Hopper (`sm_80` to `sm_90`); pre-Ampere is untested, and the
+`mma.sync` / `cp.async` prefill paths require `sm_80+`.
+
 ## Benchmarks
 
 Unless a row says otherwise, reference numbers below were measured on a single
