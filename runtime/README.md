@@ -74,6 +74,23 @@ replicates RoPE, softmax and the fp16 rounding, and one step runs in ~0.079 ms. 
 kernels: `rope_k`, `attn_k` (one block per head). A full decoder layer is the composition
 of the two verified sub-blocks (`Layer = AttnBlock + MlpBlock`, ~0.17 ms/token).
 
+## Real model, end-to-end, pure Rust
+
+A real **Llama-2-7B**, quantized to a 4-bit codebook by `model/export_runtime.py` (which
+writes a `.cbk` file and a HuggingFace reference), is loaded and run by the runtime with
+**no Python at runtime** (`cargo run --bin generate model.cbk prompt.bin ref.bin cont.bin`).
+On an RTX 4090, decoding from `"The capital of France is"`:
+
+| metric | value |
+| --- | --- |
+| logits rel err vs HF (worst over prompt) | 7.9e-3 |
+| top-1 agreement with HF | 6/6 |
+| greedy continuation reproduces HF | **16/16 tokens** |
+| decode throughput | 7.4 ms/token (**135 tok/s**) |
+
+The runtime reproduces HuggingFace's greedy generation exactly, token for token, from the
+same quantized weights, in pure Rust on the device. The `.cbk` is 3.5 GB (vs 13 GB fp16).
+
 ## Roadmap
 
 1. Activations on the device, layers chained, no per-call copies. **(done)**
@@ -81,5 +98,7 @@ of the two verified sub-blocks (`Layer = AttnBlock + MlpBlock`, ~0.17 ms/token).
 3. The MLP block (RMSNorm + SwiGLU + residual, codebook GEMVs). **(done)**
 4. The attention block (RoPE, KV cache, batch-1 attention) and a full layer = attention +
    MLP. **(done)**
-5. Load real weights (safetensors, quantized by the Python `model/` scripts), and the
-   additive-VQ kernel, to measure end-to-end tokens/s on a real model in pure Rust.
+5. Load real weights and run a real Llama-2-7B end-to-end in pure Rust. **(done:** matches
+   HF greedy generation 16/16, 135 tok/s on a 4090.**)**
+6. Next: the additive-VQ kernel in the model path (2-bit AQLM weights), and an honest
+   speed/memory/PPL/energy Pareto vs Marlin and AQLM at equal effective bits.
