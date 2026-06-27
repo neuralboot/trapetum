@@ -67,11 +67,16 @@ torch::Tensor codebook_gemv(torch::Tensor x, torch::Tensor packed, torch::Tensor
         y.data_ptr<float>(), IC, OC, GSg);
     return y;
 }
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m){ m.def("codebook_gemv",&codebook_gemv); }
 """
 
-ext = load_inline(name="pareto_cb", cpp_sources="", cuda_sources=KERNEL,
-                  functions=["codebook_gemv"], extra_cuda_cflags=["-O3"], verbose=False)
+ext = load_inline(
+    name="pareto_cb",
+    cpp_sources="torch::Tensor codebook_gemv(torch::Tensor x, torch::Tensor packed, torch::Tensor cb, int g);",
+    cuda_sources=KERNEL,
+    functions=["codebook_gemv"],
+    extra_cuda_cflags=["-O3"],
+    verbose=False,
+)
 
 
 @torch.no_grad()
