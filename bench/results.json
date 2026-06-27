@@ -1,0 +1,21 @@
+{
+  "env": {
+    "gpu": "NVIDIA H100 PCIe",
+    "torch": "2.4.0+cu121", "cuda": "12.1", "transformers": "4.44.2", "awq": "0.2.7.post2",
+    "seed": 0,
+    "harness": "HuggingFace forward path, greedy, batch=1, warmup + median of 3",
+    "note": "Llama-2-7B. FULL wikitext-2 perplexity (not capped), seqlen 2048, decode_tokens=128."
+  },
+  "results": [
+    {"name": "fp16", "method": "fp16", "bits": 16.0, "model": "NousResearch/Llama-2-7b-hf",
+     "decode_tok_per_s": 43.7, "prefill_ms": 116.1, "wikitext2_ppl": 5.468, "peak_vram_gb": 15.26},
+    {"name": "awq-4bit", "method": "AWQ", "bits": 4.0, "model": "TheBloke/Llama-2-7B-AWQ",
+     "decode_tok_per_s": 26.8, "prefill_ms": 126.5, "wikitext2_ppl": 5.602, "peak_vram_gb": 5.72},
+    {"name": "aqlm-2bit", "method": "AQLM", "bits": 2.0, "model": "ISTA-DASLab/Llama-2-7b-AQLM-2Bit-1x16-hf",
+     "decode_tok_per_s": 25.0, "prefill_ms": 171.0, "wikitext2_ppl": 6.336, "peak_vram_gb": 4.16},
+    {"name": "gptq-4bit", "method": "GPTQ", "bits": 4.0, "model": "TheBloke/Llama-2-7B-GPTQ",
+     "error": "gptqmodel wheel/metadata generation fails on this env (3 attempts). Measure via vLLM/Marlin separately. AWQ above is the representative 4-bit point."},
+    {"name": "qtip-2bit", "method": "QTIP", "bits": 2.0, "model": "relaxml/...",
+     "error": "QTIP repo not pip-installable at root + checkpoint id needs verification. Custom research kernels; requires manual wiring per Cornell-RelaxML/qtip. AQLM above represents the 2-bit accurate regime."}
+  ]
+}

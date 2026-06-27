@@ -13,3 +13,5 @@ p[0-9]*
 prof[0-9]*
 # never ignore source files
 !*.cu
+# the line "bench" above is the compiled executable of bench.cu; keep the bench/ dir
+!bench/

@@ -1,0 +1,16 @@
+{
+  "env": {
+    "gpu": "NVIDIA H100 PCIe (80 GB)",
+    "torch": "2.4.0+cu121", "cuda": "12.1", "transformers": "4.44.2", "seed": 0,
+    "harness": "HuggingFace forward path, greedy, batch=1, warmup + median of 3",
+    "note": "Llama-2-70B. FULL wikitext-2 perplexity (not capped), seqlen 2048, decode_tokens=128. fp16 70B (~138 GB) does not fit on one 80 GB GPU and was not run."
+  },
+  "results": [
+    {"name": "fp16-70b", "method": "fp16", "bits": 16.0, "model": "Llama-2-70b (fp16)",
+     "fits_on_80gb": false, "approx_vram_gb": 138.0, "comment": "does NOT fit on one 80 GB H100; needs 2+ GPUs"},
+    {"name": "awq-4bit-70b", "method": "AWQ", "bits": 4.0, "model": "TheBloke/Llama-2-70B-AWQ",
+     "fits_on_80gb": true, "decode_tok_per_s": 9.1, "prefill_ms": 1052.8, "wikitext2_ppl": 3.413, "peak_vram_gb": 38.42},
+    {"name": "aqlm-2bit-70b", "method": "AQLM", "bits": 2.0, "model": "ISTA-DASLab/Llama-2-70b-AQLM-2Bit-1x16-hf",
+     "fits_on_80gb": true, "decode_tok_per_s": 9.2, "prefill_ms": 1400.1, "wikitext2_ppl": 4.059, "peak_vram_gb": 20.69}
+  ]
+}
