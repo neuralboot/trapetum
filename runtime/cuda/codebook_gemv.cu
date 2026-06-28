@@ -76,17 +76,23 @@ __global__ void resadd_k(__half* __restrict__ h, const float* __restrict__ delta
 
 // RoPE (HF Llama rotate-half): for each head and d in [0, head_dim/2), rotate the pair
 // (x[d], x[d+head_dim/2]) by angle = pos * base^(-2d/head_dim).
-__global__ void rope_k(__half* __restrict__ x, int pos, int n_heads, int head_dim, float base) {
+__global__ void rope_k(__half* __restrict__ x, int pos, int n_heads, int head_dim, const float* __restrict__ inv_freq) {
     int t = blockIdx.x*blockDim.x + threadIdx.x;
     int half = head_dim/2;
     if (t >= n_heads*half) return;
     int h = t / half, d = t % half;
-    float angle = pos * powf(base, -2.0f*d/head_dim);
+    float angle = (float)pos * inv_freq[d];   // freqs precomputed (scaling baked in: llama3/linear/default)
     float c = cosf(angle), s = sinf(angle);
     int i = h*head_dim + d, j = h*head_dim + d + half;
     float x0 = __half2float(x[i]), x1 = __half2float(x[j]);
     x[i] = __float2half(x0*c - x1*s);
     x[j] = __float2half(x1*c + x0*s);
+}
+
+// add a bias vector (f32) into an f32 accumulator: a[i] += b[i]
+__global__ void vadd_k(float* __restrict__ a, const float* __restrict__ b, int n) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) a[i] += b[i];
 }
 
 // Batch-1 decode attention. One block per query head, head_dim threads. Cache layout is
@@ -214,10 +220,14 @@ void op_residual_add(void* h_half, const void* delta_f32, int n) {
 }
 
 // attention-block ops
-void op_rope(void* x_half, int pos, int n_heads, int head_dim, float base) {
+void op_rope(void* x_half, int pos, int n_heads, int head_dim, const void* inv_freq) {
     ensure_stream();
     int total = n_heads * (head_dim/2);
-    rope_k<<<(total+127)/128, 128, 0, g_stream>>>((__half*)x_half, pos, n_heads, head_dim, base);
+    rope_k<<<(total+127)/128, 128, 0, g_stream>>>((__half*)x_half, pos, n_heads, head_dim, (const float*)inv_freq);
+}
+void op_vadd(void* a_f32, const void* b_f32, int n) {
+    ensure_stream();
+    vadd_k<<<(n+255)/256, 256, 0, g_stream>>>((float*)a_f32, (const float*)b_f32, n);
 }
 // append a (n_kv*head_dim) fp16 vector to a [max_seq][n_kv*head_dim] cache at row `pos`
 void op_cache_append(void* cache_half, const void* src_half, int pos, int dim) {

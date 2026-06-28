@@ -3,10 +3,16 @@ name = "trapetum"
 version = "0.1.0"
 edition = "2021"
 description = "Minimal Rust runtime hosting the fused 4-bit codebook decode CUDA kernel, no Python in the loop"
-license = "CC-BY-4.0"
+license = "BUSL-1.1"
 
 [dependencies]
 half = "2"   # only for the CPU reference (emulate the fp16 rounding the GPU does)
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+tiny_http = "0.12"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+getrandom = "0.2"
 
 [lib]
 name = "trapetum"

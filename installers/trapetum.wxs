@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Trapetum Windows installer (WiX v3). Double-click .msi wizard.
+     Installs serve.exe + cudart + nssm to Program Files\Trapetum, then registers
+     and starts the Trapetum service (localhost, no password by default). -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+  <Product Id="*" Name="Trapetum" Language="1033" Version="0.1.0"
+           Manufacturer="neuralboot" UpgradeCode="153667E0-F14B-4F10-B527-D12A5D832648">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
+             Description="Trapetum — local 4-bit LLM inference server" Manufacturer="neuralboot" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Trapetum is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="trapetum.ico" SourceFile="trapetum.ico" />
+    <Property Id="ARPPRODUCTICON" Value="trapetum.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://neuralboot.com/trapetum/" />
+    <Property Id="ARPHELPLINK" Value="mailto:contact@neuralboot.com" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Trapetum">
+          <Component Id="cmp_serve" Guid="*">
+            <File Id="f_serve" Source="stage\serve.exe" KeyPath="yes" />
+          </Component>
+          <Component Id="cmp_cudart" Guid="*">
+            <File Id="f_cudart" Source="stage\cudart64_12.dll" KeyPath="yes" />
+          </Component>
+          <Component Id="cmp_svcinstall" Guid="*">
+            <File Id="f_svcinstall" Source="svc-install.ps1" KeyPath="yes" />
+          </Component>
+          <Component Id="cmp_svcremove" Guid="*">
+            <File Id="f_svcremove" Source="svc-remove.ps1" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Main" Title="Trapetum" Level="1">
+      <ComponentRef Id="cmp_serve" />
+      <ComponentRef Id="cmp_cudart" />
+      <ComponentRef Id="cmp_svcinstall" />
+      <ComponentRef Id="cmp_svcremove" />
+    </Feature>
+
+    <!-- register + start the service after files are laid down -->
+    <SetProperty Id="RunSvcInstall" Before="RunSvcInstall" Sequence="execute"
+      Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File &quot;[INSTALLFOLDER]svc-install.ps1&quot;" />
+    <CustomAction Id="RunSvcInstall" BinaryKey="WixCA" DllEntry="WixQuietExec64"
+      Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- stop + remove the service on uninstall, before files are removed -->
+    <SetProperty Id="RunSvcRemove" Before="RunSvcRemove" Sequence="execute"
+      Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File &quot;[INSTALLFOLDER]svc-remove.ps1&quot;" />
+    <CustomAction Id="RunSvcRemove" BinaryKey="WixCA" DllEntry="WixQuietExec64"
+      Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RunSvcRemove" Before="RemoveFiles">Installed AND (REMOVE="ALL")</Custom>
+      <Custom Action="RunSvcInstall" After="InstallFiles">NOT Installed OR UPGRADINGPRODUCTCODE</Custom>
+    </InstallExecuteSequence>
+
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <UIRef Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />
+  </Product>
+</Wix>

@@ -1,0 +1,21 @@
+[Unit]
+Description=Trapetum local 4-bit LLM inference server (neuralboot)
+Documentation=https://neuralboot.com/trapetum
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__HOME__
+Environment=PATH=/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin
+# Optional: free ElectricityMaps token for live per-hour grid carbon data
+# Environment=TRAPETUM_CARBON_TOKEN=your_token_here
+ExecStart=__BIN__ __MODELS__ 8088
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

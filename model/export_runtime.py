@@ -42,15 +42,30 @@ def kmeans_cols(Wt, iters=12):
     return centroids, best_k  # [K,out], [in,out]
 
 
-@torch.no_grad()
-def quantize(weight):
-    # weight: nn.Linear.weight [out, in]. Returns packed [in,out/2] u8, cb [K,out] f32, W_dq [out,in].
-    Wt = weight.t().contiguous().float().cuda()             # [in, out]
-    cb, idx = kmeans_cols(Wt)                               # [K,out], [in,out]
-    Wt_dq = torch.gather(cb, 0, idx)                        # [in,out]
+def _quant_block(Wt):
+    # Wt: [in, c] f32 on cuda. Returns packed [in,c/2] u8, cb [K,c] f32, Wt_dq [c,in] half (cpu).
+    cb, idx = kmeans_cols(Wt)                               # [K,c], [in,c]
+    Wt_dq = torch.gather(cb, 0, idx)                        # [in,c]
     idxu = idx.to(torch.uint8)
-    packed = (idxu[:, 0::2] | (idxu[:, 1::2] << 4)).contiguous()  # [in, out/2]
-    return (packed.cpu().numpy(), cb.cpu().numpy().astype(np.float32), Wt_dq.t().contiguous().half().cpu())
+    packed = (idxu[:, 0::2] | (idxu[:, 1::2] << 4)).contiguous()  # [in, c/2]
+    return packed.cpu().numpy(), cb.cpu().numpy().astype(np.float32), Wt_dq.t().contiguous().half().cpu()
+
+
+@torch.no_grad()
+def quantize(weight, chunk=16384):
+    # weight: nn.Linear.weight [out, in]. Returns packed [in,out/2] u8, cb [K,out] f32, W_dq [out,in].
+    out_dim = weight.shape[0]
+    if out_dim <= 20000:                                   # transformer layers: fast single-shot GPU path
+        return _quant_block(weight.t().contiguous().float().cuda())
+    # large LM head (big vocab): chunk over output columns so the k-means workspace stays bounded.
+    # chunk must be even so the nibble-pairing (cols 2k, 2k+1) never straddles a boundary.
+    Wt_full = weight.t().contiguous().float().cpu()        # [in, out] on CPU, fed to GPU per chunk
+    packs, cbs, dqs = [], [], []
+    for s in range(0, out_dim, chunk):
+        p, c, d = _quant_block(Wt_full[:, s:s + chunk].cuda())
+        packs.append(p); cbs.append(c); dqs.append(d)
+        torch.cuda.empty_cache()
+    return (np.concatenate(packs, axis=1), np.concatenate(cbs, axis=1), torch.cat(dqs, 0))
 
 
 def w_f32(f, t):
@@ -73,7 +88,9 @@ def main():
 
     print("loading", args.model, flush=True)
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, torch_dtype=torch.float16, low_cpu_mem_usage=True, device_map="cuda"
+    )  # load straight onto the GPU (24 GB) to avoid CPU-RAM OOM on small boxes
     cfg = model.config
     hidden = cfg.hidden_size
     n_heads = cfg.num_attention_heads
@@ -81,6 +98,7 @@ def main():
     head_dim = hidden // n_heads
     inter = cfg.intermediate_size
     vocab = cfg.vocab_size
+    pad_vocab = ((vocab + 255) // 256) * 256  # kernel tiles quantized output in blocks of 256
     n_layers = cfg.num_hidden_layers
     eps = cfg.rms_norm_eps
     base = float(getattr(cfg, "rope_theta", 10000.0))
@@ -88,23 +106,70 @@ def main():
 
     path = os.path.join(args.out, "model.cbk")
     f = open(path, "wb")
-    f.write(b"CBK1")
-    f.write(struct.pack("<7i", n_layers, hidden, n_heads, n_kv, head_dim, inter, vocab))
-    f.write(struct.pack("<2f", eps, base))
-    w_f16(f, model.model.embed_tokens.weight)  # [vocab, hidden]
+    import torch as _torch
+    rs = getattr(cfg, "rope_scaling", None)
+    rope_scale = 1.0
+    if isinstance(rs, dict) and (rs.get("type") or rs.get("rope_type")) == "linear":
+        rope_scale = float(rs.get("factor", 1.0))
+    kvdim = n_kv * head_dim
+    if kvdim % 256 != 0:
+        raise SystemExit(f"INCOMPATIBLE: KV dim {kvdim} is not a multiple of 256 (GQA too small for the kernel)")
+    has_bias = 1 if getattr(model.model.layers[0].self_attn.q_proj, "bias", None) is not None else 0
+    # compute RoPE frequencies ourselves (robust across versions): default / linear / llama3
+    import math
+    rope_theta = 10000.0
+    if isinstance(rs, dict) and rs.get("rope_theta"):
+        rope_theta = float(rs["rope_theta"])
+    else:
+        try:
+            rope_theta = float(cfg.rope_theta)
+        except Exception:
+            rope_theta = 10000.0
+    inv_freq = 1.0 / (rope_theta ** (_torch.arange(0, head_dim, 2).float() / head_dim))
+    rtype = (rs.get("rope_type") or rs.get("type")) if isinstance(rs, dict) else None
+    if rtype == "llama3":
+        factor = float(rs["factor"]); lo = float(rs["low_freq_factor"]); hi = float(rs["high_freq_factor"])
+        old_len = float(rs["original_max_position_embeddings"])
+        low_wl, high_wl = old_len / lo, old_len / hi
+        wavelen = 2 * math.pi / inv_freq
+        inv_l = _torch.where(wavelen > low_wl, inv_freq / factor, inv_freq)
+        smooth = (old_len / wavelen - lo) / (hi - lo)
+        smoothed = (1 - smooth) * inv_l / factor + smooth * inv_l
+        is_med = (~(wavelen < high_wl)) & (~(wavelen > low_wl))
+        inv_freq = _torch.where(is_med, smoothed, inv_l)
+    elif rtype == "linear":
+        inv_freq = inv_freq / float(rs.get("factor", 1.0))
+    inv_freq = inv_freq.float().cpu().contiguous()
+    base = rope_theta
+    print(f"rope: theta={rope_theta} type={rtype} has_bias={has_bias} inv_freq[{inv_freq.numel()}]", flush=True)
+    f.write(b"CBK3")
+    f.write(struct.pack("<7i", n_layers, hidden, n_heads, n_kv, head_dim, inter, pad_vocab))
+    f.write(struct.pack("<3f", eps, base, rope_scale))
+    f.write(struct.pack("<i", has_bias))
+    f.write(inv_freq.numpy().astype("<f4").tobytes())
+    def _pad_rows(w):
+        if w.shape[0] >= pad_vocab:
+            return w
+        z = _torch.zeros(pad_vocab - w.shape[0], w.shape[1], dtype=w.dtype, device=w.device)
+        return _torch.cat([w, z], 0)
 
-    def quant_write(lin):
+    w_f16(f, _pad_rows(model.model.embed_tokens.weight))  # [pad_vocab, hidden]
+
+    def quant_write(lin, bias=False):
         packed, cb, w_dq = quantize(lin.weight)
         f.write(packed.tobytes())
         f.write(cb.tobytes())
+        if bias:
+            b = lin.bias if getattr(lin, "bias", None) is not None else _torch.zeros(lin.weight.shape[0], device=lin.weight.device)
+            f.write(b.detach().float().cpu().numpy().astype("<f4").tobytes())  # [out]
         lin.weight.data = w_dq.to(lin.weight.device)  # replace for the reference forward
 
     for li in range(n_layers):
         L = model.model.layers[li]
         w_f32(f, L.input_layernorm.weight)
-        quant_write(L.self_attn.q_proj)
-        quant_write(L.self_attn.k_proj)
-        quant_write(L.self_attn.v_proj)
+        quant_write(L.self_attn.q_proj, bias=bool(has_bias))
+        quant_write(L.self_attn.k_proj, bias=bool(has_bias))
+        quant_write(L.self_attn.v_proj, bias=bool(has_bias))
         quant_write(L.self_attn.o_proj)
         w_f32(f, L.post_attention_layernorm.weight)
         quant_write(L.mlp.gate_proj)
@@ -112,7 +177,11 @@ def main():
         quant_write(L.mlp.down_proj)
         print(f"  layer {li+1}/{n_layers} quantized", flush=True)
     w_f32(f, model.model.norm.weight)
-    quant_write(model.lm_head)
+    # lm_head: pad output rows to pad_vocab for the kernel; keep the real vocab for the reference
+    _packed, _cb, _wdq = quantize(_pad_rows(model.lm_head.weight))
+    f.write(_packed.tobytes())
+    f.write(_cb.tobytes())
+    model.lm_head.weight.data = _wdq[:vocab].to(model.lm_head.weight.device)
     f.close()
     print("wrote", path, os.path.getsize(path) // (1024 * 1024), "MB", flush=True)
 

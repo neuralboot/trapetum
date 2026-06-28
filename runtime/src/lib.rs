@@ -29,7 +29,8 @@ extern "C" {
     fn op_rmsnorm(x_half: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32);
     fn op_silu_mul(gate_f32: *const c_void, up_f32: *const c_void, out_half: *mut c_void, n: i32);
     fn op_residual_add(h_half: *mut c_void, delta_f32: *const c_void, n: i32);
-    fn op_rope(x_half: *mut c_void, pos: i32, n_heads: i32, head_dim: i32, base: f32);
+    fn op_rope(x_half: *mut c_void, pos: i32, n_heads: i32, head_dim: i32, inv_freq: *const c_void);
+    fn op_vadd(a_f32: *mut c_void, b_f32: *const c_void, n: i32);
     fn op_cache_append(cache_half: *mut c_void, src_half: *const c_void, pos: i32, dim: i32);
     fn op_attn(
         q_half: *const c_void,
@@ -235,9 +236,14 @@ impl MlpBlock {
 }
 
 /// RoPE (HF Llama rotate-half) in place on `x` (`n_heads * head_dim`) at position `pos`.
-pub fn rope(x: &mut DevHalf, pos: usize, n_heads: usize, head_dim: usize, base: f32) {
+pub fn rope(x: &mut DevHalf, pos: usize, n_heads: usize, head_dim: usize, inv_freq: &DevF32) {
     assert_eq!(x.n, n_heads * head_dim);
-    unsafe { op_rope(x.ptr, pos as i32, n_heads as i32, head_dim as i32, base) };
+    unsafe { op_rope(x.ptr, pos as i32, n_heads as i32, head_dim as i32, inv_freq.ptr) };
+}
+/// Add a bias vector into an f32 accumulator in place: `a += b`.
+pub fn vadd(a: &mut DevF32, b: &DevF32) {
+    assert_eq!(a.n, b.n);
+    unsafe { op_vadd(a.ptr, b.ptr, a.n as i32) };
 }
 
 /// Append `src` (a `n_kv*head_dim` fp16 vector) to the KV cache at row `pos`.
@@ -287,7 +293,10 @@ pub struct AttnBlock {
     n_kv: usize,
     head_dim: usize,
     eps: f32,
-    base: f32,
+    inv_freq: DevF32,
+    qbias: Option<DevF32>,
+    kbias: Option<DevF32>,
+    vbias: Option<DevF32>,
 }
 
 impl AttnBlock {
@@ -304,7 +313,8 @@ impl AttnBlock {
         v: (&[u8], &[f32]),
         o: (&[u8], &[f32]),
         eps: f32,
-        base: f32,
+        inv_freq: &[f32],
+        biases: Option<(&[f32], &[f32], &[f32])>,
     ) -> Self {
         let qdim = n_heads * head_dim; // = hidden for MHA
         let kv_dim = n_kv * head_dim;
@@ -329,7 +339,10 @@ impl AttnBlock {
             n_kv,
             head_dim,
             eps,
-            base,
+            inv_freq: DevF32::from_host(inv_freq),
+            qbias: biases.map(|b| DevF32::from_host(b.0)),
+            kbias: biases.map(|b| DevF32::from_host(b.1)),
+            vbias: biases.map(|b| DevF32::from_host(b.2)),
         }
     }
 
@@ -337,13 +350,16 @@ impl AttnBlock {
     pub fn forward(&mut self, h: &mut DevHalf, pos: usize) {
         rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
         self.q.forward_into(&self.norm, &mut self.qb);
+        if let Some(b) = &self.qbias { vadd(&mut self.qb, b); }
         self.qh.copy_cast_from(&self.qb);
         self.k.forward_into(&self.norm, &mut self.kb);
+        if let Some(b) = &self.kbias { vadd(&mut self.kb, b); }
         self.kh.copy_cast_from(&self.kb);
         self.v.forward_into(&self.norm, &mut self.vb);
+        if let Some(b) = &self.vbias { vadd(&mut self.vb, b); }
         self.vh.copy_cast_from(&self.vb);
-        rope(&mut self.qh, pos, self.n_heads, self.head_dim, self.base);
-        rope(&mut self.kh, pos, self.n_kv, self.head_dim, self.base);
+        rope(&mut self.qh, pos, self.n_heads, self.head_dim, &self.inv_freq);
+        rope(&mut self.kh, pos, self.n_kv, self.head_dim, &self.inv_freq);
         cache_append(&mut self.cache_k, &self.kh, pos);
         cache_append(&mut self.cache_v, &self.vh, pos);
         attention(
@@ -438,12 +454,23 @@ impl Model {
         let mut r = BufReader::new(File::open(path)?);
         let mut magic = [0u8; 4];
         r.read_exact(&mut magic)?;
-        assert_eq!(&magic, b"CBK1", "bad magic (not a .cbk file)");
+        let v2 = &magic == b"CBK2";
+        let v3 = &magic == b"CBK3";
+        assert!(&magic == b"CBK1" || v2 || v3, "bad magic (not a .cbk file)");
         let c: Vec<usize> = (0..7).map(|_| rd_i32(&mut r) as usize).collect();
         let (n_layers, hidden, n_heads, n_kv, head_dim, inter, vocab) =
             (c[0], c[1], c[2], c[3], c[4], c[5], c[6]);
         let eps = rd_f32(&mut r);
         let base = rd_f32(&mut r);
+        let scale = if v2 || v3 { rd_f32(&mut r) } else { 1.0 };
+        let has_bias = if v3 { rd_i32(&mut r) != 0 } else { false };
+        let halfd = head_dim / 2;
+        // CBK3 stores the RoPE frequencies (any scaling baked in); older formats compute them
+        let inv_freq: Vec<f32> = if v3 {
+            rd_f32_vec(&mut r, halfd)
+        } else {
+            (0..halfd).map(|d| base.powf(-2.0 * d as f32 / head_dim as f32) / scale).collect()
+        };
         let embedding = rd_f16_vec(&mut r, vocab * hidden);
         let qdim = n_heads * head_dim;
         let kvdim = n_kv * head_dim;
@@ -451,16 +478,23 @@ impl Model {
         for _ in 0..n_layers {
             let an = rd_f32_vec(&mut r, hidden);
             let (qp, qc) = (rd_u8_vec(&mut r, hidden * qdim / 2), rd_f32_vec(&mut r, K * qdim));
+            let qb = if has_bias { Some(rd_f32_vec(&mut r, qdim)) } else { None };
             let (kp, kc) = (rd_u8_vec(&mut r, hidden * kvdim / 2), rd_f32_vec(&mut r, K * kvdim));
+            let kb = if has_bias { Some(rd_f32_vec(&mut r, kvdim)) } else { None };
             let (vp, vc) = (rd_u8_vec(&mut r, hidden * kvdim / 2), rd_f32_vec(&mut r, K * kvdim));
+            let vb = if has_bias { Some(rd_f32_vec(&mut r, kvdim)) } else { None };
             let (op, oc) = (rd_u8_vec(&mut r, qdim * hidden / 2), rd_f32_vec(&mut r, K * hidden));
             let pn = rd_f32_vec(&mut r, hidden);
             let (gp, gc) = (rd_u8_vec(&mut r, hidden * inter / 2), rd_f32_vec(&mut r, K * inter));
             let (up, uc) = (rd_u8_vec(&mut r, hidden * inter / 2), rd_f32_vec(&mut r, K * inter));
             let (dp, dc) = (rd_u8_vec(&mut r, inter * hidden / 2), rd_f32_vec(&mut r, K * hidden));
+            let biases = match (&qb, &kb, &vb) {
+                (Some(q), Some(k), Some(v)) => Some((q.as_slice(), k.as_slice(), v.as_slice())),
+                _ => None,
+            };
             let attn = AttnBlock::new(
                 hidden, n_heads, n_kv, head_dim, max_seq, &an,
-                (&qp, &qc), (&kp, &kc), (&vp, &vc), (&op, &oc), eps, base,
+                (&qp, &qc), (&kp, &kc), (&vp, &vc), (&op, &oc), eps, &inv_freq, biases,
             );
             let mlp = MlpBlock::new(hidden, inter, &pn, &gp, &gc, &up, &uc, &dp, &dc, eps);
             layers.push(Layer::new(attn, mlp));

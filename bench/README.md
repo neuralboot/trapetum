@@ -135,4 +135,4 @@ under CUDA graphs).
 
 ## License
 
-CC BY 4.0 (see `LICENSE`). Cite via `CITATION.cff`.
+Business Source License 1.1 (source available; see `LICENSE`). Cite via `CITATION.cff`.

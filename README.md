@@ -374,9 +374,9 @@ To turn this into a defensible research comparison:
 
 ## License & citation
 
-Licensed under **CC BY 4.0** (see `LICENSE`): you may use, share and adapt the
-material, including commercially, **with attribution**. If you use this work,
-please cite it via `CITATION.cff`.
-
-Note: CC licenses are intended for creative works rather than software; for a pure
-software project, Apache-2.0 or MIT is the more conventional choice.
+Licensed under the **Business Source License 1.1** (see `LICENSE`): the source is
+available to read, audit, modify and use for non-production and internal
+production purposes. Offering it to third parties as a commercial product or
+hosted service requires a commercial license from the Licensor
+(contact@neuralboot.com). The license converts to **Apache 2.0** on the Change
+Date (2030-06-30). If you use this work, please cite it via `CITATION.cff`.
