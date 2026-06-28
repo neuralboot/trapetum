@@ -30,7 +30,7 @@ Y[m, j]     = sum_i  X[m, i] * W_deq[i, j]
   additive-VQ training that beats the scalar codebook, and the accuracy probes.
 - [`bench/`](bench/): a fair single-harness speed vs accuracy vs memory benchmark of
   fp16, AWQ and AQLM (the `pareto`/`mem70` figures and `results*.json`).
-- [`paper/`](paper/): the write-up (`fused-codebook-decode.pdf`).
+- [`paper/`](paper/): the write-up (`trapetum.pdf`).
 - [`runtime/`](runtime/): a minimal **Rust** runtime that hosts the CUDA kernel with no
   Python in the loop (the bootstrap of a deployable, single-binary inference path).
 
@@ -149,7 +149,7 @@ Reproduce with `python kernels/shapes_test.py`.
 ### Model-level results (Llama-2 7B)
 
 The scheme was taken all the way to a real model (scripts in [`model/`](model/); full
-write-up in `paper/fused-codebook-decode.pdf`).
+write-up in `paper/trapetum.pdf`).
 
 **Memory.** Quantizing all 224 projection layers to 4-bit drops peak VRAM from
 13.56 GB to 4.63 GB (**2.9x**); the 7B model runs in under 5 GB on a consumer card.

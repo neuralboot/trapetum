@@ -126,10 +126,13 @@ class CodebookLinear(nn.Module):
 
 
 class PowerSampler(threading.Thread):
-    """Samples GPU power via pynvml (low-overhead, in-process) or nvidia-smi as fallback."""
+    """Samples GPU power via pynvml (low-overhead, in-process) or nvidia-smi as fallback.
+    Stores (t, watts) pairs so energy is INTEGRATED (trapezoid) over the real window,
+    not approximated by mean_watts/tps."""
     def __init__(self):
         super().__init__(daemon=True)
-        self.samples = []
+        self.samples = []      # watts
+        self.times = []        # monotonic timestamps (s)
         self.run_flag = True
         self.nvml = None
         try:
@@ -144,18 +147,36 @@ class PowerSampler(threading.Thread):
         while self.run_flag:
             try:
                 if self.nvml is not None:
-                    self.samples.append(self._pynvml.nvmlDeviceGetPowerUsage(self.nvml) / 1000.0)
+                    w = self._pynvml.nvmlDeviceGetPowerUsage(self.nvml) / 1000.0
                 else:
                     out = subprocess.run(
                         ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
                         capture_output=True, text=True, timeout=2).stdout.strip().splitlines()[0]
-                    self.samples.append(float(out))
+                    w = float(out)
+                self.samples.append(w); self.times.append(time.monotonic())
             except Exception:
                 pass
             time.sleep(0.02)
 
     def mean_watts(self):
         return float(np.mean(self.samples)) if self.samples else float("nan")
+    def std_watts(self):
+        return float(np.std(self.samples)) if self.samples else float("nan")
+    def energy_joules(self):
+        """Trapezoidal integral of power over the sampled window (J) -- the rigorous number."""
+        if len(self.samples) < 2:
+            return float("nan")
+        return float(np.trapz(np.array(self.samples), np.array(self.times)))
+
+
+def measure_idle_watts(seconds=3.0):
+    """GPU idle-power baseline (no compute): lets us report NET (active) energy too,
+    so the headline is not inflated by the card's static draw."""
+    torch.cuda.synchronize()
+    ps = PowerSampler(); ps.start()
+    time.sleep(seconds)
+    ps.run_flag = False; ps.join()
+    return ps.mean_watts()
 
 
 def linears(model):
@@ -168,6 +189,8 @@ def linears(model):
 
 @torch.no_grad()
 def wikitext_ppl(model, tok, ctx, max_tokens):
+    if max_tokens <= 0:
+        return None   # skip PPL (already known) -> energy-only run, avoids datasets-lib version issues
     from datasets import load_dataset
     data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     ids = tok("\n\n".join(data["text"]), return_tensors="pt").input_ids[0][:max_tokens].cuda()
@@ -185,27 +208,41 @@ def wikitext_ppl(model, tok, ctx, max_tokens):
 
 
 @torch.no_grad()
-def decode_energy(model, tok, n_gen):
+def decode_energy(model, tok, n_gen, repeats=3, idle_w=None):
+    """Returns (tps, jpt, extra). jpt is energy/token from the TRAPEZOIDAL integral of
+    sampled power (not mean_watts/tps), averaged over `repeats` runs with std reported.
+    extra['jpt_net'] subtracts the idle baseline so the headline is the ACTIVE energy."""
     ids = tok("The capital of France is", return_tensors="pt").input_ids.cuda()
+    # warmup once
     past = model(ids, use_cache=True).past_key_values
     cur = ids[:, -1:]
-    for _ in range(8):  # warmup
+    for _ in range(8):
         o = model(cur, past_key_values=past, use_cache=True)
         past = o.past_key_values
         cur = o.logits[:, -1:].argmax(-1)
     torch.cuda.synchronize()
-    ps = PowerSampler(); ps.start()
-    t0 = time.time()
-    for _ in range(n_gen):
-        o = model(cur, past_key_values=past, use_cache=True)
-        past = o.past_key_values
-        cur = o.logits[:, -1:].argmax(-1)
-    torch.cuda.synchronize()
-    dt = time.time() - t0
-    ps.run_flag = False; ps.join()
-    tps = n_gen / dt
-    jpt = ps.mean_watts() / tps
-    return tps, jpt
+    tps_l, jpt_l, w_l = [], [], []
+    for _ in range(repeats):
+        past = model(ids, use_cache=True).past_key_values   # fresh context per run (comparable)
+        cur = ids[:, -1:]
+        torch.cuda.synchronize()
+        ps = PowerSampler(); ps.start()
+        t0 = time.time()
+        for _ in range(n_gen):
+            o = model(cur, past_key_values=past, use_cache=True)
+            past = o.past_key_values
+            cur = o.logits[:, -1:].argmax(-1)
+        torch.cuda.synchronize()
+        dt = time.time() - t0
+        ps.run_flag = False; ps.join()
+        e = ps.energy_joules()
+        jpt = (e / n_gen) if e == e else (ps.mean_watts() / (n_gen / dt))  # integral, fallback to mean
+        tps_l.append(n_gen / dt); jpt_l.append(jpt); w_l.append(ps.mean_watts())
+    tps = float(np.mean(tps_l)); jpt = float(np.mean(jpt_l))
+    extra = {"jpt_std": float(np.std(jpt_l)), "watts": float(np.mean(w_l)),
+             "idle_w": idle_w, "repeats": repeats,
+             "jpt_net": (jpt - idle_w / tps) if isinstance(idle_w, (int, float)) else None}
+    return tps, jpt, extra
 
 
 def main():
@@ -227,10 +264,13 @@ def main():
     # fp16 baseline
     print("== fp16 ==", flush=True)
     m = load_fp16()
+    idle_w = measure_idle_watts()       # GPU static draw, for NET (active) energy
+    print("idle baseline: %.1f W" % idle_w, flush=True)
     nparam = sum(p.numel() for p in m.parameters())
     ppl = wikitext_ppl(m, tok, args.ctx, args.ppl_tokens)
-    tps, jpt = decode_energy(m, tok, args.gen)
-    rows.append(dict(method="fp16", bits=16.0, gb=nparam * 2 / 1e9, ppl=ppl, tps=tps, jpt=jpt))
+    tps, jpt, ex = decode_energy(m, tok, args.gen, idle_w=idle_w)
+    rows.append(dict(method="fp16", bits=16.0, gb=nparam * 2 / 1e9, ppl=ppl, tps=tps, jpt=jpt,
+                     jpt_std=ex["jpt_std"], jpt_net=ex["jpt_net"], watts=ex["watts"], idle_w=idle_w))
     print(rows[-1], flush=True)
     del m; torch.cuda.empty_cache()
 
@@ -255,9 +295,10 @@ def main():
         mm = L.mlp
         mm.gate_proj, mm.up_proj, mm.down_proj = (CodebookLinear(mm.gate_proj), CodebookLinear(mm.up_proj),
                                                   CodebookLinear(mm.down_proj))
-    tps_q, jpt_q = decode_energy(mk, tok, args.gen)
+    tps_q, jpt_q, exq = decode_energy(mk, tok, args.gen, idle_w=idle_w)
     rows.append(dict(method="codebook-4bit", bits=round(eff_bits, 2), gb=round(ours_gb, 2),
-                     ppl=ppl_q, tps=tps_q, jpt=jpt_q))
+                     ppl=ppl_q, tps=tps_q, jpt=jpt_q,
+                     jpt_std=exq["jpt_std"], jpt_net=exq["jpt_net"], watts=exq["watts"], idle_w=idle_w))
     print(rows[-1], flush=True)
     del mk; torch.cuda.empty_cache()
 
@@ -267,9 +308,10 @@ def main():
         ma = AutoModelForCausalLM.from_pretrained(
             "ISTA-DASLab/Llama-2-7b-AQLM-2Bit-2x8-hf", torch_dtype=torch.float16, trust_remote_code=True).cuda().eval()
         ppl_a = wikitext_ppl(ma, tok, args.ctx, args.ppl_tokens)
-        tps_a, jpt_a = decode_energy(ma, tok, args.gen)
+        tps_a, jpt_a, exa = decode_energy(ma, tok, args.gen, idle_w=idle_w)
         gb_a = sum(p.numel() * p.element_size() for p in ma.parameters()) / 1e9
-        rows.append(dict(method="aqlm-2bit", bits=2.0, gb=gb_a, ppl=ppl_a, tps=tps_a, jpt=jpt_a))
+        rows.append(dict(method="aqlm-2bit", bits=2.0, gb=gb_a, ppl=ppl_a, tps=tps_a, jpt=jpt_a,
+                         jpt_std=exa["jpt_std"], jpt_net=exa["jpt_net"], watts=exa["watts"], idle_w=idle_w))
         print(rows[-1], flush=True)
     except Exception as e:
         rows.append(dict(method="aqlm-2bit", bits=2.0, gb=None, ppl=None, tps=None, jpt=None,
@@ -286,14 +328,19 @@ def main():
         r["gco2_per_ktok_us400"] = gco2_per_ktok(r.get("jpt"), 400)
 
     json.dump(rows, open(os.path.join(args.out, "pareto.json"), "w"), indent=2)
-    print("\n| method | bits | mem GB | PPL | tok/s | J/token | gCO2/1k tok (FR/US) |", flush=True)
-    print("|---|---|---|---|---|---|---|", flush=True)
+    print("\n| method | bits | mem GB | PPL | tok/s | J/token (gross, +/-std) | J/token (net of idle) | gCO2/1k tok (FR/US) |", flush=True)
+    print("|---|---|---|---|---|---|---|---|", flush=True)
     for r in rows:
         def f(x, p="{:.2f}"):
             return p.format(x) if isinstance(x, (int, float)) else "n/a"
         co2 = f"{f(r['gco2_per_ktok_fr50'],'{:.3f}')} / {f(r['gco2_per_ktok_us400'],'{:.2f}')}"
-        print(f"| {r['method']} | {f(r['bits'])} | {f(r['gb'])} | {f(r['ppl'])} | {f(r['tps'],'{:.1f}')} | {f(r['jpt'],'{:.2f}')} | {co2} |", flush=True)
-    print("\nNOTE J/token is the measured primary axis. gCO2/1k-tok = J/token x grid intensity", flush=True)
+        jcell = f"{f(r['jpt'])} +/- {f(r.get('jpt_std'),'{:.2f}')}"
+        print(f"| {r['method']} | {f(r['bits'])} | {f(r['gb'])} | {f(r['ppl'])} | {f(r['tps'],'{:.1f}')} | {jcell} | {f(r.get('jpt_net'))} | {co2} |", flush=True)
+    print("\nNOTE J/token gross = trapezoidal integral of sampled GPU power / tokens, mean over %d runs."
+          % rows[0].get("repeats", 3) if rows else "", flush=True)
+    print("J/token NET subtracts the idle baseline (%.1f W) so the figure is the ACTIVE decode energy."
+          % (rows[0].get("idle_w") or float("nan")) if rows and rows[0].get("idle_w") else "", flush=True)
+    print("NOTE J/token is the measured primary axis. gCO2/1k-tok = J/token x grid intensity", flush=True)
     print("(FR ~50, US ~400 gCO2/kWh) -- a projection, not a measurement (RunPod grid mix unknown).", flush=True)
     print("Batch-1 decode; Marlin (uniform 4-bit) and batched throughput are TODO.", flush=True)
 

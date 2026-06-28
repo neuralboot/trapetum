@@ -74,10 +74,10 @@ def quantize_per_column(W, k=16, iters=10, chunk=2048):
     for c0 in range(0, OC, chunk):
         c1 = min(OC, c0+chunk); Wc = W[:, c0:c1]; cw = c1-c0
         cb = torch.zeros(k, cw, device=W.device); lo = Wc.min(0).values; hi = Wc.max(0).values
-        for c in range(k): cb[c] = lo + (hi-lo)*(c+0.5)/k
+        for c in range(k): cb[c] = lo + (hi-lo)*(c/(k-1))   # linear init, canonical
         ii = None
         for _ in range(iters):
-            d = (Wc.unsqueeze(-1)-cb.t().unsqueeze(0)).abs(); ii = d.argmin(-1); del d
+            d = (Wc.unsqueeze(-1)-cb.t().unsqueeze(0)) ** 2; ii = d.argmin(-1); del d   # L2/squared, canonical
             for c in range(k):
                 m = (ii==c); cb[c] = (Wc*m).sum(0)/m.sum(0).clamp(min=1)
         idx[:, c0:c1] = ii.to(torch.uint8); cbf[:, c0:c1] = cb.to(torch.float16)

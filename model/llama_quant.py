@@ -27,10 +27,10 @@ def quantize_per_column(W, k=16, iters=10):
     cb = torch.zeros(k, OC, device=W.device, dtype=torch.float32)
     lo = W.min(0).values; hi = W.max(0).values
     for c in range(k):
-        cb[c] = lo + (hi - lo) * (c + 0.5) / k
+        cb[c] = lo + (hi - lo) * (c / (k - 1))   # linear init, canonical (matches export_runtime.py / pareto.py)
     idx = torch.zeros(IC, OC, device=W.device, dtype=torch.long)
     for _ in range(iters):
-        d = (W.unsqueeze(-1) - cb.t().unsqueeze(0)).abs()   # (IC, OC, K)
+        d = (W.unsqueeze(-1) - cb.t().unsqueeze(0)) ** 2   # (IC, OC, K) -- L2/squared, canonical (k-means metric)
         idx = d.argmin(-1)
         del d
         for c in range(k):

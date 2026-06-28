@@ -6,6 +6,14 @@ machine, batch-1 decode, **all decode metrics measured over a 512-token generati
 with `python bench/pareto.py --gen 512` (Python rows) and the Rust runtime's
 `generate <model.cbk> ... 512` (Rust row).
 
+**Energy methodology (hardened).** J/token is the **trapezoidal integral** of the sampled
+GPU power over the decode window divided by the tokens generated (not `mean_watts / tok-per-s`),
+**averaged over 3 runs with the standard deviation reported**. We also measure the GPU
+**idle baseline** (static draw with weights resident, no compute) and report a **net J/token**
+that subtracts it, so the headline reflects the *active* decode energy rather than the card's
+idle draw. Power is sampled at ~50 Hz via `pynvml`. (The J/token column below is the older
+single-run gross figure; it is refreshed to gross+/-std and net on the next GPU run.)
+
 | method | bits | mem (GB) | Wikitext PPL | decode tok/s | J/token | gCO2/1k-tok (FR / US) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | fp16 (cuBLAS) | 16.0 | 13.48 | 5.28 | 45.2 | 5.45 | 0.076 / 0.61 |
@@ -14,6 +22,23 @@ with `python bench/pareto.py --gen 512` (Python rows) and the Rust runtime's
 | **codebook-4bit (ours, Rust runtime)** | 4.05 | 4.73* | 5.92 | **81** | **2.58** | **0.036 / 0.29** |
 
 \* 4.73 GB measured peak (3.5 GB weights + KV cache + activations).
+
+### Hardened energy re-measurement (3 runs, +/-std, trapezoidal integral, idle-subtracted)
+
+A focused energy-only re-run on the same RTX 4090 (PPL skipped), using the hardened harness
+above, re-measures the fp16 baseline and the Python-op 4-bit path:
+
+| method | decode tok/s | J/token gross (+/-std) | J/token net of idle |
+| --- | ---: | ---: | ---: |
+| fp16 | 46.2 | 5.31 +/- 0.13 | 4.03 |
+| codebook-4bit (Python op) | 28.5 | 3.94 +/- 0.08 | 1.86 |
+
+Idle baseline 59.4 W. The **net (active-decode) energy ratio is 2.17x** (4.03 / 1.86),
+*larger* than the gross ratio (1.35x): the fixed idle floor is shared by both methods and
+cancels once subtracted, leaving the 4-bit kernel at 112 W active versus 246 W for fp16. The
++/-std is ~2-3% over three runs, so the energy delta is well outside noise. The Rust-runtime
+and AQLM rows above remain prior single-run measurements; hardening those (the Rust energy
+wrapper, a working AQLM-kernel build) is future work.
 
 ## Honest reading
 
