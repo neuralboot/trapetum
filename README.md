@@ -385,3 +385,10 @@ production purposes. Offering it to third parties as a commercial product or
 hosted service requires a commercial license from the Licensor
 (contact@neuralboot.com). The license converts to **Apache 2.0** on the Change
 Date (2030-06-30). If you use this work, please cite it via `CITATION.cff`.
+
+## Authorship and provenance
+
+Trapetum is an independent personal project by Azziz Mimouni. It was designed and
+built **outside working hours, on my own personal computer at home**, and is
+unrelated to my professional duties (I work as a Data Protection Officer, not as a
+software developer). The commit history reflects this.
