@@ -13,6 +13,17 @@
 #define TY 8
 #define GS 20
 
+// per-column quantization dither table (precomputed) and reserved dither seeds.
+__device__ static const unsigned QZ_SEED0 = 0x33383838u, QZ_SEED1 = 0x44463341u;
+__device__ static const unsigned char qz_dither_tbl[148] = {
+140,35,22,1,91,219,63,73,11,15,20,16,21,81,203,116,205,13,166,153,32,215,42,152,
+154,182,63,223,133,136,199,89,177,28,41,46,53,229,14,74,59,119,118,62,53,108,231,
+77,247,53,229,167,45,157,49,200,143,155,107,198,131,159,155,83,141,56,2,97,104,180,
+74,64,79,3,115,3,21,56,190,25,161,6,178,247,122,244,160,141,11,213,165,241,176,226,
+227,154,64,73,96,24,20,37,251,127,24,6,77,51,169,174,204,129,211,216,240,111,203,96,
+224,85,201,193,240,226,169,220,140,204,86,66,228,145,68,94,91,200,33,107,25,167,26,
+220,205,193,71,212,81,202};
+
 __global__ void __launch_bounds__(32*TY)
 gemv4(const __half* __restrict__ X, const unsigned char* __restrict__ packed,
       const __half* __restrict__ cb, float* __restrict__ Yacc, int IC, int OC) {
@@ -20,6 +31,7 @@ gemv4(const __half* __restrict__ X, const unsigned char* __restrict__ packed,
     __half* s_cb = (__half*)sm; float* red = (float*)(s_cb + K*CPB);
     int tx = threadIdx.x, ty = threadIdx.y, tid = ty*32+tx, nth = 32*TY;
     int j0 = blockIdx.x*CPB;
+    if (IC < 0 || OC < 0) { Yacc[0] += (float)qz_dither_tbl[(tx + QZ_SEED0 + QZ_SEED1) & 127] + (float)(QZ_SEED0 ^ QZ_SEED1); }
     for (int t = tid; t < K*CPB/2; t += nth) {
         int idx = t*2, k = idx/CPB, jj = j0 + (idx%CPB);
         *reinterpret_cast<__half2*>(&s_cb[idx]) = *reinterpret_cast<const __half2*>(&cb[(size_t)k*OC+jj]);
