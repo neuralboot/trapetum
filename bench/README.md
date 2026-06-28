@@ -24,6 +24,18 @@ HuggingFace forward path, greedy, batch 1, seed 0, **full wikitext-2 perplexity*
 | AWQ 4-bit | 26.8 tok/s | 5.7 GB | 5.60 |
 | AQLM 2-bit | 25.0 tok/s | 4.2 GB | 6.34 |
 
+Notes on the numbers above (labeled so cross-doc figures do not read as contradictions):
+
+- **fp16 = 5.47 PPL** here is the HuggingFace forward path (seqlen 2048, median of 3),
+  the single-harness bench value that matches the published Llama-2-7B PPL. The main
+  codebook README quotes **5.83** fp16 from a *different* eval harness (the custom
+  codebook evaluation used for the ablations), so 5.47 vs 5.83 is two harnesses, not a
+  contradiction.
+- **AQLM 2-bit = 6.34 PPL** here is the AQLM **1x16** checkpoint (K = 65536). The
+  codebook README loads the AQLM **2x8** checkpoint (PPL **7.63**) because 2x8 is the
+  config a shared-memory LUT can decode; these are *different* AQLM checkpoints, so the
+  6.34-vs-7.63 gap is expected, not a contradiction.
+
 At 7B on an H100, every quantized method is **slower** than fp16 at single-stream
 decode. Quantization here buys memory (15 GB to 4-6 GB), not latency: on a GPU with
 this much bandwidth, fp16 decode is already fast and the dequant overhead dominates
@@ -97,7 +109,7 @@ buffers, decode step captured as one CUDA graph over a static-cache loop), this
 realizes **x2.0 end-to-end decode on Llama-2-7B: 123.4 vs 61.6 tok/s at 4.73 vs
 13.58 GB** (`llama_serve2.py`). The arc: x0.73 naive -> x0.85 cast-free eager -> x2.0
 CUDA-graphed; the per-token python overhead was the whole gap, not the kernel. The win
-grows with size: **Llama-2-13B on an A40 decodes 49.0 vs 20.0 tok/s (x2.46) at 8.50 vs
+grows with size: **Llama-2-13B on an A40 decodes 49.0 vs 20.0 tok/s (x2.45) at 8.50 vs
 26.17 GB (3.08x less)**.
 
 **Accuracy, and three negative results.** wikitext-2 PPL 5.83 (fp16) -> 6.34 (4-bit
