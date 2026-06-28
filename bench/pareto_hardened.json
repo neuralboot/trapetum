@@ -1,0 +1,41 @@
+[
+  {
+    "method": "fp16",
+    "bits": 16.0,
+    "gb": 13.476831232,
+    "ppl": null,
+    "tps": 46.221049539016455,
+    "jpt": 5.313258957343741,
+    "jpt_std": 0.12828667168510413,
+    "jpt_net": 4.0276953030352605,
+    "watts": 245.77975186046297,
+    "idle_w": 59.42010135135135,
+    "gco2_per_ktok_fr50": 0.07379526329644084,
+    "gco2_per_ktok_us400": 0.5903621063715268
+  },
+  {
+    "method": "codebook-4bit",
+    "bits": 4.05,
+    "gb": 3.81,
+    "ppl": null,
+    "tps": 28.4821034990138,
+    "jpt": 3.9449821523009176,
+    "jpt_std": 0.07905420678380366,
+    "jpt_net": 1.8587562752898048,
+    "watts": 112.46543875932144,
+    "idle_w": 59.42010135135135,
+    "gco2_per_ktok_fr50": 0.05479141878195719,
+    "gco2_per_ktok_us400": 0.4383313502556575
+  },
+  {
+    "method": "aqlm-2bit",
+    "bits": 2.0,
+    "gb": null,
+    "ppl": null,
+    "tps": null,
+    "jpt": null,
+    "note": "unavailable: 'LlamaForCausalLM' object has no attribute 'set_submodule'",
+    "gco2_per_ktok_fr50": null,
+    "gco2_per_ktok_us400": null
+  }
+]
