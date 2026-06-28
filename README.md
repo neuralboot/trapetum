@@ -390,5 +390,4 @@ Date (2030-06-30). If you use this work, please cite it via `CITATION.cff`.
 
 Trapetum is an independent personal project by Azziz Mimouni. It was designed and
 built **outside working hours, on my own personal computer at home**, and is
-unrelated to my professional duties (I work as a Data Protection Officer, not as a
-software developer). The commit history reflects this.
+unrelated to my professional duties.
