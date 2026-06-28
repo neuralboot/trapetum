@@ -26,7 +26,7 @@ Y[m, j]     = sum_i  X[m, i] * W_deq[i, j]
   vector-quantization kernel `avq_gemv*.cu`), their PyTorch binding (`quant_demo.py`),
   and the build/run harness (`benchmark.py`, `shapes_test.py`).
 - [`model/`](model/): model-level scripts on Llama-2: the cast-free CUDA-graph serving
-  integration that realizes the 2.0x/2.46x end-to-end decode speedup, the AQLM-style
+  integration that realizes the 2.0x/2.45x end-to-end decode speedup, the AQLM-style
   additive-VQ training that beats the scalar codebook, and the accuracy probes.
 - [`bench/`](bench/): a fair single-harness speed vs accuracy vs memory benchmark of
   fp16, AWQ and AQLM (the `pareto`/`mem70` figures and `results*.json`).
@@ -68,11 +68,15 @@ single binary. The 4-bit memory saving is universal; only the speedup depends on
 
 | Your GPU | Arch | Memory win | Decode speed |
 |---|---|---|---|
-| RTX 30 / 40 (3060, 3090, 4070, 4090, ...) | `sm_86` / `sm_89` | ~3.5x less | largest, up to 2.2x |
-| A100 / A40 / L40 | `sm_80` / `sm_86` / `sm_89` | ~3.5x less | strong, 2.34x on A40 |
-| H100 / H200 | `sm_90` | ~3.5x less | parity (fp16 already near roofline) |
-| Turing and older (GTX 16, RTX 20, V100) | `sm_70` / `sm_75` | ~3.5x less | untested, rebuild needed |
+| RTX 30 / 40 (3060, 3090, 4070, 4090, ...) | `sm_86` / `sm_89` | 3.9x disk / 2.9x VRAM | largest, up to 2.2x |
+| A100 / A40 / L40 | `sm_80` / `sm_86` / `sm_89` | 3.9x disk / 2.9x VRAM | strong, 2.34x on A40 |
+| H100 / H200 | `sm_90` | 3.9x disk / 2.9x VRAM | parity (fp16 already near roofline) |
+| Turing and older (GTX 16, RTX 20, V100) | `sm_70` / `sm_75` | 3.9x disk / 2.9x VRAM | untested, rebuild needed |
 | AMD, Apple Silicon, CPU | - | - | not supported (CUDA only) |
+
+Memory, labeled (both hold, they measure different things): **3.9x smaller on disk**
+(3.5 GB `.cbk` codebook file vs 13.5 GB fp16) and **2.9x less VRAM at runtime**
+(13.6 GB -> 4.7 GB peak).
 
 The memory win (a 7B in ~3.5 GB, so it fits an 8 GB card) holds on every NVIDIA GPU.
 Validated on Ampere, Ada and Hopper (`sm_80` to `sm_90`); pre-Ampere is untested, and the
@@ -164,9 +168,10 @@ captured as one CUDA graph over a static-cache loop) **realizes the win: the cod
 model decodes 123.4 vs 61.6 tok/s vs fp16 (x2.0 end-to-end) at 4.73 vs 13.58 GB.** The
 arc is x0.73 (naive) -> x0.85 (cast-free eager) -> **x2.0 (CUDA-graphed)**. The win
 grows with size and bandwidth-boundedness: Llama-2 13B on an A40 decodes 49.0 vs 20.0
-tok/s (**x2.46**) at 8.50 vs 26.17 GB (3.08x less).
+tok/s (**x2.45**) at 8.50 vs 26.17 GB (3.08x less).
 
-**Accuracy, and its ceiling.** wikitext-2 PPL goes 5.83 (fp16) -> 6.34 (4-bit
+**Accuracy, and its ceiling.** wikitext-2 PPL goes 5.83 (fp16, custom codebook
+evaluation harness used for the ablations) -> 6.34 (4-bit
 codebook). Three attempts to close the gap to AWQ all fail: a simple activation-aware
 calibration reaches 6.17, the full AWQ pipeline (output-error scale search + weight
 clipping) does not improve on it (6.21), a naive vector quantizer is catastrophic
