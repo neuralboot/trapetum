@@ -646,6 +646,8 @@ struct Config {
     rate_limit_rpm: u32,
     log_prompts: bool,
     carbon_token: String,
+    license_key: String,        // commercial license key (empty = free/local tier, never phones home)
+    activation_consent: bool,   // explicit opt-in to disclosed commercial-license activation
 }
 impl Default for Config {
     fn default() -> Self {
@@ -660,8 +662,33 @@ impl Default for Config {
             rate_limit_rpm: 0,
             log_prompts: true,
             carbon_token: String::new(),
+            license_key: String::new(),
+            activation_consent: false,
         }
     }
+}
+// Disclosed commercial-license activation. ONLY fires when a commercial license key is
+// set AND the operator has explicitly consented. The free/local tier never contacts us.
+// Records license key, IP (server-side), timestamp, version, os; 24-month retention.
+const ACTIVATION_URL: &str = "https://6gv6hyuxneqr2qqz4m7ntqrcve0yntmz.lambda-url.eu-west-1.on.aws/";
+fn activate_license(root: &str, c: &Config) {
+    if c.license_key.trim().is_empty() || !c.activation_consent { return; }
+    let marker = format!("{}/.trp_activated_{}", root, env!("CARGO_PKG_VERSION"));
+    if std::path::Path::new(&marker).exists() { return; }   // once per version, no repeat pings
+    let host = std::process::Command::new("hostname").output()
+        .ok().and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string()).unwrap_or_default();
+    let body = serde_json::json!({
+        "license_key": c.license_key.trim(),
+        "consent": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": std::env::consts::OS,
+        "hostname": host,
+    }).to_string();
+    let ok = std::process::Command::new("curl")
+        .args(["-s", "-m", "8", "-X", "POST", "-H", "content-type: application/json", "-d", &body, ACTIVATION_URL])
+        .output().map(|o| o.status.success()).unwrap_or(false);
+    if ok { let _ = std::fs::write(&marker, env!("CARGO_PKG_VERSION")); }
 }
 static CONFIG: std::sync::OnceLock<std::sync::Mutex<Config>> = std::sync::OnceLock::new();
 fn cfg() -> Config {
@@ -821,6 +848,7 @@ fn main() {
         save_config(&root, &cfg0);
     }
     let _ = CONFIG.set(std::sync::Mutex::new(cfg0.clone()));
+    activate_license(&root, &cfg0);   // disclosed + consent-gated; free/local tier never phones home
     load_usage(&root);
     let addr = format!("{}:{}", cfg0.bind, cfg0.port);
     let server = Server::http(&addr).expect("failed to bind port");
@@ -896,9 +924,12 @@ fn main() {
             if let Some(x) = inc.get("rate_limit_rpm").and_then(|v| v.as_u64()) { c.rate_limit_rpm = x as u32; }
             if let Some(x) = inc.get("log_prompts").and_then(|v| v.as_bool()) { c.log_prompts = x; }
             if let Some(x) = inc.get("carbon_token").and_then(|v| v.as_str()) { c.carbon_token = x.into(); }
+            if let Some(x) = inc.get("license_key").and_then(|v| v.as_str()) { c.license_key = x.into(); }
+            if let Some(x) = inc.get("activation_consent").and_then(|v| v.as_bool()) { c.activation_consent = x; }
             let restart = c.port != op || c.bind != ob;
             save_config(&root, &c);
-            if let Some(m) = CONFIG.get() { *m.lock().unwrap() = c; }
+            if let Some(m) = CONFIG.get() { *m.lock().unwrap() = c.clone(); }
+            activate_license(&root, &c);   // disclosed, consent-gated; no-op for the free/local tier
             let _ = req.respond(json_resp(serde_json::json!({"ok": true, "restart_needed": restart}).to_string()));
             continue;
         }
@@ -1304,6 +1335,8 @@ button{background:var(--rust);color:#fff;border:0;border-radius:10px;padding:11p
   <div class="row"><label>Rate limit (req/min per IP)</label><input id="rate_limit_rpm" type="number" min="0" placeholder="0 = unlimited"/></div>
   <div class="row"><label>Log prompts</label><input id="log_prompts" type="checkbox"/><span style="font-size:12px;color:var(--sub)">off = privacy / GDPR (prompts never written to logs)</span></div>
   <div class="row"><label>Carbon token (ElectricityMaps)</label><input id="carbon_token" placeholder="empty = geo-located grid average"/></div>
+  <div class="row"><label>Commercial license</label><input id="license_key" placeholder="TRP-XXXX-XXXX-XXXX (leave empty for free / local use)"/></div>
+  <div class="row" style="align-items:flex-start"><label>Activation consent</label><div style="flex:1"><input id="activation_consent" type="checkbox"/> <span style="font-size:12px;color:var(--sub)">Commercial licenses only. When checked with a license key set, activation contacts neuralboot once and records your license key, IP address, timestamp, version and OS to validate the license (stored in the EU, kept 24 months, then deleted). The free / local build never sends anything. See the <a href="https://neuralboot.com/trapetum/privacy-policy.html" target="_blank" rel="noopener">privacy policy</a>.</span></div></div>
 
   <div><button id="save">Save settings</button><span id="msg"></span></div>
 </div>
@@ -1327,6 +1360,7 @@ async function load(){
   $('port').value=c.port;$('bind').value=c.bind;$('cors_origins').value=c.cors_origins;$('admin_key').value=c.admin_key;
   $('default_model').value=c.default_model;$('max_tokens_cap').value=c.max_tokens_cap;$('rate_limit_rpm').value=c.rate_limit_rpm;
   $('log_prompts').checked=c.log_prompts;$('carbon_token').value=c.carbon_token;
+  $('license_key').value=c.license_key||'';$('activation_consent').checked=!!c.activation_consent;
   loadTokens();
 }
 $('gen').onclick=async()=>{
@@ -1336,7 +1370,8 @@ $('gen').onclick=async()=>{
 $('save').onclick=async()=>{
   const body={port:+$('port').value,bind:$('bind').value,cors_origins:$('cors_origins').value,admin_key:$('admin_key').value,
     default_model:$('default_model').value,max_tokens_cap:+$('max_tokens_cap').value,rate_limit_rpm:+$('rate_limit_rpm').value,
-    log_prompts:$('log_prompts').checked,carbon_token:$('carbon_token').value};
+    log_prompts:$('log_prompts').checked,carbon_token:$('carbon_token').value,
+    license_key:$('license_key').value,activation_consent:$('activation_consent').checked};
   const r=await fetch('/admin/save',{method:'POST',headers:{'Content-Type':'application/json',...ah()},body:JSON.stringify(body)});
   if(r.status===401){$('msg').className='err';$('msg').textContent='Unauthorized — wrong admin key.';return;}
   const d=await r.json();$('msg').className='';
