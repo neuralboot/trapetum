@@ -3,9 +3,9 @@ message: "If you use this software, please cite it as below."
 title: "Trapetum: fused codebook-quantization kernels and a pure-Rust LLM runtime"
 authors:
   - family-names: "Mimouni"
-    given-names: "A."
+    given-names: "Azziz"
 repository-code: "https://github.com/neuralboot/trapetum"
-license: CC-BY-4.0
+license: BUSL-1.1
 version: "0.1.0"
 date-released: "2026-06-25"
 keywords:
