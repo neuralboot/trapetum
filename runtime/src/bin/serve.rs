@@ -649,6 +649,7 @@ struct Config {
     carbon_token: String,
     license_key: String,        // commercial license key (empty = free/local tier, never phones home)
     activation_consent: bool,   // explicit opt-in to disclosed commercial-license activation
+    auto_update: bool,          // check for and install newer builds in the background
 }
 impl Default for Config {
     fn default() -> Self {
@@ -665,6 +666,7 @@ impl Default for Config {
             carbon_token: String::new(),
             license_key: String::new(),
             activation_consent: false,
+            auto_update: true,
         }
     }
 }
@@ -690,6 +692,62 @@ fn activate_license(root: &str, c: &Config) {
         .args(["-s", "-m", "8", "-X", "POST", "-H", "content-type: application/json", "-d", &body, ACTIVATION_URL])
         .output().map(|o| o.status.success()).unwrap_or(false);
     if ok { let _ = std::fs::write(&marker, env!("CARGO_PKG_VERSION")); }
+}
+
+// ---- background auto-update: poll a manifest, verify, and reinstall newer builds ----
+const UPDATE_URL: &str = "https://cdn.neuralboot.com/dist/latest.json";
+static UPDATE_STATUS: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+fn update_status() -> String {
+    UPDATE_STATUS.get().map(|m| m.lock().unwrap().clone()).unwrap_or_default()
+}
+fn build_no() -> u64 {
+    option_env!("TRAPETUM_BUILD").and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+fn sha256_file(path: &str) -> String {
+    if cfg!(windows) {
+        // certutil ships with Windows; line 2 of its output is the hex hash
+        std::process::Command::new("certutil").args(["-hashfile", path, "SHA256"]).output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.lines().nth(1).map(|l| l.trim().replace(' ', "").to_lowercase())).unwrap_or_default()
+    } else {
+        std::process::Command::new("sha256sum").arg(path).output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.split_whitespace().next().map(|x| x.to_lowercase())).unwrap_or_default()
+    }
+}
+fn check_update(auto: bool) {
+    let out = std::process::Command::new("curl").args(["-sL", "--max-time", "20", UPDATE_URL]).output();
+    let man: serde_json::Value = match out.ok().and_then(|o| serde_json::from_slice(&o.stdout).ok()) {
+        Some(v) => v, None => return,
+    };
+    let build = man.get("build").and_then(|v| v.as_u64()).unwrap_or(0);
+    if build <= build_no() { return; }                       // already up to date
+    let ver = man.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if let Some(m) = UPDATE_STATUS.get() { *m.lock().unwrap() = ver.clone(); }   // notify
+    if !auto || !cfg!(windows) { return; }                   // notify-only otherwise (Linux swaps differently)
+    let url = match man.get("url").and_then(|v| v.as_str()) { Some(u) => u, None => return };
+    let want = man.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+    let tmp = format!("{}/trapetum-update-{}.msi", std::env::temp_dir().display(), build);
+    let dl = std::process::Command::new("curl").args(["-sL", "--max-time", "1800", "-o", &tmp, url])
+        .output().map(|o| o.status.success()).unwrap_or(false);
+    if !dl { return; }
+    if want.is_empty() || sha256_file(&tmp) != want {         // verify integrity before installing
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    // major upgrade: msiexec stops the old service, swaps files, restarts. Detached so our
+    // own process being killed mid-swap does not abort the install.
+    let _ = std::process::Command::new("msiexec").args(["/i", &tmp, "/qn", "/norestart"]).spawn();
+}
+fn spawn_updater() {
+    UPDATE_STATUS.get_or_init(|| std::sync::Mutex::new(String::new()));
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(25));
+        loop {
+            check_update(cfg().auto_update);
+            std::thread::sleep(std::time::Duration::from_secs(6 * 3600));
+        }
+    });
 }
 static CONFIG: std::sync::OnceLock<std::sync::Mutex<Config>> = std::sync::OnceLock::new();
 fn cfg() -> Config {
@@ -850,6 +908,7 @@ fn main() {
     }
     let _ = CONFIG.set(std::sync::Mutex::new(cfg0.clone()));
     activate_license(&root, &cfg0);   // disclosed + consent-gated; free/local tier never phones home
+    spawn_updater();                  // background: check for and install newer builds
     load_usage(&root);
     let addr = format!("{}:{}", cfg0.bind, cfg0.port);
     let server = Server::http(&addr).expect("failed to bind port");
@@ -907,7 +966,13 @@ fn main() {
             continue;
         }
         if method == Method::Get && url.starts_with("/admin/config") {
-            let _ = req.respond(json_resp(serde_json::to_string(&cfg()).unwrap_or_else(|_| "{}".into())));
+            let mut v = serde_json::to_value(cfg()).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(o) = v.as_object_mut() {
+                o.insert("update_available".into(), serde_json::json!(update_status()));
+                o.insert("build".into(), serde_json::json!(build_no()));
+                o.insert("version".into(), serde_json::json!(env!("CARGO_PKG_VERSION")));
+            }
+            let _ = req.respond(json_resp(v.to_string()));
             continue;
         }
         if method == Method::Post && url.starts_with("/admin/save") {
@@ -927,6 +992,7 @@ fn main() {
             if let Some(x) = inc.get("carbon_token").and_then(|v| v.as_str()) { c.carbon_token = x.into(); }
             if let Some(x) = inc.get("license_key").and_then(|v| v.as_str()) { c.license_key = x.into(); }
             if let Some(x) = inc.get("activation_consent").and_then(|v| v.as_bool()) { c.activation_consent = x; }
+            if let Some(x) = inc.get("auto_update").and_then(|v| v.as_bool()) { c.auto_update = x; }
             let restart = c.port != op || c.bind != ob;
             save_config(&root, &c);
             if let Some(m) = CONFIG.get() { *m.lock().unwrap() = c.clone(); }
@@ -1338,6 +1404,8 @@ button{background:var(--rust);color:#fff;border:0;border-radius:10px;padding:11p
   <div class="row"><label>Carbon token (ElectricityMaps)</label><input id="carbon_token" placeholder="empty = geo-located grid average"/></div>
   <div class="row"><label>Commercial license</label><input id="license_key" placeholder="TRP-XXXX-XXXX-XXXX (leave empty for free / local use)"/></div>
   <div class="row" style="align-items:flex-start"><label>Activation consent</label><div style="flex:1"><input id="activation_consent" type="checkbox"/> <span style="font-size:12px;color:var(--sub)">Commercial licenses only. When checked with a license key set, activation contacts neuralboot once and records your license key, IP address, timestamp, version and OS to validate the license (stored in the EU, kept 24 months, then deleted). The free / local build never sends anything. See the <a href="https://neuralboot.com/trapetum/privacy-policy.html" target="_blank" rel="noopener">privacy policy</a>.</span></div></div>
+  <div class="row"><label>Automatic updates</label><input id="auto_update" type="checkbox"/><span style="font-size:12px;color:var(--sub)">Check for new builds in the background and install them automatically.</span></div>
+  <div id="upd-banner" style="display:none;margin:6px 0 0;padding:9px 12px;border:1px solid #2ea043;background:rgba(63,185,80,.1);border-radius:8px;color:#e6edf3;font-size:12.5px"></div>
 
   <div><button id="save">Save settings</button><span id="msg"></span></div>
 </div>
@@ -1362,6 +1430,8 @@ async function load(){
   $('default_model').value=c.default_model;$('max_tokens_cap').value=c.max_tokens_cap;$('rate_limit_rpm').value=c.rate_limit_rpm;
   $('log_prompts').checked=c.log_prompts;$('carbon_token').value=c.carbon_token;
   $('license_key').value=c.license_key||'';$('activation_consent').checked=!!c.activation_consent;
+  $('auto_update').checked=c.auto_update!==false;
+  if(c.update_available){var _b=$('upd-banner');_b.style.display='block';_b.textContent='Update available: '+c.update_available+(c.auto_update!==false?' — installing automatically in the background.':' — turn on Automatic updates to install it.');}
   loadTokens();
 }
 $('gen').onclick=async()=>{
@@ -1372,7 +1442,7 @@ $('save').onclick=async()=>{
   const body={port:+$('port').value,bind:$('bind').value,cors_origins:$('cors_origins').value,admin_key:$('admin_key').value,
     default_model:$('default_model').value,max_tokens_cap:+$('max_tokens_cap').value,rate_limit_rpm:+$('rate_limit_rpm').value,
     log_prompts:$('log_prompts').checked,carbon_token:$('carbon_token').value,
-    license_key:$('license_key').value,activation_consent:$('activation_consent').checked};
+    license_key:$('license_key').value,activation_consent:$('activation_consent').checked,auto_update:$('auto_update').checked};
   const r=await fetch('/admin/save',{method:'POST',headers:{'Content-Type':'application/json',...ah()},body:JSON.stringify(body)});
   if(r.status===401){$('msg').className='err';$('msg').textContent='Unauthorized — wrong admin key.';return;}
   const d=await r.json();$('msg').className='';
