@@ -571,7 +571,7 @@ fn search_hf(query: &str, vram: f64, root: &str) -> serde_json::Value {
     let (carbon, _) = carbon_g_per_kwh();
     let q = if query.trim().is_empty() { "llama".to_string() } else { query.to_string() };
     let url = format!(
-        "https://huggingface.co/api/models?search={}&filter=text-generation&sort=downloads&direction=-1&limit=30&expand%5B%5D=safetensors&expand%5B%5D=downloads&expand%5B%5D=likes&expand%5B%5D=tags&expand%5B%5D=gated&expand%5B%5D=config",
+        "https://huggingface.co/api/models?search={}&filter=text-generation&sort=lastModified&direction=-1&limit=40&expand%5B%5D=safetensors&expand%5B%5D=downloads&expand%5B%5D=likes&expand%5B%5D=tags&expand%5B%5D=gated&expand%5B%5D=config&expand%5B%5D=lastModified",
         url_enc(&q)
     );
     let out = std::process::Command::new("curl")
@@ -586,6 +586,7 @@ fn search_hf(query: &str, vram: f64, root: &str) -> serde_json::Value {
         let likes = m.get("likes").and_then(|v| v.as_u64()).unwrap_or(0);
         let tags: Vec<String> = m.get("tags").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default();
         let gated = match m.get("gated") { Some(v) => v.is_string() || v.as_bool() == Some(true), None => false };
+        if gated { continue; }   // gated repos need HF auth and always fail to download here, so hide them
         let params = m.get("safetensors").and_then(|s| s.get("total")).and_then(|v| v.as_f64()).filter(|t| *t > 0.0).map(|t| (t / 1e9 * 100.0).round() / 100.0).or_else(|| params_from_id(&id));
         let name = id.replace('/', "_");
         let installed = std::path::Path::new(&format!("{}/{}/model.cbk", root, name)).exists();
