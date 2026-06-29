@@ -11,7 +11,9 @@ param(
   [string]$Inst  = "C:\build\installers",                                # this folder (wxs + scripts)
   [string]$Cuda  = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6",
   [string]$Wix   = "C:\wix",                                             # candle.exe / light.exe
-  [string]$Ver   = "0.1.0"
+  [string]$Ver   = "0.1.0",
+  [int]$Build    = 1,                                                    # monotonic build number, drives auto-update
+  [string]$MsiUrl = "https://cdn.neuralboot.com/dist/trapetum-0.1.0-x64.msi"
 )
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -21,6 +23,7 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $env:CUDA_PATH = $Cuda
 $env:CUDA_ARCH = "sm_80"
 $env:PATH = "$env:PATH;$Cuda\bin;C:\ProgramData\chocolatey\lib\rust-ms\tools\bin;C:\ProgramData\chocolatey\bin"
+$env:TRAPETUM_BUILD = "$Build"          # stamped into the binary; the updater compares this to the manifest
 Push-Location $Src
 cargo build --release --bin serve
 Pop-Location
@@ -59,7 +62,22 @@ $zip = Join-Path $Inst "trapetum-windows-x64.zip"
 Remove-Item $zip -ErrorAction SilentlyContinue
 Compress-Archive -Path "$pkg\*" -DestinationPath $zip -Force
 
-Write-Host "`nBuilt:"
+# 7. update the auto-update manifest (publishing latest.json to the CDN triggers installed apps to update)
+$sha = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLower()
+$manifest = Join-Path $Inst "latest.json"
+[ordered]@{
+  build    = $Build
+  version  = "$Ver-beta.$Build"
+  url      = $MsiUrl
+  sha256   = $sha
+  notes    = "Trapetum Windows build $Build"
+  released = (Get-Date -Format "yyyy-MM-dd")
+} | ConvertTo-Json | Set-Content -Path $manifest -Encoding UTF8
+
+Write-Host "`nBuilt (build $Build):"
 Write-Host "  $msi"
 Write-Host "  $zip"
+Write-Host "  $manifest"
+Write-Host "`nPublish to ship the update: upload the .msi to $MsiUrl, then latest.json to"
+Write-Host "  https://cdn.neuralboot.com/dist/latest.json  (installed apps with auto-update poll it and reinstall)."
 if (-not $Sign) { Write-Warning "UNSIGNED build. Pass -Sign once a code-signing cert is configured (see CODE-SIGNING.md)." }
