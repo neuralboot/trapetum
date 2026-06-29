@@ -30,6 +30,8 @@
           </Component>
           <Component Id="cmp_svcremove" Guid="*">
             <File Id="f_svcremove" Source="svc-remove.ps1" KeyPath="yes" />
+            <!-- remove the runtime log the service writes (untracked) so the folder is fully cleaned on uninstall -->
+            <RemoveFile Id="rm_serve_log" Name="serve.log" On="uninstall" />
           </Component>
         </Directory>
       </Directory>
