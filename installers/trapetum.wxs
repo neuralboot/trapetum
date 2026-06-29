@@ -35,6 +35,12 @@
           </Component>
         </Directory>
       </Directory>
+      <Directory Id="DesktopFolder" Name="Desktop">
+        <Component Id="cmp_desktop_sc" Guid="*">
+          <util:InternetShortcut Id="TrapetumDesktopUrl" Name="Trapetum" Target="http://localhost:8088" />
+          <RegistryValue Root="HKCU" Key="Software\neuralboot\Trapetum" Name="desktop" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
     </Directory>
 
     <Feature Id="Main" Title="Trapetum" Level="1">
@@ -42,6 +48,7 @@
       <ComponentRef Id="cmp_cudart" />
       <ComponentRef Id="cmp_svcinstall" />
       <ComponentRef Id="cmp_svcremove" />
+      <ComponentRef Id="cmp_desktop_sc" />
     </Feature>
 
     <!-- register + start the service after files are laid down -->
