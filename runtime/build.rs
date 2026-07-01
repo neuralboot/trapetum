@@ -10,6 +10,16 @@ fn main() {
     let arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_80".to_string());
     let windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
 
+    // Backend features: only the `cuda` feature compiles/links the CUDA kernel.
+    // With `--no-default-features --features metal` there is nothing native to
+    // build yet (the Metal kernels arrive with the Metal work package), so the
+    // crate builds and links anywhere, including Apple Silicon.
+    if env::var("CARGO_FEATURE_CUDA").is_err() {
+        println!("cargo:warning=cuda feature disabled: not compiling the CUDA kernel");
+        println!("cargo:rerun-if-changed=cuda/codebook_gemv.cu");
+        return;
+    }
+
     // SKIP_CUDA lets you `cargo check` the Rust on a machine without nvcc (no linking).
     if env::var("SKIP_CUDA").is_ok() {
         println!("cargo:warning=SKIP_CUDA set: not compiling the CUDA kernel");

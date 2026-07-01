@@ -5,6 +5,14 @@ edition = "2021"
 description = "Minimal Rust runtime hosting the fused 4-bit codebook decode CUDA kernel, no Python in the loop"
 license = "BUSL-1.1"
 
+[features]
+# GPU backend selection. `cuda` (default) links the nvcc-compiled fused kernel.
+# `metal` compiles the crate on Apple platforms against the same 24-function
+# backend seam; the Metal kernels themselves land in the next work package.
+default = ["cuda"]
+cuda = []
+metal = []
+
 [dependencies]
 half = "2"   # only for the CPU reference (emulate the fp16 rounding the GPU does)
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
