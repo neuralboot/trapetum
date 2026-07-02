@@ -54,45 +54,8 @@ mod backend {
 }
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
-mod backend {
-    #![allow(unused_variables)]
-    use std::os::raw::c_void;
-    fn nyi() -> ! {
-        panic!("Trapetum Metal backend: the kernels arrive in the next work package; build with the `cuda` feature to run today")
-    }
-    pub unsafe fn qlinear_create(packed: *const u8, cb: *const f32, ic: i32, oc: i32) -> *mut c_void { nyi() }
-    pub unsafe fn qlinear_forward_dev(h: *mut c_void, d_x: *const c_void, d_y: *mut c_void) { nyi() }
-    pub unsafe fn qlinear_free(h: *mut c_void) { nyi() }
-    pub unsafe fn dev_alloc_half(n: i32) -> *mut c_void { nyi() }
-    pub unsafe fn dev_alloc_f32(n: i32) -> *mut c_void { nyi() }
-    pub unsafe fn dev_free(p: *mut c_void) { nyi() }
-    pub unsafe fn dev_upload_to_half(d_half: *mut c_void, x: *const f32, n: i32) { nyi() }
-    pub unsafe fn dev_cast_f32_to_half(d_half: *mut c_void, d_f32: *const c_void, n: i32) { nyi() }
-    pub unsafe fn dev_download_f32(x: *mut f32, d_f32: *const c_void, n: i32) { nyi() }
-    pub unsafe fn dev_download_half(x: *mut f32, d_half: *const c_void, n: i32) { nyi() }
-    pub unsafe fn dev_sync() { nyi() }
-    pub unsafe fn graph_begin() { nyi() }
-    pub unsafe fn graph_end() -> *mut c_void { nyi() }
-    pub unsafe fn graph_launch(exec: *mut c_void) { nyi() }
-    pub unsafe fn graph_free(exec: *mut c_void) { nyi() }
-    pub unsafe fn dev_upload_f32(d_f32: *mut c_void, x: *const f32, n: i32) { nyi() }
-    pub unsafe fn op_rmsnorm(x_half: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32) { nyi() }
-    pub unsafe fn op_silu_mul(gate_f32: *const c_void, up_f32: *const c_void, out_half: *mut c_void, n: i32) { nyi() }
-    pub unsafe fn op_residual_add(h_half: *mut c_void, delta_f32: *const c_void, n: i32) { nyi() }
-    pub unsafe fn op_rope(x_half: *mut c_void, pos: i32, n_heads: i32, head_dim: i32, inv_freq: *const c_void) { nyi() }
-    pub unsafe fn op_vadd(a_f32: *mut c_void, b_f32: *const c_void, n: i32) { nyi() }
-    pub unsafe fn op_cache_append(cache_half: *mut c_void, src_half: *const c_void, pos: i32, dim: i32) { nyi() }
-    pub unsafe fn op_attn(
-        q_half: *const c_void,
-        ck_half: *const c_void,
-        cv_half: *const c_void,
-        out_half: *mut c_void,
-        n_heads: i32,
-        n_kv: i32,
-        head_dim: i32,
-        seqlen: i32,
-    ) { nyi() }
-}
+#[path = "backend_metal.rs"]
+mod backend;
 
 #[cfg(not(any(feature = "cuda", feature = "metal")))]
 compile_error!("enable a GPU backend feature: `cuda` (default) or `metal`");

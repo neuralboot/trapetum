@@ -11,9 +11,10 @@ license = "BUSL-1.1"
 # backend seam; the Metal kernels themselves land in the next work package.
 default = ["cuda"]
 cuda = []
-metal = []
+metal = ["dep:metal-rs"]
 
 [dependencies]
+metal-rs = { package = "metal", version = "0.29", optional = true }
 half = "2"   # only for the CPU reference (emulate the fp16 rounding the GPU does)
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 tiny_http = "0.12"

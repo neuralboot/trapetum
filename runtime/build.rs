@@ -10,12 +10,31 @@ fn main() {
     let arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_80".to_string());
     let windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
 
-    // Backend features: only the `cuda` feature compiles/links the CUDA kernel.
-    // With `--no-default-features --features metal` there is nothing native to
-    // build yet (the Metal kernels arrive with the Metal work package), so the
-    // crate builds and links anywhere, including Apple Silicon.
+    // Backend features: `cuda` compiles/links the nvcc kernel; `metal` compiles
+    // metal/kernels.metal into a metallib that backend_metal.rs embeds.
+    if env::var("CARGO_FEATURE_METAL").is_ok() && env::var("CARGO_FEATURE_CUDA").is_err() {
+        let macos = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
+            || env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios");
+        assert!(macos, "the `metal` feature targets Apple platforms");
+        let air = format!("{out}/kernels.air");
+        let lib = format!("{out}/kernels.metallib");
+        let ok = Command::new("xcrun")
+            .args(["-sdk", "macosx", "metal", "-std=metal3.0", "-O2",
+                   "-c", "metal/kernels.metal", "-o", &air])
+            .status().expect("failed to spawn xcrun metal (Xcode command line tools?)")
+            .success();
+        assert!(ok, "metal shader compilation failed");
+        let ok = Command::new("xcrun")
+            .args(["-sdk", "macosx", "metallib", &air, "-o", &lib])
+            .status().expect("failed to spawn xcrun metallib")
+            .success();
+        assert!(ok, "metallib link failed");
+        println!("cargo:rerun-if-changed=metal/kernels.metal");
+        println!("cargo:rerun-if-changed=build.rs");
+        return;
+    }
     if env::var("CARGO_FEATURE_CUDA").is_err() {
-        println!("cargo:warning=cuda feature disabled: not compiling the CUDA kernel");
+        println!("cargo:warning=no GPU backend feature enabled");
         println!("cargo:rerun-if-changed=cuda/codebook_gemv.cu");
         return;
     }

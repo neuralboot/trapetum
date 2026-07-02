@@ -1,0 +1,323 @@
+//! Metal backend: the same 24-function seam as the CUDA wrapper, implemented on
+//! MTLBuffer + a single MTLCommandQueue. Buffers are storageModeShared (Apple
+//! unified memory), so downloads are plain memcpy after a queue drain.
+//!
+//! Correctness-first: one command buffer per op, in-order queue. Batching a whole
+//! decode step into one command buffer (the CUDA-graph equivalent) is the next
+//! work package; graph_* therefore panics with a clear message for now.
+#![allow(clippy::missing_safety_doc)]
+use std::collections::HashMap;
+use std::os::raw::c_void;
+use std::sync::{Mutex, OnceLock};
+
+use metal_rs::{
+    Buffer, CommandBuffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions,
+    MTLSize, NSRange,
+};
+
+const K: usize = 16;
+const CPB: usize = 256;
+const TY: usize = 8;
+const GS: u64 = 20;
+
+const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
+const KERNELS: &[&str] = &[
+    "gemv4", "cast_f2h", "rmsnorm_k", "silu_mul_k", "resadd_k", "rope_k", "vadd_k", "attn_k",
+];
+
+struct Ctx {
+    _device: Device,
+    queue: CommandQueue,
+    pl: HashMap<&'static str, ComputePipelineState>,
+    last: Mutex<Option<CommandBuffer>>,
+}
+unsafe impl Send for Ctx {}
+unsafe impl Sync for Ctx {}
+
+fn ctx() -> &'static Ctx {
+    static CTX: OnceLock<Ctx> = OnceLock::new();
+    CTX.get_or_init(|| {
+        let device = Device::system_default().expect("no Metal device");
+        let queue = device.new_command_queue();
+        let lib = device
+            .new_library_with_data(METALLIB)
+            .expect("failed to load kernels.metallib");
+        let mut pl = HashMap::new();
+        for name in KERNELS {
+            let f = lib.get_function(name, None).expect("missing kernel");
+            let p = device
+                .new_compute_pipeline_state_with_function(&f)
+                .expect("pipeline creation failed");
+            pl.insert(*name, p);
+        }
+        Ctx { _device: device, queue, pl, last: Mutex::new(None) }
+    })
+}
+
+fn remember(cb: &metal_rs::CommandBufferRef) {
+    *ctx().last.lock().unwrap() = Some(cb.to_owned());
+}
+
+fn drain() {
+    if let Some(cb) = ctx().last.lock().unwrap().take() {
+        cb.wait_until_completed();
+    }
+}
+
+unsafe fn bufref<'a>(p: *const c_void) -> &'a Buffer {
+    &*(p as *const Buffer)
+}
+
+fn alloc_bytes(len: usize) -> *mut c_void {
+    let b = ctx()
+        ._device
+        .new_buffer(len as u64, MTLResourceOptions::StorageModeShared);
+    Box::into_raw(Box::new(b)) as *mut c_void
+}
+
+/// Ceil to the 16-byte granularity Metal requires for threadgroup memory lengths.
+fn tg(len: usize) -> u64 {
+    (((len + 15) / 16) * 16) as u64
+}
+
+// ---- 1D elementwise dispatch helper -----------------------------------------
+fn dispatch1d(name: &'static str, bufs: &[&Buffer], scalars: &[u8], n: usize) {
+    let c = ctx();
+    let cb = c.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.pl[name]);
+    for (i, b) in bufs.iter().enumerate() {
+        enc.set_buffer(i as u64, Some(b), 0);
+    }
+    enc.set_bytes(
+        bufs.len() as u64,
+        scalars.len() as u64,
+        scalars.as_ptr() as *const c_void,
+    );
+    let tpb = 256u64;
+    let grid = MTLSize::new((n as u64 + tpb - 1) / tpb, 1, 1);
+    enc.dispatch_thread_groups(grid, MTLSize::new(tpb, 1, 1));
+    enc.end_encoding();
+    cb.commit();
+    remember(cb);
+}
+
+// ---- QLinear -----------------------------------------------------------------
+struct QLin {
+    packed: Buffer,
+    cb: Buffer,
+    ic: i32,
+    oc: i32,
+}
+
+pub unsafe fn qlinear_create(packed: *const u8, cb_f32: *const f32, ic: i32, oc: i32) -> *mut c_void {
+    let c = ctx();
+    let np = ic as usize * (oc as usize / 2);
+    let pb = c
+        ._device
+        .new_buffer(np as u64, MTLResourceOptions::StorageModeShared);
+    std::ptr::copy_nonoverlapping(packed, pb.contents() as *mut u8, np);
+    let ncb = K * oc as usize;
+    let cbb = c
+        ._device
+        .new_buffer((ncb * 2) as u64, MTLResourceOptions::StorageModeShared);
+    let dst = cbb.contents() as *mut u16;
+    for i in 0..ncb {
+        *dst.add(i) = half::f16::from_f32(*cb_f32.add(i)).to_bits();
+    }
+    Box::into_raw(Box::new(QLin { packed: pb, cb: cbb, ic, oc })) as *mut c_void
+}
+
+pub unsafe fn qlinear_forward_dev(h: *mut c_void, d_x: *const c_void, d_y: *mut c_void) {
+    let q = &*(h as *const QLin);
+    let c = ctx();
+    let y = bufref(d_y);
+    let cb = c.queue.new_command_buffer();
+    // zero the f32 accumulator (cudaMemsetAsync equivalent)
+    let blit = cb.new_blit_command_encoder();
+    blit.fill_buffer(y, NSRange::new(0, q.oc as u64 * 4), 0);
+    blit.end_encoding();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.pl["gemv4"]);
+    enc.set_buffer(0, Some(bufref(d_x)), 0);
+    enc.set_buffer(1, Some(&q.packed), 0);
+    enc.set_buffer(2, Some(&q.cb), 0);
+    enc.set_buffer(3, Some(y), 0);
+    let p: [i32; 2] = [q.ic, q.oc];
+    enc.set_bytes(4, 8, p.as_ptr() as *const c_void);
+    enc.set_threadgroup_memory_length(0, tg(K * CPB * 2));
+    enc.set_threadgroup_memory_length(1, tg(TY * CPB * 4));
+    enc.dispatch_thread_groups(
+        MTLSize::new(q.oc as u64 / CPB as u64, GS, 1),
+        MTLSize::new(32, TY as u64, 1),
+    );
+    enc.end_encoding();
+    cb.commit();
+    remember(cb);
+}
+
+pub unsafe fn qlinear_free(h: *mut c_void) {
+    drop(Box::from_raw(h as *mut QLin));
+}
+
+// ---- device buffers ----------------------------------------------------------
+pub unsafe fn dev_alloc_half(n: i32) -> *mut c_void { alloc_bytes(n as usize * 2) }
+pub unsafe fn dev_alloc_f32(n: i32) -> *mut c_void { alloc_bytes(n as usize * 4) }
+pub unsafe fn dev_free(p: *mut c_void) {
+    drain();
+    drop(Box::from_raw(p as *mut Buffer));
+}
+
+pub unsafe fn dev_upload_to_half(d_half: *mut c_void, x: *const f32, n: i32) {
+    drain();
+    let dst = bufref(d_half).contents() as *mut u16;
+    for i in 0..n as usize {
+        *dst.add(i) = half::f16::from_f32(*x.add(i)).to_bits();
+    }
+}
+
+pub unsafe fn dev_upload_f32(d_f32: *mut c_void, x: *const f32, n: i32) {
+    drain();
+    std::ptr::copy_nonoverlapping(x, bufref(d_f32).contents() as *mut f32, n as usize);
+}
+
+pub unsafe fn dev_cast_f32_to_half(d_half: *mut c_void, d_f32: *const c_void, n: i32) {
+    dispatch1d(
+        "cast_f2h",
+        &[bufref(d_f32), bufref(d_half)],
+        &n.to_ne_bytes(),
+        n as usize,
+    );
+}
+
+pub unsafe fn dev_download_f32(x: *mut f32, d_f32: *const c_void, n: i32) {
+    drain();
+    std::ptr::copy_nonoverlapping(bufref(d_f32).contents() as *const f32, x, n as usize);
+}
+
+pub unsafe fn dev_download_half(x: *mut f32, d_half: *const c_void, n: i32) {
+    drain();
+    let src = bufref(d_half).contents() as *const u16;
+    for i in 0..n as usize {
+        *x.add(i) = half::f16::from_bits(*src.add(i)).to_f32();
+    }
+}
+
+pub unsafe fn dev_sync() { drain(); }
+
+// ---- transformer-block ops ----------------------------------------------------
+pub unsafe fn op_rmsnorm(x_half: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32) {
+    let c = ctx();
+    let cb = c.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.pl["rmsnorm_k"]);
+    enc.set_buffer(0, Some(bufref(x_half)), 0);
+    enc.set_buffer(1, Some(bufref(w_f32)), 0);
+    enc.set_buffer(2, Some(bufref(out_half)), 0);
+    #[repr(C)]
+    struct P { n: i32, eps: f32 }
+    let p = P { n, eps };
+    enc.set_bytes(3, 8, &p as *const P as *const c_void);
+    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+    enc.end_encoding();
+    cb.commit();
+    remember(cb);
+}
+
+pub unsafe fn op_silu_mul(gate_f32: *const c_void, up_f32: *const c_void, out_half: *mut c_void, n: i32) {
+    dispatch1d(
+        "silu_mul_k",
+        &[bufref(gate_f32), bufref(up_f32), bufref(out_half)],
+        &n.to_ne_bytes(),
+        n as usize,
+    );
+}
+
+pub unsafe fn op_residual_add(h_half: *mut c_void, delta_f32: *const c_void, n: i32) {
+    dispatch1d(
+        "resadd_k",
+        &[bufref(h_half), bufref(delta_f32)],
+        &n.to_ne_bytes(),
+        n as usize,
+    );
+}
+
+pub unsafe fn op_rope(x_half: *mut c_void, pos: i32, n_heads: i32, head_dim: i32, inv_freq: *const c_void) {
+    #[repr(C)]
+    struct P { pos: i32, n_heads: i32, head_dim: i32 }
+    let p = P { pos, n_heads, head_dim };
+    let total = (n_heads * (head_dim / 2)) as usize;
+    let bytes = std::slice::from_raw_parts(&p as *const P as *const u8, 12);
+    dispatch1d("rope_k", &[bufref(x_half), bufref(inv_freq)], bytes, total);
+}
+
+pub unsafe fn op_vadd(a_f32: *mut c_void, b_f32: *const c_void, n: i32) {
+    dispatch1d(
+        "vadd_k",
+        &[bufref(a_f32), bufref(b_f32)],
+        &n.to_ne_bytes(),
+        n as usize,
+    );
+}
+
+pub unsafe fn op_cache_append(cache_half: *mut c_void, src_half: *const c_void, pos: i32, dim: i32) {
+    let c = ctx();
+    let cb = c.queue.new_command_buffer();
+    let blit = cb.new_blit_command_encoder();
+    blit.copy_from_buffer(
+        bufref(src_half),
+        0,
+        bufref(cache_half),
+        pos as u64 * dim as u64 * 2,
+        dim as u64 * 2,
+    );
+    blit.end_encoding();
+    cb.commit();
+    remember(cb);
+}
+
+pub unsafe fn op_attn(
+    q_half: *const c_void,
+    ck_half: *const c_void,
+    cv_half: *const c_void,
+    out_half: *mut c_void,
+    n_heads: i32,
+    n_kv: i32,
+    head_dim: i32,
+    seqlen: i32,
+) {
+    let c = ctx();
+    let cb = c.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.pl["attn_k"]);
+    enc.set_buffer(0, Some(bufref(q_half)), 0);
+    enc.set_buffer(1, Some(bufref(ck_half)), 0);
+    enc.set_buffer(2, Some(bufref(cv_half)), 0);
+    enc.set_buffer(3, Some(bufref(out_half)), 0);
+    let p: [i32; 4] = [n_heads, n_kv, head_dim, seqlen];
+    enc.set_bytes(4, 16, p.as_ptr() as *const c_void);
+    enc.set_threadgroup_memory_length(0, tg(head_dim as usize * 4));
+    enc.set_threadgroup_memory_length(1, tg(seqlen as usize * 4));
+    enc.dispatch_thread_groups(
+        MTLSize::new(n_heads as u64, 1, 1),
+        MTLSize::new(head_dim as u64, 1, 1),
+    );
+    enc.end_encoding();
+    cb.commit();
+    remember(cb);
+}
+
+// ---- graph capture: a WP2 item on Metal ----------------------------------------
+// The CUDA path records the decode chain into a replayable graph. The Metal
+// equivalent (encoding the whole step into one command buffer) lands with the
+// host-layer work package; the direct per-op path above is fully functional.
+pub unsafe fn graph_begin() {
+    panic!("Metal backend: graph capture arrives with the host-layer work package; use the direct decode path")
+}
+pub unsafe fn graph_end() -> *mut c_void {
+    panic!("Metal backend: graph capture arrives with the host-layer work package")
+}
+pub unsafe fn graph_launch(_exec: *mut c_void) {
+    panic!("Metal backend: graph capture arrives with the host-layer work package")
+}
+pub unsafe fn graph_free(_exec: *mut c_void) {}
