@@ -18,17 +18,29 @@ fn main() {
         assert!(macos, "the `metal` feature targets Apple platforms");
         let air = format!("{out}/kernels.air");
         let lib = format!("{out}/kernels.metallib");
+        // Compile the shaders for the SDK matching the Rust target: iphoneos for
+        // a device build, iphonesimulator for the sim, macosx otherwise. A Metal
+        // library is target-family specific, so this must track the target OS.
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        let sim = env::var("CARGO_CFG_TARGET_ABI").as_deref() == Ok("sim")
+            || env::var("TARGET").unwrap_or_default().contains("ios-sim");
+        let sdk = match target_os.as_str() {
+            "ios" if sim => "iphonesimulator",
+            "ios" => "iphoneos",
+            _ => "macosx",
+        };
         let ok = Command::new("xcrun")
-            .args(["-sdk", "macosx", "metal", "-std=metal3.0", "-O2",
+            .args(["-sdk", sdk, "metal", "-std=metal3.0", "-O2",
                    "-c", "metal/kernels.metal", "-o", &air])
             .status().expect("failed to spawn xcrun metal (Xcode command line tools?)")
             .success();
         assert!(ok, "metal shader compilation failed");
         let ok = Command::new("xcrun")
-            .args(["-sdk", "macosx", "metallib", &air, "-o", &lib])
+            .args(["-sdk", sdk, "metallib", &air, "-o", &lib])
             .status().expect("failed to spawn xcrun metallib")
             .success();
         assert!(ok, "metallib link failed");
+        println!("cargo:warning=trapetum: built Metal shaders for SDK {sdk}");
         println!("cargo:rerun-if-changed=metal/kernels.metal");
         println!("cargo:rerun-if-changed=build.rs");
         return;

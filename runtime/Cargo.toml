@@ -26,6 +26,8 @@ getrandom = "0.2"
 [lib]
 name = "trapetum"
 path = "src/lib.rs"
+# rlib for the bins/tests; staticlib is the libtrapetum.a an iOS/macOS app links.
+crate-type = ["rlib", "staticlib"]
 
 [[bin]]
 name = "demo"
@@ -34,3 +36,11 @@ path = "src/main.rs"
 [profile.release]
 opt-level = 3
 lto = true
+
+# Profile for the native-app static library (iOS/macOS). LTO internalizes the
+# #[no_mangle] C ABI symbols out of a staticlib, so the app lib disables it.
+# Build the app archive with:  cargo build --lib --profile applib \
+#   --no-default-features --features metal --target aarch64-apple-ios
+[profile.applib]
+inherits = "release"
+lto = false

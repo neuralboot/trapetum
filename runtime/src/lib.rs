@@ -583,3 +583,6 @@ impl Drop for Graph {
         unsafe { graph_free(self.exec) };
     }
 }
+
+/// C ABI for embedding the engine in a native app (iOS/macOS), no server.
+pub mod ffi;

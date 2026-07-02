@@ -18,7 +18,16 @@ use metal_rs::{
 const K: usize = 16;
 const CPB: usize = 256;
 const TY: usize = 8;
-const GS: u64 = 20;
+
+// IC-split grid.y for the fused GEMV. 20 was tuned for Ampere's ~108 SMs; Apple
+// GPUs have far fewer cores, so fewer, fatter threadgroups (less atomic-reduce
+// contention) win. Overridable via TRAPETUM_GS for tuning; default 8.
+fn gs() -> u64 {
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("TRAPETUM_GS").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
+    })
+}
 
 const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
 const KERNELS: &[&str] = &[
@@ -158,7 +167,7 @@ pub unsafe fn qlinear_forward_dev(h: *mut c_void, d_x: *const c_void, d_y: *mut 
     enc.set_threadgroup_memory_length(0, tg(K * CPB * 2));
     enc.set_threadgroup_memory_length(1, tg(TY * CPB * 4));
     enc.dispatch_thread_groups(
-        MTLSize::new(q.oc as u64 / CPB as u64, GS, 1),
+        MTLSize::new(q.oc as u64 / CPB as u64, gs(), 1),
         MTLSize::new(32, TY as u64, 1),
     );
     enc.end_encoding();
