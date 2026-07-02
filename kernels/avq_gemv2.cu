@@ -1,4 +1,5 @@
 // Fused additive-VQ decode GEMV, v2: group-TILE LUT to amortize syncs.
+// AVQ = Additive Vector Quantization (the compression scheme; nothing else).
 // Each block handles one output-tile (CPB outputs) and one GROUP TILE (GT groups):
 // it builds all GT*M*K LUT entries in shared once (one sync), then every output
 // accumulates over the whole GT-group tile with no further sync. That cuts the sync

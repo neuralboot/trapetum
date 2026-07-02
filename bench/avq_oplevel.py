@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+AVQ = Additive Vector Quantization (the compression scheme; nothing else).
 Op-level decode latency: our fused additive-VQ GEMV (avq_gemv3, 2-bit AQLM 2x8 config
 M=2/K=256/D=8) vs AQLM's official kernel, on the REAL Llama-2-7B attention shape
 (4096->4096), batch-1, same machine.

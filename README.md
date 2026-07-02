@@ -354,7 +354,7 @@ To turn this into a defensible research comparison:
 
 - `gemv_codebook_4bit.cu` - decode GEMV, 4-bit packed indices (K <= 16). Fastest scalar.
 - `avq_gemv.cu` / `avq_gemv2.cu` / `avq_gemv3.cu` - fused additive vector-quantization
-  (AQLM-style) decode GEMV, LUT-based, 2-bit. v1 (split-K) -> v2 (group-tile LUT, sync
+  (AVQ = Additive Vector Quantization, AQLM-style) decode GEMV, LUT-based, 2-bit. v1 (split-K) -> v2 (group-tile LUT, sync
   reduction, no help) -> v3 (vectorized uint32 code reads, **x4.30 on A40**). The
   accuracy-frontier + speed direction (preliminary, random codebooks).
 - `gemv_codebook_hopper_v2.cu` - the 4-bit decode GEMV with a live cuBLAS baseline,

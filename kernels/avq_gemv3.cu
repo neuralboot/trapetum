@@ -1,4 +1,5 @@
 // Fused additive-VQ decode GEMV, v3: vectorized uint32 code reads.
+// AVQ = Additive Vector Quantization (the compression scheme; nothing else).
 // v2 (sync reduction) did not help: the kernel is memory-access-efficiency bound, not
 // sync bound (it sat at ~22% of the A40 roofline reading 1-byte codes). Here each
 // thread owns 4 consecutive outputs and reads their 4 codes as ONE uint32 (128 B per

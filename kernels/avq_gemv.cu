@@ -1,4 +1,5 @@
 // Fused additive vector-quantization decode GEMV (AQLM-style).
+// AVQ = Additive Vector Quantization (the compression scheme; nothing else).
 //
 // A group of D consecutive input weights for output o is reconstructed as a SUM of
 // M codebook vectors:  w_group = sum_m C_m[ code_m[o,g] ]  (C_m is [K, D]).
