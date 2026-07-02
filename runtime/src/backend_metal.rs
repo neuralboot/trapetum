@@ -29,7 +29,12 @@ struct Ctx {
     _device: Device,
     queue: CommandQueue,
     pl: HashMap<&'static str, ComputePipelineState>,
-    last: Mutex<Option<CommandBuffer>>,
+    // Current OPEN (uncommitted) command buffer. Every op encodes into it and
+    // does NOT commit; drain() (called by dev_sync and any host read-back)
+    // commits it once. So a whole decode step between two sync() calls becomes a
+    // SINGLE command buffer, the Metal equivalent of the CUDA-graph lesson that
+    // turns a per-op kernel win into an end-to-end one.
+    cur: Mutex<Option<CommandBuffer>>,
 }
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
@@ -50,16 +55,23 @@ fn ctx() -> &'static Ctx {
                 .expect("pipeline creation failed");
             pl.insert(*name, p);
         }
-        Ctx { _device: device, queue, pl, last: Mutex::new(None) }
+        Ctx { _device: device, queue, pl, cur: Mutex::new(None) }
     })
 }
 
-fn remember(cb: &metal_rs::CommandBufferRef) {
-    *ctx().last.lock().unwrap() = Some(cb.to_owned());
+/// The current open command buffer, created lazily. Ops append encoders to it
+/// and never commit; only drain() commits.
+fn cur_cb() -> CommandBuffer {
+    let mut g = ctx().cur.lock().unwrap();
+    if g.is_none() {
+        *g = Some(ctx().queue.new_command_buffer().to_owned());
+    }
+    g.as_ref().unwrap().to_owned()
 }
 
 fn drain() {
-    if let Some(cb) = ctx().last.lock().unwrap().take() {
+    if let Some(cb) = ctx().cur.lock().unwrap().take() {
+        cb.commit();
         cb.wait_until_completed();
     }
 }
@@ -83,7 +95,7 @@ fn tg(len: usize) -> u64 {
 // ---- 1D elementwise dispatch helper -----------------------------------------
 fn dispatch1d(name: &'static str, bufs: &[&Buffer], scalars: &[u8], n: usize) {
     let c = ctx();
-    let cb = c.queue.new_command_buffer();
+    let cb = cur_cb();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&c.pl[name]);
     for (i, b) in bufs.iter().enumerate() {
@@ -98,8 +110,6 @@ fn dispatch1d(name: &'static str, bufs: &[&Buffer], scalars: &[u8], n: usize) {
     let grid = MTLSize::new((n as u64 + tpb - 1) / tpb, 1, 1);
     enc.dispatch_thread_groups(grid, MTLSize::new(tpb, 1, 1));
     enc.end_encoding();
-    cb.commit();
-    remember(cb);
 }
 
 // ---- QLinear -----------------------------------------------------------------
@@ -132,7 +142,7 @@ pub unsafe fn qlinear_forward_dev(h: *mut c_void, d_x: *const c_void, d_y: *mut 
     let q = &*(h as *const QLin);
     let c = ctx();
     let y = bufref(d_y);
-    let cb = c.queue.new_command_buffer();
+    let cb = cur_cb();
     // zero the f32 accumulator (cudaMemsetAsync equivalent)
     let blit = cb.new_blit_command_encoder();
     blit.fill_buffer(y, NSRange::new(0, q.oc as u64 * 4), 0);
@@ -152,8 +162,6 @@ pub unsafe fn qlinear_forward_dev(h: *mut c_void, d_x: *const c_void, d_y: *mut 
         MTLSize::new(32, TY as u64, 1),
     );
     enc.end_encoding();
-    cb.commit();
-    remember(cb);
 }
 
 pub unsafe fn qlinear_free(h: *mut c_void) {
@@ -208,7 +216,7 @@ pub unsafe fn dev_sync() { drain(); }
 // ---- transformer-block ops ----------------------------------------------------
 pub unsafe fn op_rmsnorm(x_half: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32) {
     let c = ctx();
-    let cb = c.queue.new_command_buffer();
+    let cb = cur_cb();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&c.pl["rmsnorm_k"]);
     enc.set_buffer(0, Some(bufref(x_half)), 0);
@@ -220,8 +228,6 @@ pub unsafe fn op_rmsnorm(x_half: *const c_void, w_f32: *const c_void, out_half: 
     enc.set_bytes(3, 8, &p as *const P as *const c_void);
     enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
     enc.end_encoding();
-    cb.commit();
-    remember(cb);
 }
 
 pub unsafe fn op_silu_mul(gate_f32: *const c_void, up_f32: *const c_void, out_half: *mut c_void, n: i32) {
@@ -261,8 +267,7 @@ pub unsafe fn op_vadd(a_f32: *mut c_void, b_f32: *const c_void, n: i32) {
 }
 
 pub unsafe fn op_cache_append(cache_half: *mut c_void, src_half: *const c_void, pos: i32, dim: i32) {
-    let c = ctx();
-    let cb = c.queue.new_command_buffer();
+    let cb = cur_cb();
     let blit = cb.new_blit_command_encoder();
     blit.copy_from_buffer(
         bufref(src_half),
@@ -272,8 +277,6 @@ pub unsafe fn op_cache_append(cache_half: *mut c_void, src_half: *const c_void, 
         dim as u64 * 2,
     );
     blit.end_encoding();
-    cb.commit();
-    remember(cb);
 }
 
 pub unsafe fn op_attn(
@@ -287,7 +290,7 @@ pub unsafe fn op_attn(
     seqlen: i32,
 ) {
     let c = ctx();
-    let cb = c.queue.new_command_buffer();
+    let cb = cur_cb();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&c.pl["attn_k"]);
     enc.set_buffer(0, Some(bufref(q_half)), 0);
@@ -303,8 +306,6 @@ pub unsafe fn op_attn(
         MTLSize::new(head_dim as u64, 1, 1),
     );
     enc.end_encoding();
-    cb.commit();
-    remember(cb);
 }
 
 // ---- graph capture: a WP2 item on Metal ----------------------------------------

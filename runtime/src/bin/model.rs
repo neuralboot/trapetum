@@ -176,10 +176,13 @@ fn main() {
     let embedding: Vec<f32> = (0..c.vocab * c.hidden).map(|_| (next() % 1000) as f32 / 1000.0 - 0.5).collect();
     let prompt: Vec<usize> = (0..tokens).map(|_| (next() % c.vocab as u64) as usize).collect();
 
-    // build the GPU model
+    // build the GPU model (inv_freq precomputed exactly as the CPU reference: BASE^(-2d/hd))
+    let inv_freq: Vec<f32> = (0..c.hd / 2)
+        .map(|d| BASE.powf(-2.0 * d as f32 / c.hd as f32))
+        .collect();
     let layers: Vec<Layer> = lws.iter().map(|lw| {
         let attn = AttnBlock::new(c.hidden, c.n_heads, c.n_kv, c.hd, max_seq, &lw.an,
-            (&lw.qp, &lw.qc), (&lw.kp, &lw.kc), (&lw.vp, &lw.vc), (&lw.op, &lw.oc), EPS, BASE);
+            (&lw.qp, &lw.qc), (&lw.kp, &lw.kc), (&lw.vp, &lw.vc), (&lw.op, &lw.oc), EPS, &inv_freq, None);
         let mlp = MlpBlock::new(c.hidden, c.inter, &lw.pn,
             &lw.gp, &lw.gc, &lw.up, &lw.uc, &lw.dp, &lw.dc, EPS);
         Layer::new(attn, mlp)
