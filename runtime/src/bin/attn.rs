@@ -143,9 +143,10 @@ fn main() {
         .map(|_| (0..hidden).map(|_| (next() % 1000) as f32 / 1000.0 - 0.5).collect())
         .collect();
 
+    let inv_freq: Vec<f32> = (0..hd / 2).map(|d| BASE.powf(-2.0 * d as f32 / hd as f32)).collect();
     let mut block = AttnBlock::new(
         hidden, n_heads, n_kv, hd, max_seq, &nw,
-        (&qp, &qc), (&kp, &kc), (&vp, &vc), (&op, &oc), EPS, BASE,
+        (&qp, &qc), (&kp, &kc), (&vp, &vc), (&op, &oc), EPS, &inv_freq, None,
     );
     let w = Weights { nw, qi, qc, ki, kc, vi, vc, oi, oc };
 

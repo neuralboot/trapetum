@@ -6,7 +6,56 @@
 //!
 //!   cargo run --bin metal_check --no-default-features --features metal
 use half::f16;
-use trapetum::{silu_mul, sync, rmsnorm, DevF32, DevHalf, QuantLinear, K};
+use trapetum::{attention, silu_mul, sync, rmsnorm, DevF32, DevHalf, QuantLinear, K};
+
+// Raw batch-1 attention reference (fp16 rounding on q/k/v, f32 accumulation),
+// matching attn_k exactly. Isolated from rope/projections.
+fn attn_ref(q: &[f32], ck: &[f32], cv: &[f32], n_heads: usize, n_kv: usize, hd: usize, seqlen: usize) -> Vec<f32> {
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut out = vec![0f32; n_heads * hd];
+    for h in 0..n_heads {
+        let kvh = h / (n_heads / n_kv);
+        let mut scores = vec![0f32; seqlen];
+        for t in 0..seqlen {
+            let mut s = 0f32;
+            for d in 0..hd {
+                s += f16::from_f32(q[h * hd + d]).to_f32()
+                    * f16::from_f32(ck[t * n_kv * hd + kvh * hd + d]).to_f32();
+            }
+            scores[t] = s * scale;
+        }
+        let mx = scores.iter().cloned().fold(f32::MIN, f32::max);
+        let mut sum = 0f32;
+        for s in scores.iter_mut() { *s = (*s - mx).exp(); sum += *s; }
+        for s in scores.iter_mut() { *s /= sum; }
+        for d in 0..hd {
+            let mut acc = 0f32;
+            for t in 0..seqlen {
+                acc += scores[t] * f16::from_f32(cv[t * n_kv * hd + kvh * hd + d]).to_f32();
+            }
+            out[h * hd + d] = f16::from_f32(acc).to_f32();
+        }
+    }
+    out
+}
+
+fn check_attn(rng: &mut Rng, n_heads: usize, n_kv: usize, hd: usize, seqlen: usize) -> bool {
+    let q: Vec<f32> = (0..n_heads * hd).map(|_| rng.f32() * 0.5).collect();
+    let ck: Vec<f32> = (0..seqlen * n_kv * hd).map(|_| rng.f32() * 0.5).collect();
+    let cv: Vec<f32> = (0..seqlen * n_kv * hd).map(|_| rng.f32() * 0.5).collect();
+    let r = attn_ref(&q, &ck, &cv, n_heads, n_kv, hd, seqlen);
+    let dq = DevHalf::from_host(&q);
+    let dck = DevHalf::from_host(&ck);
+    let dcv = DevHalf::from_host(&cv);
+    let mut dout = DevHalf::zeros(n_heads * hd);
+    attention(&dq, &dck, &dcv, &mut dout, n_heads, n_kv, hd, seqlen);
+    sync();
+    let o = dout.to_host();
+    let e = rel_err(&o, &r);
+    let ok = e < 5e-3;
+    println!("attn hd={hd:<3} n_kv={n_kv} seq={seqlen}  rel_err = {e:.2e}  {}", if ok { "OK" } else { "FAIL" });
+    ok
+}
 
 // deterministic xorshift so CPU and GPU see the exact same data
 struct Rng(u64);
@@ -109,6 +158,12 @@ fn main() {
     let e = rel_err(&s, &s_ref);
     println!("silu_mul rel_err = {e:.2e}  {}", if e < 5e-3 { "OK" } else { "FAIL" });
     if e >= 5e-3 { fails += 1; }
+
+    // ---- 4. raw attention: head_dim 64 (works in 1B) vs 128 (7B, suspect) ----
+    if !check_attn(&mut rng, 8, 8, 64, 5) { fails += 1; }   // MHA hd=64
+    if !check_attn(&mut rng, 32, 8, 64, 5) { fails += 1; }  // GQA hd=64 (1B-like)
+    if !check_attn(&mut rng, 32, 32, 128, 5) { fails += 1; } // MHA hd=128 (7B-like)
+    if !check_attn(&mut rng, 32, 32, 128, 33) { fails += 1; } // hd=128 longer seq
 
     if fails == 0 {
         println!("ALL CHECKS PASS");
