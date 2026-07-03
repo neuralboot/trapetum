@@ -197,3 +197,21 @@ kernel void attn_k(
         acc += scores[t] * (float)cv[(ulong)t*p.n_kv*p.head_dim + kvh*p.head_dim + d];
     out[h*p.head_dim + d] = (half)acc;
 }
+
+// Naive dense fp16 GEMV baseline (the Apple analogue of cuBLAS fp16 in the paper):
+// y[o] = sum_i W[o*IC + i] * x[i], reading the FULL fp16 weight. Used only to
+// measure the bandwidth win of the fused 4-bit decode against dense fp16.
+struct FpParams { int ic; int oc; };
+kernel void gemv_fp16(
+    device const half*  W   [[buffer(0)]],
+    device const half*  X   [[buffer(1)]],
+    device float*       Y   [[buffer(2)]],
+    constant FpParams&  p   [[buffer(3)]],
+    uint o [[thread_position_in_grid]])
+{
+    if ((int)o >= p.oc) return;
+    float acc = 0.0f;
+    device const half* row = W + (ulong)o * p.ic;
+    for (int i = 0; i < p.ic; i++) acc += (float)row[i] * (float)X[i];
+    Y[o] = acc;
+}

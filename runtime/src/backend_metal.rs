@@ -32,6 +32,7 @@ fn gs() -> u64 {
 const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
 const KERNELS: &[&str] = &[
     "gemv4", "cast_f2h", "rmsnorm_k", "silu_mul_k", "resadd_k", "rope_k", "vadd_k", "attn_k",
+    "gemv_fp16",
 ];
 
 struct Ctx {
@@ -331,3 +332,55 @@ pub unsafe fn graph_launch(_exec: *mut c_void) {
     panic!("Metal backend: graph capture arrives with the host-layer work package")
 }
 pub unsafe fn graph_free(_exec: *mut c_void) {}
+
+// --- microbenchmark: fused 4-bit decode GEMV vs dense fp16 GEMV --------------
+// Returns (ms_4bit, ms_fp16) averaged over `iters` at IC x OC, the Apple
+// analogue of the paper's cuBLAS comparison. Random data (perf is data
+// independent for a memory-bound GEMV).
+pub unsafe fn bench_gemv(ic: i32, oc: i32, iters: i32) -> (f64, f64) {
+    use std::time::Instant;
+    let c = ctx();
+    // 4-bit path: build a QLinear (packed indices + fp16 codebook) and time forward.
+    let np = ic as usize * (oc as usize / 2);
+    let packed: Vec<u8> = (0..np).map(|i| (i * 37 + 11) as u8).collect();
+    let cbk: Vec<f32> = (0..K * oc as usize).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
+    let q = qlinear_create(packed.as_ptr(), cbk.as_ptr(), ic, oc);
+    let xf: Vec<f32> = (0..ic as usize).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+    let dx = dev_alloc_half(ic);
+    dev_upload_to_half(dx, xf.as_ptr(), ic);
+    let dy = dev_alloc_f32(oc);
+    // warmup + time
+    for _ in 0..3 { qlinear_forward_dev(q, dx, dy); }
+    drain();
+    let t = Instant::now();
+    for _ in 0..iters { qlinear_forward_dev(q, dx, dy); }
+    drain();
+    let ms_4bit = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+    // fp16 dense path: full [oc*ic] fp16 weight, naive GEMV.
+    let wbuf = c._device.new_buffer((oc as u64 * ic as u64) * 2, MTLResourceOptions::StorageModeShared);
+    {
+        let dst = wbuf.contents() as *mut u16;
+        for i in 0..(oc as usize * ic as usize) { *dst.add(i) = half::f16::from_f32(((i % 19) as f32 - 9.0) * 0.01).to_bits(); }
+    }
+    let run_fp16 = || {
+        let cb = cur_cb();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.pl["gemv_fp16"]);
+        enc.set_buffer(0, Some(&wbuf), 0);
+        enc.set_buffer(1, Some(bufref(dx)), 0);
+        enc.set_buffer(2, Some(bufref(dy)), 0);
+        let p: [i32; 2] = [ic, oc];
+        enc.set_bytes(3, 8, p.as_ptr() as *const c_void);
+        let tpb = 256u64;
+        enc.dispatch_thread_groups(MTLSize::new((oc as u64 + tpb - 1)/tpb, 1, 1), MTLSize::new(tpb, 1, 1));
+        enc.end_encoding();
+    };
+    for _ in 0..3 { run_fp16(); } drain();
+    let t = Instant::now();
+    for _ in 0..iters { run_fp16(); } drain();
+    let ms_fp16 = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+    qlinear_free(q); dev_free(dx); dev_free(dy);
+    (ms_4bit, ms_fp16)
+}

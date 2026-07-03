@@ -586,3 +586,10 @@ impl Drop for Graph {
 
 /// C ABI for embedding the engine in a native app (iOS/macOS), no server.
 pub mod ffi;
+
+/// Microbenchmark: fused 4-bit decode GEMV vs dense fp16 GEMV at `ic`x`oc`,
+/// averaged over `iters`. Returns (ms_4bit, ms_fp16). Metal backend only.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn bench_gemv(ic: usize, oc: usize, iters: usize) -> (f64, f64) {
+    unsafe { backend::bench_gemv(ic as i32, oc as i32, iters as i32) }
+}
