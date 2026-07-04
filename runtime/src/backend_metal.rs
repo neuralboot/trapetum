@@ -32,7 +32,7 @@ fn gs() -> u64 {
 const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
 const KERNELS: &[&str] = &[
     "gemv4", "cast_f2h", "rmsnorm_k", "silu_mul_k", "resadd_k", "rope_k", "vadd_k", "attn_k",
-    "gemv_fp16", "gemm_mtile", "gemm_mtile2",
+    "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m",
 ];
 
 struct Ctx {
@@ -470,4 +470,106 @@ pub unsafe fn bench_mtile2(ic: i32, oc: i32, m: i32, iters: i32) -> f64 {
     let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
     qlinear_free(q); dev_free(dx); dev_free(dy);
     ms
+}
+
+// Correctness of gemm_mtile: run M columns of X through it, and check each output
+// column equals the single-column gemv4 result for that same X. Returns worst
+// per-column relative error. This must pass before building spec-dec on it.
+pub unsafe fn check_mtile(ic: i32, oc: i32, m: i32) -> f64 {
+    let c = ctx();
+    let np = ic as usize * (oc as usize / 2);
+    let packed: Vec<u8> = (0..np).map(|i| ((i * 131 + 7) % 256) as u8).collect();
+    let cbk: Vec<f32> = (0..K * oc as usize).map(|i| (((i * 7) % 31) as f32 - 15.0) * 0.02).collect();
+    let q = qlinear_create(packed.as_ptr(), cbk.as_ptr(), ic, oc);
+    let ql = &*(q as *const QLin);
+    // distinct X per column
+    let xf: Vec<f32> = (0..(m as usize * ic as usize)).map(|i| (((i * 13 + 1) % 23) as f32 - 11.0) * 0.05).collect();
+    let dx = dev_alloc_half(m * ic);
+    dev_upload_to_half(dx, xf.as_ptr(), m * ic);
+    let dy = dev_alloc_f32(m * oc);
+    // run gemm_mtile once
+    {
+        let cb = cur_cb();
+        let blit = cb.new_blit_command_encoder();
+        blit.fill_buffer(bufref(dy), NSRange::new(0, (m as u64)*(oc as u64)*4), 0);
+        blit.end_encoding();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.pl["gemm_mtile"]);
+        enc.set_buffer(0, Some(bufref(dx)), 0);
+        enc.set_buffer(1, Some(&ql.packed), 0);
+        enc.set_buffer(2, Some(&ql.cb), 0);
+        enc.set_buffer(3, Some(bufref(dy)), 0);
+        let p: [i32;3] = [ic, oc, m];
+        enc.set_bytes(4, 12, p.as_ptr() as *const c_void);
+        enc.set_threadgroup_memory_length(0, tg(K*CPB*2));
+        enc.dispatch_thread_groups(MTLSize::new(oc as u64/CPB as u64, gs(), 1), MTLSize::new(32, TY as u64, 1));
+        enc.end_encoding();
+    }
+    let mut ygemm = vec![0f32; (m as usize)*(oc as usize)];
+    dev_download_f32(ygemm.as_mut_ptr(), dy, m*oc);
+    // reference: per-column gemv4
+    let mut worst = 0f64;
+    let dxc = dev_alloc_half(ic);
+    let dyc = dev_alloc_f32(oc);
+    for col in 0..m as usize {
+        let xcol = &xf[col*ic as usize..(col+1)*ic as usize];
+        dev_upload_to_half(dxc, xcol.as_ptr(), ic);
+        qlinear_forward_dev(q, dxc, dyc);
+        let mut yref = vec![0f32; oc as usize];
+        dev_download_f32(yref.as_mut_ptr(), dyc, oc);
+        let mut num = 0f64; let mut den = 0f64;
+        for o in 0..oc as usize {
+            let d = (ygemm[col*oc as usize + o] - yref[o]) as f64;
+            num += d*d; den += (yref[o] as f64)*(yref[o] as f64);
+        }
+        worst = worst.max((num/den.max(1e-30)).sqrt());
+    }
+    qlinear_free(q); dev_free(dx); dev_free(dy); dev_free(dxc); dev_free(dyc);
+    worst
+}
+
+// Validate rmsnorm_m (batched, M rows) against the M=1 op_rmsnorm, per row.
+// This is the only genuinely new kernel the batched forward needs; the linears
+// (gemm_mtile) and elementwise ops are already validated / M-agnostic.
+pub unsafe fn check_rmsnorm_m(n: i32, m: i32) -> f64 {
+    let c = ctx();
+    let eps = 1e-5f32;
+    let xf: Vec<f32> = (0..(m as usize * n as usize)).map(|i| (((i * 17 + 3) % 41) as f32 - 20.0) * 0.05).collect();
+    let wf: Vec<f32> = (0..n as usize).map(|i| 1.0 + ((i % 7) as f32) * 0.1).collect();
+    let dx = dev_alloc_half(m * n);
+    dev_upload_to_half(dx, xf.as_ptr(), m * n);
+    let dw = dev_alloc_f32(n);
+    dev_upload_f32(dw, wf.as_ptr(), n);
+    let dout = dev_alloc_half(m * n);
+    // batched
+    {
+        let cb = cur_cb();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.pl["rmsnorm_m"]);
+        enc.set_buffer(0, Some(bufref(dx)), 0);
+        enc.set_buffer(1, Some(bufref(dw)), 0);
+        enc.set_buffer(2, Some(bufref(dout)), 0);
+        #[repr(C)] struct P { n: i32, eps: f32 }
+        let p = P { n, eps };
+        enc.set_bytes(3, 8, &p as *const P as *const c_void);
+        enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    }
+    let mut got = vec![0f32; (m*n) as usize];
+    dev_download_half(got.as_mut_ptr(), dout, m * n);
+    // reference: per-row M=1 op_rmsnorm
+    let dxr = dev_alloc_half(n);
+    let dor = dev_alloc_half(n);
+    let mut worst = 0f64;
+    for row in 0..m as usize {
+        dev_upload_to_half(dxr, xf[row*n as usize..].as_ptr(), n);
+        op_rmsnorm(dxr, dw, dor, n, eps);
+        let mut r = vec![0f32; n as usize];
+        dev_download_half(r.as_mut_ptr(), dor, n);
+        let mut num = 0f64; let mut den = 0f64;
+        for i in 0..n as usize { let d = (got[row*n as usize + i] - r[i]) as f64; num += d*d; den += (r[i] as f64).powi(2); }
+        worst = worst.max((num/den.max(1e-30)).sqrt());
+    }
+    dev_free(dx); dev_free(dw); dev_free(dout); dev_free(dxr); dev_free(dor);
+    worst
 }

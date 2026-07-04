@@ -309,3 +309,29 @@ kernel void gemm_mtile2(
         Y[(ulong)m*OC + j0 + chan] = s;
     }
 }
+
+// Batched RMSNorm: one threadgroup per row, normalizes each of M rows over its
+// own n elements. The linear layers (gemm_mtile) and elementwise ops (silu,
+// resadd) are already M-agnostic; this is the only per-row op the batched
+// forward needs. Reuses RmsParams {n, eps}; M comes from the grid.
+kernel void rmsnorm_m(
+    device const half*  x   [[buffer(0)]],   // [M][n]
+    device const float* w   [[buffer(1)]],   // [n]
+    device half*        out [[buffer(2)]],   // [M][n]
+    constant RmsParams& p   [[buffer(3)]],
+    uint3 tptg [[thread_position_in_threadgroup]],
+    uint3 tgpig [[threadgroup_position_in_grid]])
+{
+    int tid = tptg.x;
+    int row = tgpig.x;
+    device const half* xr = x + (ulong)row * p.n;
+    device half* outr = out + (ulong)row * p.n;
+    threadgroup float red[256];
+    float ss = 0;
+    for (int i = tid; i < p.n; i += 256) { float v = (float)xr[i]; ss += v*v; }
+    red[tid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 128; s > 0; s >>= 1) { if ((int)tid < s) red[tid] += red[tid+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float scale = rsqrt(red[0]/p.n + p.eps);
+    for (int i = tid; i < p.n; i += 256) outr[i] = (half)((float)xr[i] * scale * w[i]);
+}

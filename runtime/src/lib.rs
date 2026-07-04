@@ -606,3 +606,15 @@ pub fn bench_mtile(ic: usize, oc: usize, m: usize, iters: usize) -> f64 {
 pub fn bench_mtile2(ic: usize, oc: usize, m: usize, iters: usize) -> f64 {
     unsafe { backend::bench_mtile2(ic as i32, oc as i32, m as i32, iters as i32) }
 }
+
+/// Validate gemm_mtile computes the same as per-column gemv (worst rel err).
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn check_mtile(ic: usize, oc: usize, m: usize) -> f64 {
+    unsafe { backend::check_mtile(ic as i32, oc as i32, m as i32) }
+}
+
+/// Validate batched rmsnorm_m against per-row M=1 rmsnorm (worst rel err).
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn check_rmsnorm_m(n: usize, m: usize) -> f64 {
+    unsafe { backend::check_rmsnorm_m(n as i32, m as i32) }
+}
