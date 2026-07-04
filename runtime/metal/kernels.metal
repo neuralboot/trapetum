@@ -215,3 +215,51 @@ kernel void gemv_fp16(
     for (int i = 0; i < p.ic; i++) acc += (float)row[i] * (float)X[i];
     Y[o] = acc;
 }
+
+// Small-M fused 4-bit decode GEMM (the speculative-verification kernel).
+// Y[m][o] = sum_ic X[m][ic] * decode(packed[ic][o]). The packed weight + codebook
+// are read ONCE per ic and reused across all M input columns, so if M is small
+// the kernel stays bandwidth-bound (one weight read serves M tokens). This is the
+// M0 go/no-go: verifying K+1 draft tokens for the price of ~one weight read.
+struct GemmParams { int ic; int oc; int m; };
+kernel void gemm_mtile(
+    device const half*  X       [[buffer(0)]],   // [M][IC]
+    device const uchar* packed  [[buffer(1)]],   // [IC][OC/2]
+    device const half*  cb      [[buffer(2)]],   // [K][OC]
+    device atomic_float* Y      [[buffer(3)]],   // [M][OC]
+    constant GemmParams& p      [[buffer(4)]],
+    threadgroup half*  s_cb     [[threadgroup(0)]],   // K*CPB halfs
+    uint3 tptg [[thread_position_in_threadgroup]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tgpg [[threadgroups_per_grid]])
+{
+    const int IC = p.ic, OC = p.oc, M = p.m;
+    int tx = tptg.x, ty = tptg.y, tid = ty*32 + tx, nth = 32*TY;
+    int j0 = tgpig.x * CPB;
+    for (int t = tid; t < K*CPB/2; t += nth) {
+        int idx = t*2, k = idx/CPB, jj = j0 + (idx%CPB);
+        *reinterpret_cast<threadgroup half2*>(&s_cb[idx]) =
+            *reinterpret_cast<device const half2*>(&cb[(ulong)k*OC + jj]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int per = (IC + (int)tgpg.y - 1) / (int)tgpg.y;
+    int ic0 = tgpig.y * per, ic1 = min(IC, ic0 + per);
+    int jbase = j0 + tx*8; ulong OCp = (ulong)(OC/2);
+    float acc[8][8];
+    for (int c = 0; c < 8; c++) for (int m = 0; m < 8; m++) acc[c][m] = 0;
+    for (int ic = ic0 + ty; ic < ic1; ic += TY) {
+        uint f = *reinterpret_cast<device const uint*>(&packed[(ulong)ic*OCp + (ulong)(jbase/2)]);
+        float w[8];
+        #pragma unroll(8)
+        for (int c = 0; c < 8; c++) { uchar id = (f >> (4*c)) & 0xF; w[c] = (float)s_cb[id*CPB + tx*8 + c]; }
+        for (int m = 0; m < M; m++) {
+            float xx = (float)X[(ulong)m*IC + ic];
+            #pragma unroll(8)
+            for (int c = 0; c < 8; c++) acc[c][m] += xx * w[c];
+        }
+    }
+    for (int m = 0; m < M; m++)
+        #pragma unroll(8)
+        for (int c = 0; c < 8; c++)
+            atomic_fetch_add_explicit(&Y[(ulong)m*OC + j0 + tx*8 + c], acc[c][m], memory_order_relaxed);
+}

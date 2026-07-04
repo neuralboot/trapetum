@@ -593,3 +593,10 @@ pub mod ffi;
 pub fn bench_gemv(ic: usize, oc: usize, iters: usize) -> (f64, f64) {
     unsafe { backend::bench_gemv(ic as i32, oc as i32, iters as i32) }
 }
+
+/// M0 microbenchmark: time the small-M fused decode GEMM at `m` columns.
+/// If ms(m=6) ~= ms(m=1), verifying K+1 draft tokens costs ~one weight read.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn bench_mtile(ic: usize, oc: usize, m: usize, iters: usize) -> f64 {
+    unsafe { backend::bench_mtile(ic as i32, oc as i32, m as i32, iters as i32) }
+}

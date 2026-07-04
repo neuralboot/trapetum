@@ -32,7 +32,7 @@ fn gs() -> u64 {
 const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
 const KERNELS: &[&str] = &[
     "gemv4", "cast_f2h", "rmsnorm_k", "silu_mul_k", "resadd_k", "rope_k", "vadd_k", "attn_k",
-    "gemv_fp16",
+    "gemv_fp16", "gemm_mtile",
 ];
 
 struct Ctx {
@@ -383,4 +383,49 @@ pub unsafe fn bench_gemv(ic: i32, oc: i32, iters: i32) -> (f64, f64) {
 
     qlinear_free(q); dev_free(dx); dev_free(dy);
     (ms_4bit, ms_fp16)
+}
+
+// --- M0 microbenchmark: small-M fused decode GEMM stays bandwidth-bound? --------
+// Times gemm_mtile at a fixed IC x OC for a given M (columns verified at once).
+// If ms(M=6) ~= ms(M=1), the verification of K+1 tokens costs ~one weight read:
+// the whole speculative-decoding speedup is unlocked. Returns avg ms.
+pub unsafe fn bench_mtile(ic: i32, oc: i32, m: i32, iters: i32) -> f64 {
+    use std::time::Instant;
+    let c = ctx();
+    let np = ic as usize * (oc as usize / 2);
+    let packed: Vec<u8> = (0..np).map(|i| (i * 37 + 11) as u8).collect();
+    let cbk: Vec<f32> = (0..K * oc as usize).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
+    let q = qlinear_create(packed.as_ptr(), cbk.as_ptr(), ic, oc);
+    let ql = &*(q as *const QLin);
+    // X is [M][IC] fp16, Y is [M][OC] f32
+    let xf: Vec<f32> = (0..(m as usize * ic as usize)).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+    let dx = dev_alloc_half(m * ic);
+    dev_upload_to_half(dx, xf.as_ptr(), m * ic);
+    let dy = dev_alloc_f32(m * oc);
+    let run = || {
+        let cb = cur_cb();
+        let blit = cb.new_blit_command_encoder();
+        blit.fill_buffer(bufref(dy), NSRange::new(0, (m as u64) * (oc as u64) * 4), 0);
+        blit.end_encoding();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.pl["gemm_mtile"]);
+        enc.set_buffer(0, Some(bufref(dx)), 0);
+        enc.set_buffer(1, Some(&ql.packed), 0);
+        enc.set_buffer(2, Some(&ql.cb), 0);
+        enc.set_buffer(3, Some(bufref(dy)), 0);
+        let p: [i32; 3] = [ic, oc, m];
+        enc.set_bytes(4, 12, p.as_ptr() as *const c_void);
+        enc.set_threadgroup_memory_length(0, tg(K * CPB * 2));
+        enc.dispatch_thread_groups(
+            MTLSize::new(oc as u64 / CPB as u64, gs(), 1),
+            MTLSize::new(32, TY as u64, 1),
+        );
+        enc.end_encoding();
+    };
+    for _ in 0..3 { run(); } drain();
+    let t = Instant::now();
+    for _ in 0..iters { run(); } drain();
+    let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+    qlinear_free(q); dev_free(dx); dev_free(dy);
+    ms
 }
