@@ -618,3 +618,9 @@ pub fn check_mtile(ic: usize, oc: usize, m: usize) -> f64 {
 pub fn check_rmsnorm_m(n: usize, m: usize) -> f64 {
     unsafe { backend::check_rmsnorm_m(n as i32, m as i32) }
 }
+
+/// Validate batched causal attention attn_m vs per-query M=1 reference.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn check_attn_m(n_heads: usize, n_kv: usize, hd: usize, base: usize, m: usize) -> f64 {
+    unsafe { backend::check_attn_m(n_heads as i32, n_kv as i32, hd as i32, base as i32, m as i32) }
+}

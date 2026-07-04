@@ -32,7 +32,7 @@ fn gs() -> u64 {
 const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
 const KERNELS: &[&str] = &[
     "gemv4", "cast_f2h", "rmsnorm_k", "silu_mul_k", "resadd_k", "rope_k", "vadd_k", "attn_k",
-    "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m",
+    "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m", "attn_m",
 ];
 
 struct Ctx {
@@ -571,5 +571,67 @@ pub unsafe fn check_rmsnorm_m(n: i32, m: i32) -> f64 {
         worst = worst.max((num/den.max(1e-30)).sqrt());
     }
     dev_free(dx); dev_free(dw); dev_free(dout); dev_free(dxr); dev_free(dor);
+    worst
+}
+
+// Validate attn_m (batched causal decode attention) against a CPU reference:
+// query m attends over base+m+1 keys. Returns worst rel err over the M outputs.
+pub unsafe fn check_attn_m(n_heads: i32, n_kv: i32, hd: i32, base: i32, m: i32) -> f64 {
+    let c = ctx();
+    let qdim = (n_heads * hd) as usize;
+    let kvdim = (n_kv * hd) as usize;
+    let total = (base + m) as usize; // cache holds base + m rows (m new tokens appended)
+    let mut rng = 0x1234_5678u64;
+    let mut nx = || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; (((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0)*0.4 };
+    let q: Vec<f32> = (0..(m as usize*qdim)).map(|_| nx()).collect();
+    let ck: Vec<f32> = (0..(total*kvdim)).map(|_| nx()).collect();
+    let cv: Vec<f32> = (0..(total*kvdim)).map(|_| nx()).collect();
+    let dq = dev_alloc_half(m*qdim as i32); dev_upload_to_half(dq, q.as_ptr(), m*qdim as i32);
+    let dck = dev_alloc_half((total*kvdim) as i32); dev_upload_to_half(dck, ck.as_ptr(), (total*kvdim) as i32);
+    let dcv = dev_alloc_half((total*kvdim) as i32); dev_upload_to_half(dcv, cv.as_ptr(), (total*kvdim) as i32);
+    let dout = dev_alloc_half(m*qdim as i32);
+    {
+        let cb = cur_cb();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.pl["attn_m"]);
+        enc.set_buffer(0, Some(bufref(dq)), 0);
+        enc.set_buffer(1, Some(bufref(dck)), 0);
+        enc.set_buffer(2, Some(bufref(dcv)), 0);
+        enc.set_buffer(3, Some(bufref(dout)), 0);
+        let p: [i32;5] = [n_heads, n_kv, hd, base, m];
+        enc.set_bytes(4, 20, p.as_ptr() as *const c_void);
+        enc.set_threadgroup_memory_length(0, tg(hd as usize*4));
+        enc.set_threadgroup_memory_length(1, tg(total*4));
+        enc.dispatch_thread_groups(MTLSize::new(n_heads as u64,1,1), MTLSize::new(hd as u64,1,1));
+        enc.end_encoding();
+    }
+    let mut got = vec![0f32; m as usize*qdim]; dev_download_half(got.as_mut_ptr(), dout, m*qdim as i32);
+    // CPU reference (fp16 rounding), per query m, seqlen = base+m+1
+    let h16 = |v:f32| half::f16::from_f32(v).to_f32();
+    let scale = 1.0/(hd as f32).sqrt();
+    let mut worst = 0f64;
+    for mm in 0..m as usize {
+        let seqlen = base as usize + mm + 1;
+        for h in 0..n_heads as usize {
+            let kvh = h / (n_heads/n_kv) as usize;
+            let mut scores = vec![0f32; seqlen];
+            for t in 0..seqlen {
+                let mut s=0f32;
+                for d in 0..hd as usize { s += h16(q[mm*qdim + h*hd as usize + d]) * h16(ck[t*kvdim + kvh*hd as usize + d]); }
+                scores[t]=s*scale;
+            }
+            let mx=scores.iter().cloned().fold(f32::MIN,f32::max);
+            let mut sum=0f32; for s in scores.iter_mut(){*s=(*s-mx).exp();sum+=*s;} for s in scores.iter_mut(){*s/=sum;}
+            for d in 0..hd as usize {
+                let mut acc=0f32;
+                for t in 0..seqlen { acc += scores[t]*h16(cv[t*kvdim + kvh*hd as usize + d]); }
+                let r = h16(acc);
+                let g = got[mm*qdim + h*hd as usize + d];
+                let den = (r as f64).abs().max(1e-4);
+                worst = worst.max(((g-r) as f64).abs()/den);
+            }
+        }
+    }
+    dev_free(dq); dev_free(dck); dev_free(dcv); dev_free(dout);
     worst
 }

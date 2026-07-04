@@ -335,3 +335,50 @@ kernel void rmsnorm_m(
     float scale = rsqrt(red[0]/p.n + p.eps);
     for (int i = tid; i < p.n; i += 256) outr[i] = (half)((float)xr[i] * scale * w[i]);
 }
+
+// Batched decode attention (the spec-dec crux). Verifies M query positions at
+// once, causally: query m (at absolute position base+m) attends to keys
+// 0..base+m, i.e. the KV cache (0..base-1) plus the m new tokens already
+// appended at cache rows base..base+m. One threadgroup per query head, head_dim
+// threads, loops the M queries; each has its own causal seqlen = base+m+1.
+struct AttnMParams { int n_heads; int n_kv; int head_dim; int base; int m; };
+kernel void attn_m(
+    device const half* q   [[buffer(0)]],   // [M][n_heads*head_dim]
+    device const half* ck  [[buffer(1)]],   // cache K [>=base+M][n_kv*head_dim]
+    device const half* cv  [[buffer(2)]],   // cache V
+    device half* out       [[buffer(3)]],   // [M][n_heads*head_dim]
+    constant AttnMParams& p [[buffer(4)]],
+    threadgroup float* red    [[threadgroup(0)]],   // head_dim
+    threadgroup float* scores [[threadgroup(1)]],   // base+M
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tptg  [[thread_position_in_threadgroup]])
+{
+    int h = tgpig.x;
+    int kvh = h / (p.n_heads / p.n_kv);
+    int d = tptg.x;
+    float scale = rsqrt((float)p.head_dim);
+    int qdim = p.n_heads * p.head_dim;
+    for (int m = 0; m < p.m; m++) {
+        int seqlen = p.base + m + 1;
+        float qd = (float)q[m*qdim + h*p.head_dim + d];
+        for (int t = 0; t < seqlen; t++) {
+            red[d] = qd * (float)ck[(ulong)t*p.n_kv*p.head_dim + kvh*p.head_dim + d];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int s = p.head_dim/2; s > 0; s >>= 1) { if (d < s) red[d] += red[d+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+            if (d == 0) scores[t] = red[0] * scale;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (d == 0) {
+            float mx = -1e30f;
+            for (int t = 0; t < seqlen; t++) mx = fmax(mx, scores[t]);
+            float sum = 0;
+            for (int t = 0; t < seqlen; t++) { scores[t] = exp(scores[t]-mx); sum += scores[t]; }
+            for (int t = 0; t < seqlen; t++) scores[t] /= sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float acc = 0;
+        for (int t = 0; t < seqlen; t++) acc += scores[t] * (float)cv[(ulong)t*p.n_kv*p.head_dim + kvh*p.head_dim + d];
+        out[m*qdim + h*p.head_dim + d] = (half)acc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
