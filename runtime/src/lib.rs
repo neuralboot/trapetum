@@ -600,3 +600,9 @@ pub fn bench_gemv(ic: usize, oc: usize, iters: usize) -> (f64, f64) {
 pub fn bench_mtile(ic: usize, oc: usize, m: usize, iters: usize) -> f64 {
     unsafe { backend::bench_mtile(ic as i32, oc as i32, m as i32, iters as i32) }
 }
+
+/// M0b: optimized small-M decode GEMM (2 chan/thread, no atomics).
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn bench_mtile2(ic: usize, oc: usize, m: usize, iters: usize) -> f64 {
+    unsafe { backend::bench_mtile2(ic as i32, oc as i32, m as i32, iters as i32) }
+}

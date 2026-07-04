@@ -263,3 +263,49 @@ kernel void gemm_mtile(
         for (int c = 0; c < 8; c++)
             atomic_fetch_add_explicit(&Y[(ulong)m*OC + j0 + tx*8 + c], acc[c][m], memory_order_relaxed);
 }
+
+// gemm_mtile2: optimized small-M fused decode GEMM. Fixes the naive version's
+// two leaks past M=2: (a) light registers (2 output channels/thread, acc[2][M]
+// not [8][8]) so nothing spills; (b) NO atomics — each output tile is owned by
+// one threadgroup over the full IC, reduced in threadgroup memory and written
+// directly. Goal: ms/token keeps dropping to M=6-8 (stays bandwidth-bound).
+#define CPB2 64
+kernel void gemm_mtile2(
+    device const half*  X       [[buffer(0)]],   // [M][IC]
+    device const uchar* packed  [[buffer(1)]],   // [IC][OC/2]
+    device const half*  cb      [[buffer(2)]],   // [K][OC]
+    device float*       Y       [[buffer(3)]],   // [M][OC]  (owned tile, no atomics)
+    constant GemmParams& p      [[buffer(4)]],
+    threadgroup half*  s_cb     [[threadgroup(0)]],   // K*CPB2 halfs
+    threadgroup float* red      [[threadgroup(1)]],   // TY*CPB2*M floats
+    uint3 tptg [[thread_position_in_threadgroup]],
+    uint3 tgpig [[threadgroup_position_in_grid]])
+{
+    const int IC = p.ic, OC = p.oc, M = p.m;
+    int tx = tptg.x, ty = tptg.y, tid = ty*32 + tx, nth = 32*TY;
+    int j0 = tgpig.x * CPB2;
+    for (int t = tid; t < K*CPB2; t += nth) { int k = t/CPB2, jj = j0 + (t%CPB2); s_cb[t] = cb[(ulong)k*OC + jj]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int jbase = tx*2;                 // 2 output channels per x-thread, within the tile
+    ulong OCp = (ulong)(OC/2);
+    float acc[2][8];
+    for (int c = 0; c < 2; c++) for (int m = 0; m < 8; m++) acc[c][m] = 0;
+    for (int ic = ty; ic < IC; ic += TY) {
+        uchar byte = packed[(ulong)ic*OCp + (ulong)((j0 + jbase)/2)];
+        float w0 = (float)s_cb[(byte & 0xF)*CPB2 + jbase];
+        float w1 = (float)s_cb[((byte>>4)&0xF)*CPB2 + jbase + 1];
+        for (int m = 0; m < M; m++) {
+            float xx = (float)X[(ulong)m*IC + ic];
+            acc[0][m] += xx * w0; acc[1][m] += xx * w1;
+        }
+    }
+    for (int c = 0; c < 2; c++) for (int m = 0; m < M; m++)
+        red[(ty*CPB2 + tx*2 + c)*M + m] = acc[c][m];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int o = tid; o < CPB2*M; o += nth) {
+        int chan = o / M, m = o % M;
+        float s = 0;
+        for (int y = 0; y < TY; y++) s += red[(y*CPB2 + chan)*M + m];
+        Y[(ulong)m*OC + j0 + chan] = s;
+    }
+}
