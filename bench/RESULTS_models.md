@@ -28,6 +28,8 @@ reasoning model measured on plain wikitext, not its domain.)
 | **Gemma-2-9B** | GeGLU + softcaps + 4-norm | **74 tok/s** | "**Paris**. 🇫🇷 Let me know if you have any other questions!" |
 | **Phi-4** (14B) | Phi3 (fused qkv/gate_up) | **79.9 tok/s** | " **Paris**." (then chat-template tokens — chat model, bare prompt) |
 | Llama-2-7B | standard | 136 tok/s | reproduces HF greedy 16/16 exactly |
+| Qwen2.5-7B | GQA + qkv bias | 118 tok/s | coherent (wallclock harness, torch-free export) |
+| Llama-3.1-8B | GQA + llama3 rope | 118 tok/s | coherent (wallclock harness, torch-free export) |
 
 Gemma-2 worked on the FIRST run (no debug iterations) — the port (attention+final logit
 softcapping, GeGLU, RMSNorm(1+w), embedding*sqrt(hidden), 4-norm post-sublayer residual)
