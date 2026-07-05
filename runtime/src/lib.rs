@@ -50,6 +50,22 @@ mod backend {
             head_dim: i32,
             seqlen: i32,
         );
+        // batched (M-token) ops for speculative decoding
+        pub fn qlinear_forward_m(handle: *mut c_void, d_x: *const c_void, d_y: *mut c_void, m: i32);
+        pub fn op_rmsnorm_m(x_half: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32, m: i32);
+        pub fn op_rope_m(x_half: *mut c_void, base: i32, n_heads: i32, head_dim: i32, inv_freq: *const c_void, m: i32);
+        pub fn op_cache_append_m(cache_half: *mut c_void, src_half: *const c_void, base: i32, dim: i32, m: i32);
+        pub fn op_attn_m(
+            q_half: *const c_void,
+            ck_half: *const c_void,
+            cv_half: *const c_void,
+            out_half: *mut c_void,
+            n_heads: i32,
+            n_kv: i32,
+            head_dim: i32,
+            base: i32,
+            m: i32,
+        );
     }
 }
 
@@ -204,7 +220,7 @@ pub fn residual_add(h: &mut DevHalf, delta: &DevF32) {
 // (see check_mtile / check_rmsnorm_m / check_attn_m / check_rope_m).
 // ============================================================================
 
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl QuantLinear {
     /// Batched decode GEMM: `y[M][oc] = x[M][ic] W^T`, one weight read serves all M rows.
     pub fn forward_m(&self, x: &DevHalf, y: &mut DevF32, m: usize) {
@@ -215,7 +231,7 @@ impl QuantLinear {
 }
 
 /// Batched RMSNorm over M rows (`x`,`out` are `m*n`).
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn rmsnorm_m(x: &DevHalf, w: &DevF32, out: &mut DevHalf, eps: f32, n: usize, m: usize) {
     assert_eq!(x.n, m * n);
     assert_eq!(w.n, n);
@@ -223,21 +239,21 @@ pub fn rmsnorm_m(x: &DevHalf, w: &DevF32, out: &mut DevHalf, eps: f32, n: usize,
 }
 
 /// Batched RoPE: row `r` rotated at absolute position `base+r` (`x` is `m*n_heads*head_dim`).
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn rope_m(x: &mut DevHalf, base: usize, n_heads: usize, head_dim: usize, inv_freq: &DevF32, m: usize) {
     assert_eq!(x.n, m * n_heads * head_dim);
     unsafe { op_rope_m(x.ptr, base as i32, n_heads as i32, head_dim as i32, inv_freq.ptr, m as i32) };
 }
 
 /// Append M contiguous new rows to the KV cache at rows `base..base+m`.
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn cache_append_m(cache: &mut DevHalf, src: &DevHalf, base: usize, dim: usize, m: usize) {
     assert_eq!(src.n, m * dim);
     unsafe { op_cache_append_m(cache.ptr, src.ptr, base as i32, dim as i32, m as i32) };
 }
 
 /// Batched causal decode attention: query `r` attends over `base+r+1` keys (`q`,`out` are `m*n_heads*head_dim`).
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 #[allow(clippy::too_many_arguments)]
 pub fn attention_m(q: &DevHalf, ck: &DevHalf, cv: &DevHalf, out: &mut DevHalf,
                    n_heads: usize, n_kv: usize, head_dim: usize, base: usize, m: usize) {
@@ -457,7 +473,7 @@ impl Layer {
 // ---- batched (M-token) forward for the transformer blocks -------------------
 // Verifies K+1 speculative tokens in a single forward. Scratch is allocated per
 // call (a test-grade path; production would preallocate). No attention bias yet.
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl MlpBlock {
     /// `h` is `m*hidden`, updated in place: `h = h + MLP(RMSNorm(h))` for all M rows.
     pub fn forward_m(&mut self, h: &mut DevHalf, m: usize) {
@@ -477,7 +493,7 @@ impl MlpBlock {
     }
 }
 
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl AttnBlock {
     /// Batched decode step: `h` is `m*hidden`, the M new tokens sit at positions
     /// `base..base+m`. Each query attends causally over `base+row+1` keys.
@@ -513,7 +529,7 @@ impl AttnBlock {
     }
 }
 
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl Layer {
     /// One batched decode step over M tokens at positions `base..base+m`.
     pub fn forward_m(&mut self, h: &mut DevHalf, base: usize, m: usize) {
@@ -583,7 +599,7 @@ impl Model {
     /// `t1` at `pos+1` in ONE forward (appending KV rows `pos`, `pos+1`), returning the
     /// next-token logits at each position: `(logits0, logits1)`. `logits0` predicts the
     /// token after `t0`; `logits1` predicts the token after `t0,t1`.
-    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     pub fn forward_m2(&mut self, t0: usize, t1: usize, pos: usize) -> (Vec<f32>, Vec<f32>) {
         let hid = self.hidden;
         let mut h2 = vec![0f32; 2 * hid];
@@ -604,7 +620,7 @@ impl Model {
     /// Batched forward over M tokens at positions `pos..pos+M`, returning the M next-token
     /// logit vectors. `logits[j]` predicts the token after `tokens[0..=j]`. M = K+1 for a
     /// K-token speculative verify (M<=4, the validated range of gemm_mtile).
-    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     pub fn forward_mk(&mut self, tokens: &[usize], pos: usize) -> Vec<Vec<f32>> {
         let m = tokens.len();
         let hid = self.hidden;
@@ -628,7 +644,7 @@ impl Model {
     /// `drafter(prefix, k) -> k proposed tokens`. LOSSLESS by construction. K<=3 (the verify
     /// needs an M=K+1 batched forward, and gemm_mtile is validated to M=4). Returns
     /// `(tokens, target_forwards)`; fewer forwards = the speedup.
-    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     pub fn spec_decode_greedy_k(
         &mut self,
         prompt: &[usize],
@@ -684,7 +700,7 @@ impl Model {
     /// target's greedy argmax, so the output equals plain greedy decode regardless of the
     /// drafter's accuracy — a good drafter just emits more tokens per target forward.
     /// Returns `(tokens, target_forwards)` so callers can see the speedup (fewer forwards).
-    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     pub fn spec_decode_greedy(
         &mut self,
         prompt: &[usize],
@@ -893,13 +909,13 @@ pub fn check_rope_m(n_heads: usize, head_dim: usize, base: usize, m: usize) -> f
 /// (attention + MLP) run once over M tokens must equal M sequential M=1 forwards
 /// through the same weights with a causally growing KV cache. Returns worst rel err
 /// over the M output rows. This validates the whole spec-dec verify forward.
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn check_batched_layer(hidden: usize, n_heads: usize, n_kv: usize, head_dim: usize,
                            inter: usize, base: usize, m: usize) -> f64 {
     check_batched_impl(hidden, n_heads, n_kv, head_dim, inter, base, m, false)
 }
 
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 #[allow(clippy::too_many_arguments)]
 fn check_batched_impl(hidden: usize, n_heads: usize, n_kv: usize, head_dim: usize,
                       inter: usize, base: usize, m: usize, attn_only: bool) -> f64 {
@@ -965,13 +981,13 @@ fn check_batched_impl(hidden: usize, n_heads: usize, n_kv: usize, head_dim: usiz
 }
 
 /// Test wrapper for the batched-layer lossless check.
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn batched_layer_relerr(hidden: usize, n_heads: usize, n_kv: usize, head_dim: usize, inter: usize, base: usize, m: usize) -> f64 {
     check_batched_layer(hidden, n_heads, n_kv, head_dim, inter, base, m)
 }
 
 /// Attention-sublayer-only variant of the batched lossless check (for bisecting).
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn batched_attn_relerr(hidden: usize, n_heads: usize, n_kv: usize, head_dim: usize, base: usize, m: usize) -> f64 {
     check_batched_impl(hidden, n_heads, n_kv, head_dim, 512, base, m, true)
 }
@@ -983,7 +999,7 @@ pub fn argmax(v: &[f32]) -> usize {
     bi
 }
 
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl Model {
     /// Plain greedy autoregressive decode (the reference the spec loop must match).
     pub fn decode_greedy(&mut self, prompt: &[usize], n: usize) -> Vec<usize> {
@@ -1008,7 +1024,7 @@ impl Model {
 /// then runs spec-dec with (a) a perfect drafter (all accepts -> fewer forwards) and
 /// (b) an adversarial drafter (many rejects). Returns (ok_oracle, ok_wrong, fwds_oracle,
 /// fwds_wrong, n) so the caller can also confirm the accept path actually saves forwards.
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn check_spec_decode() -> (bool, bool, usize, usize, usize) {
     let (hidden, vocab, n_heads, n_kv, head_dim, inter, n_layers) = (256usize, 256usize, 8usize, 8usize, 32usize, 512usize, 2usize);
     let eps = 1e-5f32;
@@ -1067,7 +1083,7 @@ pub fn check_spec_decode() -> (bool, bool, usize, usize, usize) {
 /// K-general lossless check of the speculative loop (K=1..3). Same tiny random model as
 /// `check_spec_decode`, but verifies K+1 tokens per forward. Returns
 /// (ok_oracle, ok_wrong, fwds_oracle, fwds_wrong, n).
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn check_spec_decode_k(k: usize) -> (bool, bool, usize, usize, usize) {
     let (hidden, vocab, n_heads, n_kv, head_dim, inter, n_layers) = (256usize, 256usize, 8usize, 8usize, 32usize, 512usize, 2usize);
     let eps = 1e-5f32; let max_seq = 128usize;
@@ -1123,7 +1139,7 @@ impl Model {
     /// the verify needs M=K+1 <= 4). Draft more when the drafter is sure, fewer when not.
     /// Still LOSSLESS (the verify guarantees the target's greedy output). Returns
     /// `(tokens, target_forwards, avg_k)`.
-    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     pub fn spec_decode_greedy_conf(
         &mut self,
         prompt: &[usize],
@@ -1170,7 +1186,7 @@ impl Model {
 
 /// Lossless check of confidence-scheduled decode: output must equal plain greedy for any
 /// confidence signal. Returns (ok_highconf, ok_mixed, fwds_high, avg_k_high, n).
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn check_spec_decode_conf() -> (bool, bool, usize, f64, usize) {
     let (hidden, vocab, n_heads, n_kv, head_dim, inter, n_layers) = (256usize, 256usize, 8usize, 8usize, 32usize, 512usize, 2usize);
     let eps = 1e-5f32; let max_seq = 128usize;

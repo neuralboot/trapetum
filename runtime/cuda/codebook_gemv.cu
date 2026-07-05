@@ -141,6 +141,121 @@ __global__ void attn_k(const __half* __restrict__ q, const __half* __restrict__ 
     out[h*head_dim + d] = __float2half(acc);
 }
 
+// ============================================================================
+// Batched (M-token) decode kernels for speculative decoding (verify K+1 tokens
+// in one forward). M <= 4. Mirror the M=1 kernels above, reusing one weight read
+// across the M columns. Validated bit-for-bit against the M=1 path in the Metal
+// backend (check_mtile / check_attn_m / …); this is the CUDA twin.
+// ============================================================================
+#define MMAX 4
+
+// Batched fused 4-bit decode GEMM: X[M][IC] -> Y[M][OC]. One packed-weight read
+// per (ic) serves all M columns; that is what keeps the verify bandwidth-bound.
+__global__ void __launch_bounds__(32*TY)
+gemm_mtile(const __half* __restrict__ X, const unsigned char* __restrict__ packed,
+           const __half* __restrict__ cb, float* __restrict__ Yacc, int IC, int OC, int M) {
+    extern __shared__ char sm[];
+    __half* s_cb = (__half*)sm;
+    float* red = (float*)(s_cb + K*CPB);          // M*TY*CPB floats
+    int tx = threadIdx.x, ty = threadIdx.y, tid = ty*32+tx, nth = 32*TY;
+    int j0 = blockIdx.x*CPB;
+    for (int t = tid; t < K*CPB/2; t += nth) {
+        int idx = t*2, k = idx/CPB, jj = j0 + (idx%CPB);
+        *reinterpret_cast<__half2*>(&s_cb[idx]) = *reinterpret_cast<const __half2*>(&cb[(size_t)k*OC+jj]);
+    }
+    __syncthreads();
+    int per = (IC+gridDim.y-1)/gridDim.y, ic0 = blockIdx.y*per, ic1 = min(IC, ic0+per);
+    size_t OCp = OC/2;
+    float acc[MMAX][8];
+    #pragma unroll
+    for (int m = 0; m < MMAX; m++) for (int c = 0; c < 8; c++) acc[m][c] = 0.f;
+    for (int ic = ic0+ty; ic < ic1; ic += TY) {
+        unsigned f = __ldg((const unsigned*)&packed[(size_t)ic*OCp + (j0 + tx*8)/2]);
+        float xx[MMAX];
+        for (int m = 0; m < M; m++) xx[m] = __half2float(__ldg(&X[(size_t)m*IC + ic]));
+        #pragma unroll
+        for (int c = 0; c < 8; c++) {
+            unsigned char id = (f>>(4*c))&0xF;
+            float w = __half2float(s_cb[id*CPB+tx*8+c]);
+            for (int m = 0; m < M; m++) acc[m][c] += xx[m]*w;
+        }
+    }
+    for (int m = 0; m < M; m++)
+        #pragma unroll
+        for (int c = 0; c < 8; c++) red[((size_t)m*TY+ty)*CPB + tx*8+c] = acc[m][c];
+    __syncthreads();
+    if (ty == 0) {
+        for (int m = 0; m < M; m++)
+            #pragma unroll
+            for (int c = 0; c < 8; c++) {
+                float s = 0; for (int y = 0; y < TY; y++) s += red[((size_t)m*TY+y)*CPB + tx*8+c];
+                atomicAdd(&Yacc[(size_t)m*OC + j0+tx*8+c], s);
+            }
+    }
+}
+
+// Batched RMSNorm: one block per row (grid.x = M), 256 threads.
+__global__ void rmsnorm_m(const __half* __restrict__ x, const float* __restrict__ w,
+                          __half* __restrict__ out, int n, float eps) {
+    int row = blockIdx.x, tid = threadIdx.x;
+    const __half* xr = x + (size_t)row*n; __half* outr = out + (size_t)row*n;
+    __shared__ float red[256];
+    float ss = 0; for (int i = tid; i < n; i += 256) { float v = __half2float(xr[i]); ss += v*v; }
+    red[tid] = ss; __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid+s]; __syncthreads(); }
+    float scale = rsqrtf(red[0]/n + eps);
+    for (int i = tid; i < n; i += 256) outr[i] = __float2half(__half2float(xr[i]) * scale * w[i]);
+}
+
+// Batched RoPE: row r rotated at absolute position base+r.
+__global__ void rope_m(__half* __restrict__ x, int base, int n_heads, int head_dim,
+                       const float* __restrict__ inv_freq, int M) {
+    int t = blockIdx.x*blockDim.x + threadIdx.x;
+    int half = head_dim/2, per_row = n_heads*half;
+    if (t >= M*per_row) return;
+    int row = t/per_row, r = t%per_row, h = r/half, d = r%half;
+    float angle = (float)(base+row) * inv_freq[d];
+    float c = cosf(angle), s = sinf(angle);
+    int qdim = n_heads*head_dim;
+    size_t i = (size_t)row*qdim + h*head_dim + d, j = i + half;
+    float x0 = __half2float(x[i]), x1 = __half2float(x[j]);
+    x[i] = __float2half(x0*c - x1*s);
+    x[j] = __float2half(x1*c + x0*s);
+}
+
+// Batched causal decode attention: query row m attends over base+m+1 keys.
+__global__ void attn_m(const __half* __restrict__ q, const __half* __restrict__ ck,
+                       const __half* __restrict__ cv, __half* __restrict__ out,
+                       int n_heads, int n_kv, int head_dim, int base, int M) {
+    int h = blockIdx.x, kvh = h / (n_heads/n_kv), d = threadIdx.x;
+    extern __shared__ float smem[];
+    float* red = smem;                 // head_dim
+    float* scores = smem + head_dim;   // base+M
+    int qdim = n_heads*head_dim;
+    float scale = rsqrtf((float)head_dim);
+    for (int m = 0; m < M; m++) {
+        int seqlen = base + m + 1;
+        float qd = __half2float(q[(size_t)m*qdim + h*head_dim + d]);
+        for (int t = 0; t < seqlen; t++) {
+            red[d] = qd * __half2float(ck[(size_t)t*n_kv*head_dim + kvh*head_dim + d]);
+            __syncthreads();
+            for (int s = head_dim/2; s > 0; s >>= 1) { if (d < s) red[d] += red[d+s]; __syncthreads(); }
+            if (d == 0) scores[t] = red[0] * scale;
+            __syncthreads();
+        }
+        if (d == 0) {
+            float mx = -1e30f; for (int t = 0; t < seqlen; t++) mx = fmaxf(mx, scores[t]);
+            float sum = 0; for (int t = 0; t < seqlen; t++) { scores[t] = expf(scores[t]-mx); sum += scores[t]; }
+            for (int t = 0; t < seqlen; t++) scores[t] /= sum;
+        }
+        __syncthreads();
+        float acc = 0;
+        for (int t = 0; t < seqlen; t++) acc += scores[t] * __half2float(cv[(size_t)t*n_kv*head_dim + kvh*head_dim + d]);
+        out[(size_t)m*qdim + h*head_dim + d] = __float2half(acc);
+        __syncthreads();
+    }
+}
+
 // One dedicated stream for all device ops, so the decode chain can be CUDA-graph
 // captured (launches MUST be on the captured stream, else they are not recorded).
 static cudaStream_t g_stream = 0;
@@ -253,6 +368,37 @@ void op_attn(const void* q_half, const void* ck_half, const void* cv_half, void*
     size_t smem = ((size_t)head_dim + seqlen) * sizeof(float);
     attn_k<<<n_heads, head_dim, smem, g_stream>>>((const __half*)q_half, (const __half*)ck_half,
         (const __half*)cv_half, (__half*)out_half, n_heads, n_kv, head_dim, seqlen);
+}
+
+// --- batched (M-token) ops for speculative decoding -------------------------------
+void qlinear_forward_m(void* handle, const void* d_x, void* d_y, int M) {
+    QLinear* q = (QLinear*)handle;
+    ensure_stream();
+    cudaMemsetAsync(d_y, 0, (size_t)M*q->OC*sizeof(float), g_stream);
+    size_t smem = (size_t)K*CPB*sizeof(__half) + (size_t)M*TY*CPB*sizeof(float);
+    dim3 grid(q->OC/CPB, GS), block(32, TY);
+    gemm_mtile<<<grid, block, smem, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, (float*)d_y, q->IC, q->OC, M);
+}
+void op_rmsnorm_m(const void* x_half, const void* w_f32, void* out_half, int n, float eps, int M) {
+    ensure_stream();
+    rmsnorm_m<<<M, 256, 0, g_stream>>>((const __half*)x_half, (const float*)w_f32, (__half*)out_half, n, eps);
+}
+void op_rope_m(void* x_half, int base, int n_heads, int head_dim, const void* inv_freq, int M) {
+    ensure_stream();
+    int total = M * n_heads * (head_dim/2);
+    rope_m<<<(total+127)/128, 128, 0, g_stream>>>((__half*)x_half, base, n_heads, head_dim, (const float*)inv_freq, M);
+}
+void op_cache_append_m(void* cache_half, const void* src_half, int base, int dim, int M) {
+    ensure_stream();
+    cudaMemcpyAsync((char*)cache_half + (size_t)base*dim*sizeof(__half), src_half,
+                    (size_t)M*dim*sizeof(__half), cudaMemcpyDeviceToDevice, g_stream);
+}
+void op_attn_m(const void* q_half, const void* ck_half, const void* cv_half, void* out_half,
+               int n_heads, int n_kv, int head_dim, int base, int M) {
+    ensure_stream();
+    size_t smem = ((size_t)head_dim + base + M) * sizeof(float);
+    attn_m<<<n_heads, head_dim, smem, g_stream>>>((const __half*)q_half, (const __half*)ck_half,
+        (const __half*)cv_half, (__half*)out_half, n_heads, n_kv, head_dim, base, M);
 }
 
 void dev_sync() { cudaDeviceSynchronize(); }
