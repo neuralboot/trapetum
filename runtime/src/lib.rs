@@ -706,6 +706,89 @@ impl Model {
         (out, fwds)
     }
 
+    /// TWO-MODEL wall-clock speculative decode: the drafter is a real second `Model`
+    /// decoding incrementally in its own KV cache (no re-prefill per round). The drafter
+    /// is conditioned on the committed prefix PLUS the pending token u0, reusing cache
+    /// rows via longest-common-prefix (rejected speculative rows are overwritten in
+    /// place, same position-indexed trick as the target's verify). LOSSLESS by
+    /// construction. Returns `(tokens, target_forwards, drafter_forwards)`; wall-clock
+    /// speed is the caller's job (time this against a plain greedy loop).
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    pub fn spec_decode_two_model(
+        &mut self,
+        drafter: &mut Model,
+        prompt: &[usize],
+        n: usize,
+        k: usize,
+    ) -> (Vec<usize>, usize, usize) {
+        assert!((1..=3).contains(&k), "K must be 1..=3 (verify M=K+1 <= 4)");
+        assert!(!prompt.is_empty());
+        let mut last = vec![];
+        for (i, &t) in prompt.iter().enumerate() { last = self.forward(t, i); }
+        let mut out: Vec<usize> = Vec::with_capacity(n);
+        let mut pos = prompt.len();
+        let mut u0 = argmax(&last);
+        let (mut t_fwds, mut d_fwds) = (0usize, 0usize);
+        // drafter cache state: d_toks[i] is the token whose KV row sits at position i;
+        // d_last = drafter logits after the last row (valid only when d_last_ok).
+        let mut d_toks: Vec<usize> = Vec::new();
+        let mut d_last: Vec<f32> = vec![];
+        while out.len() < n {
+            // the drafter conditions on prompt + out + [u0]
+            let mut want = prompt.to_vec();
+            want.extend_from_slice(&out);
+            want.push(u0);
+            // longest common prefix with what the drafter already has in cache
+            let mut c = 0usize;
+            while c < d_toks.len() && c < want.len() && d_toks[c] == want[c] { c += 1; }
+            d_toks.truncate(c);
+            let mut fed_any = false;
+            for i in c..want.len() {
+                d_last = drafter.forward(want[i], i);
+                d_fwds += 1;
+                d_toks.push(want[i]);
+                fed_any = true;
+            }
+            debug_assert!(fed_any || !d_toks.is_empty());
+            // propose k tokens greedily, feeding each into the drafter's cache
+            let mut drafts = Vec::with_capacity(k);
+            for _ in 0..k {
+                let d = argmax(&d_last);
+                drafts.push(d);
+                d_last = drafter.forward(d, d_toks.len());
+                d_fwds += 1;
+                d_toks.push(d);
+            }
+            // target verifies u0 + drafts in one batched forward
+            let mut toks = Vec::with_capacity(k + 1);
+            toks.push(u0);
+            toks.extend_from_slice(&drafts);
+            let logits = self.forward_mk(&toks, pos);
+            t_fwds += 1;
+            out.push(u0);
+            if out.len() >= n { break; }
+            let mut j = 0usize;
+            while j < k {
+                let a = argmax(&logits[j]);
+                if drafts[j] == a {
+                    out.push(drafts[j]);
+                    j += 1;
+                    if out.len() >= n { break; }
+                } else { break; }
+            }
+            if out.len() >= n { break; }
+            if j == k {
+                u0 = argmax(&logits[k]);
+                pos += k + 1;
+            } else {
+                u0 = argmax(&logits[j]);
+                pos += j + 1; // stale target rows overwritten next step
+            }
+        }
+        out.truncate(n);
+        (out, t_fwds, d_fwds)
+    }
+
     /// Greedy speculative decode, K=1. `drafter(prefix) -> proposed next token`. Emits
     /// `n` tokens after the prompt. LOSSLESS by construction: every emitted token is the
     /// target's greedy argmax, so the output equals plain greedy decode regardless of the
