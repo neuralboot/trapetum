@@ -85,10 +85,49 @@ def kmeans_cols(Wt, iters=8):
     return centroids.astype(np.float32), idx
 
 
+def kmeans_cols_torch(Wt_np, iters=8):
+    # GPU k-means via torch ONLY (no transformers/tokenizers/safetensors) for large models.
+    # Enabled with EXPORT_DEV=cuda; ~100x faster than CPU numpy. Same shape as kmeans_cols.
+    # K-loop running-min assignment (no cdist), column-chunked to bound memory on big matrices.
+    import torch
+    dev = os.environ.get("EXPORT_DEV", "cuda")
+    Wt = torch.from_numpy(Wt_np).to(dev)              # [in,out]
+    inn, out = Wt.shape
+    lo, hi = Wt.min(0).values, Wt.max(0).values
+    C = torch.stack([lo + (hi - lo) * (k / (K - 1)) for k in range(K)], 0)  # [K,out]
+    blk = max(1, (256 * 1024 * 1024) // (inn * 4))     # ~256MB/[in,blk] working set
+
+    def assign():
+        idx = torch.empty((inn, out), dtype=torch.uint8, device=dev)
+        for s in range(0, out, blk):
+            W = Wt[:, s:s + blk]
+            best_d = torch.full_like(W, float("inf"))
+            best_k = torch.zeros_like(W, dtype=torch.uint8)
+            for k in range(K):
+                d = (W - C[k, s:s + blk]) ** 2
+                m = d < best_d
+                best_k = torch.where(m, torch.full_like(best_k, k), best_k)
+                best_d = torch.where(m, d, best_d)
+            idx[:, s:s + blk] = best_k
+        return idx
+
+    idx = assign()
+    for _ in range(iters):
+        for k in range(K):
+            msk = idx == k
+            cnt = msk.sum(0)
+            C[k] = torch.where(cnt > 0, (Wt * msk).sum(0) / cnt.clamp(min=1), C[k])
+        idx = assign()
+    return C.float().cpu().numpy(), idx.cpu().numpy()
+
+
 def quantize(weight, chunk=16384):
     # weight [out,in] -> packed [in,out/2] u8, cb [K,out] f32
     Wt = np.ascontiguousarray(weight.T.astype(np.float32))  # [in,out]
-    cb, idx = kmeans_cols(Wt)
+    if os.environ.get("EXPORT_DEV", "").startswith("cuda"):
+        cb, idx = kmeans_cols_torch(Wt)
+    else:
+        cb, idx = kmeans_cols(Wt)
     idxu = idx.astype(np.uint8)
     packed = (idxu[:, 0::2] | (idxu[:, 1::2] << 4))
     return np.ascontiguousarray(packed), np.ascontiguousarray(cb)
@@ -98,6 +137,25 @@ def wf16(f, a): f.write(a.astype("<f2").tobytes())
 def wf32(f, a): f.write(a.astype("<f4").tobytes())
 def qwrite(f, w):
     p, cb = quantize(w); f.write(np.ascontiguousarray(p, dtype=np.uint8).tobytes()); wf32(f, cb)
+
+
+def split_fused(W, n_layers, n_heads, n_kv, head_dim):
+    # Phi-3/Phi-4 (Phi3ForCausalLM) fuse qkv_proj and gate_up_proj into single matrices.
+    # Split them into the standard q/k/v and gate/up keys the CBK3 writer expects. Lossless.
+    if "model.layers.0.self_attn.qkv_proj.weight" not in W:
+        return W
+    for li in range(n_layers):
+        P = f"model.layers.{li}."
+        qkv = W.pop(P + "self_attn.qkv_proj.weight")
+        q_r, kv_r = n_heads * head_dim, n_kv * head_dim
+        W[P + "self_attn.q_proj.weight"] = qkv[:q_r]
+        W[P + "self_attn.k_proj.weight"] = qkv[q_r:q_r + kv_r]
+        W[P + "self_attn.v_proj.weight"] = qkv[q_r + kv_r:q_r + 2 * kv_r]
+        gu = W.pop(P + "mlp.gate_up_proj.weight")
+        inter = gu.shape[0] // 2
+        W[P + "mlp.gate_proj.weight"] = gu[:inter]
+        W[P + "mlp.up_proj.weight"] = gu[inter:]
+    return W
 
 
 def pad_rows(w, n):
@@ -116,6 +174,7 @@ def main():
     eps = c["rms_norm_eps"]; base = float(c.get("rope_theta", 10000.0))
     pad_vocab = ((vocab + 255) // 256) * 256
     W = load_weights(a.dir)
+    W = split_fused(W, n_layers, n_heads, n_kv, head_dim)  # Phi-3/Phi-4 fused qkv/gate_up
     has_bias = 1 if "model.layers.0.self_attn.q_proj.bias" in W else 0
     # rope inv_freq (default / llama3 scaling)
     inv = 1.0 / (base ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim))
