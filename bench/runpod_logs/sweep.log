@@ -1,0 +1,167 @@
+### env ###
+ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
+torchaudio 2.2.0 requires torch==2.2.0, but you have torch 2.4.0+cu121 which is incompatible.
+torchvision 0.17.0 requires torch==2.2.0, but you have torch 2.4.0+cu121 which is incompatible.
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
+torchvision 0.17.0 requires torch==2.2.0, but you have torch 2.4.0+cu121 which is incompatible.
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+[notice] A new release of pip is available: 24.0 -> 26.1.2
+[notice] To update, run: python -m pip install --upgrade pip
+### Qwen/Qwen2.5-7B-Instruct -> Pareto (fp16 vs 4-bit: VRAM, tok/s, J/token, PPL@40000) ###
+/usr/local/lib/python3.10/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/usr/local/lib/python3.10/dist-packages/torch/utils/cpp_extension.py:1965: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+== fp16 ==
+Downloading shards:   0%|          | 0/4 [00:00<?, ?it/s]Downloading shards:  25%|██▌       | 1/4 [00:16<00:48, 16.23s/it]Downloading shards:  50%|█████     | 2/4 [00:23<00:21, 10.86s/it]Downloading shards:  75%|███████▌  | 3/4 [00:29<00:08,  8.89s/it]Downloading shards: 100%|██████████| 4/4 [00:37<00:00,  8.49s/it]Downloading shards: 100%|██████████| 4/4 [00:37<00:00,  9.44s/it]
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██▌       | 1/4 [00:00<00:02,  1.03it/s]Loading checkpoint shards:  50%|█████     | 2/4 [00:01<00:01,  1.01it/s]Loading checkpoint shards:  75%|███████▌  | 3/4 [00:02<00:00,  1.07it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:03<00:00,  1.14it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:03<00:00,  1.10it/s]
+idle baseline: 54.0 W
+Generating test split:   0%|          | 0/4358 [00:00<?, ? examples/s]Generating test split: 100%|██████████| 4358/4358 [00:00<00:00, 247083.96 examples/s]
+Generating train split:   0%|          | 0/36718 [00:00<?, ? examples/s]Generating train split: 100%|██████████| 36718/36718 [00:00<00:00, 427405.11 examples/s]
+Generating validation split:   0%|          | 0/3760 [00:00<?, ? examples/s]Generating validation split: 100%|██████████| 3760/3760 [00:00<00:00, 390177.47 examples/s]
+Token indices sequence length is longer than the specified maximum sequence length for this model (299078 > 131072). Running this sequence through the model will result in indexing errors
+We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)
+{'method': 'fp16', 'bits': 16.0, 'gb': 15.231233024, 'ppl': 7.2419626834713435, 'tps': 39.00528848542013, 'jpt': 6.043585948276632, 'jpt_std': 0.3919514461996602, 'jpt_net': 4.658919694959343, 'watts': 236.51911541722777, 'idle_w': 54.00930666666667}
+== codebook-4bit (ours) ==
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██▌       | 1/4 [00:00<00:02,  1.11it/s]Loading checkpoint shards:  50%|█████     | 2/4 [00:01<00:01,  1.15it/s]Loading checkpoint shards:  75%|███████▌  | 3/4 [00:02<00:00,  1.13it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:03<00:00,  1.17it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:03<00:00,  1.16it/s]
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██▌       | 1/4 [00:00<00:02,  1.07it/s]Loading checkpoint shards:  50%|█████     | 2/4 [00:01<00:01,  1.13it/s]Loading checkpoint shards:  75%|███████▌  | 3/4 [00:02<00:00,  1.17it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:03<00:00,  1.22it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:03<00:00,  1.18it/s]
+{'method': 'codebook-4bit', 'bits': 4.05, 'gb': 5.49, 'ppl': 8.224809175782918, 'tps': 24.660162989076415, 'jpt': 4.640817345205597, 'jpt_std': 0.44646043563601373, 'jpt_net': 2.4506733996610808, 'watts': 114.71469788124318, 'idle_w': 54.00930666666667}
+== aqlm-2bit (best-effort) ==
+aqlm skipped: Using `aqlm` quantization requires AQLM: `pip install aqlm[gpu,cpu]`
+
+| method | bits | mem GB | PPL | tok/s | J/token (gross, +/-std) | J/token (net of idle) | gCO2/1k tok (FR/US) |
+|---|---|---|---|---|---|---|---|
+| fp16 | 16.00 | 15.23 | 7.24 | 39.0 | 6.04 +/- 0.39 | 4.66 | 0.084 / 0.67 |
+| codebook-4bit | 4.05 | 5.49 | 8.22 | 24.7 | 4.64 +/- 0.45 | 2.45 | 0.064 / 0.52 |
+| aqlm-2bit | 2.00 | n/a | n/a | n/a | n/a +/- n/a | n/a | n/a / n/a |
+
+NOTE J/token gross = trapezoidal integral of sampled GPU power / tokens, mean over 3 runs.
+J/token NET subtracts the idle baseline (54.0 W) so the figure is the ACTIVE decode energy.
+NOTE J/token is the measured primary axis. gCO2/1k-tok = J/token x grid intensity
+(FR ~50, US ~400 gCO2/kWh) -- a projection, not a measurement (RunPod grid mix unknown).
+Batch-1 decode; Marlin (uniform 4-bit) and batched throughput are TODO.
+### unsloth/Meta-Llama-3.1-8B-Instruct -> Pareto (fp16 vs 4-bit: VRAM, tok/s, J/token, PPL@40000) ###
+/usr/local/lib/python3.10/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/usr/local/lib/python3.10/dist-packages/torch/utils/cpp_extension.py:1965: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+Traceback (most recent call last):
+  File "/workspace/trapetum/bench/pareto.py", line 349, in <module>
+    main()
+  File "/workspace/trapetum/bench/pareto.py", line 258, in main
+    tok = AutoTokenizer.from_pretrained(args.model)
+  File "/usr/local/lib/python3.10/dist-packages/transformers/models/auto/tokenization_auto.py", line 897, in from_pretrained
+    return tokenizer_class.from_pretrained(pretrained_model_name_or_path, *inputs, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/transformers/tokenization_utils_base.py", line 2271, in from_pretrained
+    return cls._from_pretrained(
+  File "/usr/local/lib/python3.10/dist-packages/transformers/tokenization_utils_base.py", line 2505, in _from_pretrained
+    tokenizer = cls(*init_inputs, **init_kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/transformers/tokenization_utils_fast.py", line 115, in __init__
+    fast_tokenizer = TokenizerFast.from_file(fast_tokenizer_file)
+Exception: data did not match any variant of untagged enum ModelWrapper at line 1251003 column 3
+WARN: unsloth/Meta-Llama-3.1-8B-Instruct failed (arch/gating?) - skipping
+### unsloth/mistral-7b-instruct-v0.3 -> Pareto (fp16 vs 4-bit: VRAM, tok/s, J/token, PPL@40000) ###
+/usr/local/lib/python3.10/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/usr/local/lib/python3.10/dist-packages/torch/utils/cpp_extension.py:1965: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+Traceback (most recent call last):
+  File "/workspace/trapetum/bench/pareto.py", line 349, in <module>
+    main()
+  File "/workspace/trapetum/bench/pareto.py", line 258, in main
+    tok = AutoTokenizer.from_pretrained(args.model)
+  File "/usr/local/lib/python3.10/dist-packages/transformers/models/auto/tokenization_auto.py", line 897, in from_pretrained
+    return tokenizer_class.from_pretrained(pretrained_model_name_or_path, *inputs, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/transformers/tokenization_utils_base.py", line 2271, in from_pretrained
+    return cls._from_pretrained(
+  File "/usr/local/lib/python3.10/dist-packages/transformers/tokenization_utils_base.py", line 2505, in _from_pretrained
+    tokenizer = cls(*init_inputs, **init_kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/transformers/models/llama/tokenization_llama_fast.py", line 157, in __init__
+    super().__init__(
+  File "/usr/local/lib/python3.10/dist-packages/transformers/tokenization_utils_fast.py", line 131, in __init__
+    slow_tokenizer = self.slow_tokenizer_class(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/transformers/models/llama/tokenization_llama.py", line 171, in __init__
+    self.sp_model = self.get_spm_processor(kwargs.pop("from_slow", False))
+  File "/usr/local/lib/python3.10/dist-packages/transformers/models/llama/tokenization_llama.py", line 203, in get_spm_processor
+    model_pb2 = import_protobuf(f"The new behaviour of {self.__class__.__name__} (with `self.legacy = False`)")
+  File "/usr/local/lib/python3.10/dist-packages/transformers/convert_slow_tokenizer.py", line 43, in import_protobuf
+    raise ImportError(PROTOBUF_IMPORT_ERROR.format(error_message))
+ImportError: 
+The new behaviour of LlamaTokenizer (with `self.legacy = False`) requires the protobuf library but it was not found in your environment. Checkout the instructions on the
+installation page of its repo: https://github.com/protocolbuffers/protobuf/tree/master/python#installation and follow the ones
+that match your environment. Please note that you may need to restart your runtime after installation.
+
+WARN: unsloth/mistral-7b-instruct-v0.3 failed (arch/gating?) - skipping
+### deepseek-ai/DeepSeek-R1-Distill-Qwen-7B -> Pareto (fp16 vs 4-bit: VRAM, tok/s, J/token, PPL@40000) ###
+/usr/local/lib/python3.10/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/usr/local/lib/python3.10/dist-packages/torch/utils/cpp_extension.py:1965: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+== fp16 ==
+Downloading shards:   0%|          | 0/2 [00:00<?, ?it/s]Downloading shards:  50%|█████     | 1/2 [00:23<00:23, 23.14s/it]Downloading shards: 100%|██████████| 2/2 [00:40<00:00, 19.84s/it]Downloading shards: 100%|██████████| 2/2 [00:40<00:00, 20.34s/it]
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:02<00:02,  2.01s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:03<00:00,  1.70s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:03<00:00,  1.74s/it]
+idle baseline: 55.7 W
+Token indices sequence length is longer than the specified maximum sequence length for this model (299079 > 16384). Running this sequence through the model will result in indexing errors
+We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)
+{'method': 'fp16', 'bits': 16.0, 'gb': 15.231233024, 'ppl': 25.775943550542355, 'tps': 38.49013118217852, 'jpt': 6.07764712355592, 'jpt_std': 0.3541749349217229, 'jpt_net': 4.629236367662918, 'watts': 235.1186718267007, 'idle_w': 55.74952000000001}
+== codebook-4bit (ours) ==
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:02<00:02,  2.02s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:03<00:00,  1.72s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:03<00:00,  1.77s/it]
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:01<00:01,  1.94s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:03<00:00,  1.74s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:03<00:00,  1.77s/it]
+{'method': 'codebook-4bit', 'bits': 4.05, 'gb': 5.49, 'ppl': 30.734300131272633, 'tps': 24.168450438597194, 'jpt': 4.7224044954968685, 'jpt_std': 0.450762190322728, 'jpt_net': 2.4156980667318857, 'watts': 114.21850860258756, 'idle_w': 55.74952000000001}
+== aqlm-2bit (best-effort) ==
+aqlm skipped: Using `aqlm` quantization requires AQLM: `pip install aqlm[gpu,cpu]`
+
+| method | bits | mem GB | PPL | tok/s | J/token (gross, +/-std) | J/token (net of idle) | gCO2/1k tok (FR/US) |
+|---|---|---|---|---|---|---|---|
+| fp16 | 16.00 | 15.23 | 25.78 | 38.5 | 6.08 +/- 0.35 | 4.63 | 0.084 / 0.68 |
+| codebook-4bit | 4.05 | 5.49 | 30.73 | 24.2 | 4.72 +/- 0.45 | 2.42 | 0.066 / 0.52 |
+| aqlm-2bit | 2.00 | n/a | n/a | n/a | n/a +/- n/a | n/a | n/a / n/a |
+
+NOTE J/token gross = trapezoidal integral of sampled GPU power / tokens, mean over 3 runs.
+J/token NET subtracts the idle baseline (55.7 W) so the figure is the ACTIVE decode energy.
+NOTE J/token is the measured primary axis. gCO2/1k-tok = J/token x grid intensity
+(FR ~50, US ~400 gCO2/kWh) -- a projection, not a measurement (RunPod grid mix unknown).
+Batch-1 decode; Marlin (uniform 4-bit) and batched throughput are TODO.
+### microsoft/phi-4 -> Pareto (fp16 vs 4-bit: VRAM, tok/s, J/token, PPL@40000) ###
+/usr/local/lib/python3.10/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/usr/local/lib/python3.10/dist-packages/torch/utils/cpp_extension.py:1965: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+== fp16 ==
+Downloading shards:   0%|          | 0/6 [00:00<?, ?it/s]Downloading shards:  17%|█▋        | 1/6 [00:36<03:00, 36.03s/it]Downloading shards:  33%|███▎      | 2/6 [00:54<01:43, 25.98s/it]Downloading shards:  50%|█████     | 3/6 [01:12<01:06, 22.32s/it]Downloading shards:  67%|██████▋   | 4/6 [01:29<00:40, 20.16s/it]Downloading shards:  83%|████████▎ | 5/6 [01:46<00:18, 18.81s/it]Downloading shards: 100%|██████████| 6/6 [02:02<00:00, 18.04s/it]Downloading shards: 100%|██████████| 6/6 [02:02<00:00, 20.46s/it]
+Loading checkpoint shards:   0%|          | 0/6 [00:00<?, ?it/s]Loading checkpoint shards:  17%|█▋        | 1/6 [00:01<00:05,  1.16s/it]Loading checkpoint shards:  33%|███▎      | 2/6 [00:02<00:04,  1.11s/it]Loading checkpoint shards:  50%|█████     | 3/6 [00:03<00:03,  1.06s/it]Loading checkpoint shards:  67%|██████▋   | 4/6 [00:04<00:02,  1.02s/it]Loading checkpoint shards:  83%|████████▎ | 5/6 [00:05<00:01,  1.01s/it]Loading checkpoint shards: 100%|██████████| 6/6 [00:06<00:00,  1.05s/it]Loading checkpoint shards: 100%|██████████| 6/6 [00:06<00:00,  1.06s/it]
+Traceback (most recent call last):
+  File "/workspace/trapetum/bench/pareto.py", line 349, in <module>
+    main()
+  File "/workspace/trapetum/bench/pareto.py", line 266, in main
+    m = load_fp16()
+  File "/workspace/trapetum/bench/pareto.py", line 262, in load_fp16
+    return AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16).cuda().eval()
+  File "/usr/local/lib/python3.10/dist-packages/transformers/modeling_utils.py", line 2875, in cuda
+    return super().cuda(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 916, in cuda
+    return self._apply(lambda t: t.cuda(device))
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 780, in _apply
+    module._apply(fn)
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 780, in _apply
+    module._apply(fn)
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 780, in _apply
+    module._apply(fn)
+  [Previous line repeated 2 more times]
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 805, in _apply
+    param_applied = fn(param)
+  File "/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py", line 916, in <lambda>
+    return self._apply(lambda t: t.cuda(device))
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 176.00 MiB. GPU 0 has a total capacity of 23.52 GiB of which 123.81 MiB is free. Including non-PyTorch memory, this process has 23.39 GiB memory in use. Of the allocated memory 23.00 GiB is allocated by PyTorch, and 6.32 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+WARN: microsoft/phi-4 failed (arch/gating?) - skipping
+### SWEEP DONE ###
+--- collected ---
+-rw-r--r-- 1 root root 1070 Jul  4 21:03 /workspace/sweep/Qwen_Qwen2.5-7B-Instruct.json
+-rw-r--r-- 1 root root 1067 Jul  4 21:10 /workspace/sweep/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B.json

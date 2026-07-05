@@ -1,0 +1,41 @@
+[
+  {
+    "method": "fp16",
+    "bits": 16.0,
+    "gb": 15.231233024,
+    "ppl": 7.2419626834713435,
+    "tps": 39.00528848542013,
+    "jpt": 6.043585948276632,
+    "jpt_std": 0.3919514461996602,
+    "jpt_net": 4.658919694959343,
+    "watts": 236.51911541722777,
+    "idle_w": 54.00930666666667,
+    "gco2_per_ktok_fr50": 0.08393869372606433,
+    "gco2_per_ktok_us400": 0.6715095498085146
+  },
+  {
+    "method": "codebook-4bit",
+    "bits": 4.05,
+    "gb": 5.49,
+    "ppl": 8.224809175782918,
+    "tps": 24.660162989076415,
+    "jpt": 4.640817345205597,
+    "jpt_std": 0.44646043563601373,
+    "jpt_net": 2.4506733996610808,
+    "watts": 114.71469788124318,
+    "idle_w": 54.00930666666667,
+    "gco2_per_ktok_fr50": 0.06445579646118885,
+    "gco2_per_ktok_us400": 0.5156463716895108
+  },
+  {
+    "method": "aqlm-2bit",
+    "bits": 2.0,
+    "gb": null,
+    "ppl": null,
+    "tps": null,
+    "jpt": null,
+    "note": "unavailable: Using `aqlm` quantization requires AQLM: `pip install aqlm[gpu,cpu]`",
+    "gco2_per_ktok_fr50": null,
+    "gco2_per_ktok_us400": null
+  }
+]
