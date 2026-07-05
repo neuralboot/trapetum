@@ -5,6 +5,7 @@
 set -uo pipefail
 export PATH=/usr/local/cuda/bin:$HOME/.cargo/bin:$PATH
 export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 MODEL="${MODEL:-deepseek-ai/DeepSeek-V2-Lite}"
 OUT=/workspace/ds; mkdir -p "$OUT"
@@ -21,5 +22,5 @@ echo "### build CUDA runtime + deepseek_run ###"
 ( cd runtime && cargo build --release --features cuda --bin deepseek_run )
 
 echo "### run DeepSeek in the pure-Rust runtime ###"
-runtime/target/release/deepseek_run "$OUT/model.cbk" "$OUT/prompt.bin" "$OUT/cont.bin"
+runtime/target/release/deepseek_run "$OUT/model.cbk" "$OUT/prompt.bin"
 echo "### DONE ###"

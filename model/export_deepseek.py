@@ -38,7 +38,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model, torch_dtype=torch.float16, low_cpu_mem_usage=True,
-        device_map=DEV, trust_remote_code=True)
+        trust_remote_code=True)  # stays on CPU; quantize() moves each weight to GPU one at a time
     c = model.config
     hidden = c.hidden_size
     n_heads = c.num_attention_heads
@@ -106,20 +106,12 @@ def main():
     f.close()
     print("wrote", path, os.path.getsize(path)//(1024*1024), "MB", flush=True)
 
-    # reference: HF fp16 greedy continuation (approximate target; the runtime is 4-bit so it
-    # should be coherent + high top-1 agreement, not bit-identical).
-    model = model.eval()
-    ids = tok(args.prompt, return_tensors="pt").input_ids.to(DEV)
-    am = torch.ones_like(ids)
-    out = model(ids)
-    logits = out.logits[0].detach().float().cpu().numpy().astype("<f4")
-    gen = model.generate(ids, attention_mask=am, max_new_tokens=args.gen, do_sample=False)
-    cont = gen[0, ids.shape[1]:].cpu().numpy().astype("<i4")
-    print("continuation:", repr(tok.decode(cont)), flush=True)
-    ids.cpu().numpy().astype("<i4").tofile(os.path.join(args.out, "prompt.bin"))
-    logits.tofile(os.path.join(args.out, "ref.bin"))
-    cont.tofile(os.path.join(args.out, "cont.bin"))
-    print("wrote prompt.bin ref.bin cont.bin", flush=True)
+    # save the tokenized prompt (the 16B fp16 reference forward does not fit the GPU here;
+    # the runtime output is checked for coherence by decoding + detokenizing separately).
+    ids = tok(args.prompt, return_tensors="pt").input_ids
+    ids.numpy().astype("<i4").tofile(os.path.join(args.out, "prompt.bin"))
+    print("prompt tokens:", ids.tolist(), flush=True)
+    print("wrote prompt.bin", flush=True)
 
 
 if __name__ == "__main__":
