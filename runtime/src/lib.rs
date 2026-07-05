@@ -1686,7 +1686,7 @@ pub struct MlaAttn {
     cache_ckv: DevHalf,           // [max_seq][d_c]
     cache_kr: DevHalf,            // [max_seq][d_rope]
     n_heads: usize, d_c: usize, d_rope: usize, nope: usize, v_head_dim: usize, hidden: usize,
-    eps: f32,
+    pub eps: f32,
     aq_dev: DevHalf, qr_dev: DevHalf, outl_dev: DevHalf,
     ckv_h: DevHalf, kr_h: DevHalf,
     qf: DevF32, kvf: DevF32, attn_dev: DevHalf, o_out: DevF32,
@@ -1859,4 +1859,32 @@ pub fn check_mla_block() -> f64 {
         }
     }
     worst
+}
+
+/// A full DeepSeek decoder layer: RMSNorm -> MLA attention -> residual, then a MoE block
+/// (which norms + residual-adds internally). Composes the validated MlaAttn + MoeBlock.
+/// (DeepSeek-V2/V3 use a dense MLP for the first `first_k_dense` layers; swap MoeBlock for
+/// MlpBlock there. The MoE variant can be MoeBlock or MoeBlockOffload for the memory wall.)
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct DeepSeekLayer {
+    attn_norm: DevF32,
+    pub attn: MlaAttn,
+    pub moe: MoeBlock,
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl DeepSeekLayer {
+    pub fn new(attn_norm: &[f32], attn: MlaAttn, moe: MoeBlock) -> Self {
+        Self { attn_norm: DevF32::from_host(attn_norm), attn, moe }
+    }
+    /// One decode step at position `pos`: `h += attn(norm(h)); h += MoE(norm(h))`.
+    pub fn forward(&mut self, h: &mut DevHalf, pos: usize) {
+        let mut normed = DevHalf::zeros(h.n);
+        rmsnorm(h, &self.attn_norm, &mut normed, self.attn.eps);
+        {
+            let o = self.attn.forward(&normed, pos);
+            residual_add(h, o);
+        }
+        self.moe.forward(h); // MoeBlock norms + residual-adds internally
+    }
 }
