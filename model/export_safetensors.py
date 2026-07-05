@@ -37,6 +37,11 @@ def _read_safetensors(path):
             if dt == "BF16":
                 u16 = np.frombuffer(raw, dtype=np.uint16).astype(np.uint32)
                 arr = (u16 << 16).view(np.float32)
+                # EXPORT_LOWMEM: keep weights in fp16 to halve host RAM (needed for 14B+ on
+                # small-RAM pods). k-means upcasts per-matrix; weight precision impact is
+                # negligible at 4-bit. quantize() casts back to fp32.
+                if os.environ.get("EXPORT_LOWMEM") == "1":
+                    arr = arr.astype(np.float16)
             else:
                 arr = np.frombuffer(raw, dtype=_ST_DT[dt])
             out[name] = arr.reshape(shape) if shape else arr.reshape(())

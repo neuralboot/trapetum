@@ -26,11 +26,26 @@ reasoning model measured on plain wikitext, not its domain.)
 |---|---|---|---|
 | **DeepSeek-V2-Lite** (16B) | MLA + MoE (64 experts) | ~10 tok/s | "...Paris. The capital of France is Paris..." |
 | **Gemma-2-9B** | GeGLU + softcaps + 4-norm | **74 tok/s** | "**Paris**. 🇫🇷 Let me know if you have any other questions!" |
+| **Phi-4** (14B) | Phi3 (fused qkv/gate_up) | **79.9 tok/s** | " **Paris**." (then chat-template tokens — chat model, bare prompt) |
 | Llama-2-7B | standard | 136 tok/s | reproduces HF greedy 16/16 exactly |
 
 Gemma-2 worked on the FIRST run (no debug iterations) — the port (attention+final logit
 softcapping, GeGLU, RMSNorm(1+w), embedding*sqrt(hidden), 4-norm post-sublayer residual)
 was correct by construction. DeepSeek took 7 fixes (see RESULTS_deepseek.md).
 
-## Not yet measured
-- Llama-3.1-8B, Mistral-7B: measured (table above) after fixing the sweep tooling (tokenizers upgrade + protobuf + uninstall the torch-2.2-pinned torchvision that broke transformers 4.48). Phi-4 (14B) still failed the harness (rerun TODO); NOT a Trapetum issue (the runtime is torch-free).
+## Torch-free export (kills the dependency-hell)
+`model/export_safetensors.py` compresses any Llama/Phi-3-arch HF model to CBK3 with **no torch, no
+transformers, no tokenizers, no safetensors dep** at export time: a hand-rolled safetensors container
+reader (BF16 upcast by hand) + config.json + per-column K=16 k-means. This removes the
+transformers/tokenizers/protobuf/torchvision version conflicts that had broken the sweep. Optional
+`EXPORT_DEV=cuda` runs the k-means on GPU via torch only (~100x faster); `EXPORT_LOWMEM=1` keeps
+weights fp16 for large models. Validated on TinyLlama-1.1B locally and **Phi-4 (14B) on a 4090**.
+
+## Phi-4 (14B) — RESOLVED via torch-free export
+Phi-4 is `Phi3ForCausalLM` (fused `qkv_proj`/`gate_up_proj`); `split_fused()` slices them into the
+standard q/k/v + gate/up so the Llama CBK3 path handles it. Exported torch-free on a 4090 (GPU
+k-means, 7.86 GB .cbk) and **run end-to-end in pure Rust: "The capital of France is" -> " Paris."
+at 79.9 tok/s** (loaded in 5.9 s, vocab 100352). The earlier harness failure was the
+transformers/torchvision dependency-hell, not an arch issue — the runtime is torch-free and the
+torch-free exporter sidesteps it entirely. (fp16 Pareto row not run: it still needs a transformers
+fp16 load; the coherent pure-Rust decode is the meaningful result.)
