@@ -1336,6 +1336,7 @@ pub struct MoeBlock {
     experts: Vec<Expert>,
     shared: Option<Expert>,
     top_k: usize,
+    rscale: f32,
     hidden: usize,
     inter: usize,
     shared_inter: usize,
@@ -1360,7 +1361,7 @@ impl MoeBlock {
                norm_w: &[f32], router_w: &[f32],
                experts: Vec<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
                shared: Option<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
-               shared_inter: usize) -> Self {
+               shared_inter: usize, rscale: f32) -> Self {
         assert_eq!(experts.len(), n_experts);
         let mk = |e: &(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32]), inter: usize| Expert {
             gate: QuantLinear::new(e.0, e.1, hidden, inter),
@@ -1372,7 +1373,7 @@ impl MoeBlock {
             router: DenseLinear::new(router_w, hidden, n_experts),
             experts: experts.iter().map(|e| mk(e, inter)).collect(),
             shared: shared.as_ref().map(|e| mk(e, shared_inter)),  // DeepSeek shared expert is bigger (n_shared*moe_inter)
-            top_k, hidden, inter, shared_inter, n_experts, eps,
+            top_k, rscale, hidden, inter, shared_inter, n_experts, eps,
             norm: DevHalf::zeros(hidden),
             rlogits: DevF32::zeros(n_experts),
             g: DevF32::zeros(inter), u: DevF32::zeros(inter),
@@ -1424,7 +1425,7 @@ impl MoeBlock {
         let topk = &idx[..self.top_k];
         let wsum: f32 = topk.iter().map(|&e| probs[e]).sum();
         let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
-        let picks: Vec<(usize, f32)> = topk.iter().map(|&e| (e, probs[e] / wsum)).collect();
+        let picks: Vec<(usize, f32)> = topk.iter().map(|&e| (e, self.rscale * probs[e] / wsum)).collect();
         for (e, w) in picks { self.ffn(e, &mut acc, w); }
         if self.shared.is_some() { self.run_shared(&mut acc); }
         residual_add(h, &acc);
@@ -1450,7 +1451,7 @@ impl MoeBlock {
         let wsum: f32 = idx[..self.top_k].iter().map(|&e| probs[e]).sum();
         let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
         for e in 0..self.n_experts {
-            let w = if topk.contains(&e) { probs[e] / wsum } else { 0.0 };
+            let w = if topk.contains(&e) { self.rscale * probs[e] / wsum } else { 0.0 };
             if w > 0.0 { self.ffn(e, &mut acc, w); }
         }
         if self.shared.is_some() { self.run_shared(&mut acc); }
@@ -1484,7 +1485,7 @@ pub fn check_moe() -> f64 {
               packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
               packed(inter*(hidden/2),&mut r), cbk(K*hidden,&mut r));
     let shared = Some((sh.0.as_slice(),sh.1.as_slice(),sh.2.as_slice(),sh.3.as_slice(),sh.4.as_slice(),sh.5.as_slice()));
-    let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, &rw, experts, shared, inter);
+    let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, &rw, experts, shared, inter, 1.0);
     let h0: Vec<f32> = (0..hidden).map(|_| r()*0.3).collect();
     let mut ha = DevHalf::from_host(&h0); moe.forward(&mut ha); let a = ha.to_host();
     let mut hb = DevHalf::from_host(&h0); moe.forward_dense_ref(&mut hb); let b = hb.to_host();
@@ -1640,7 +1641,7 @@ pub fn check_moe_offload() -> (f64, usize, usize, usize) {
     let (nw, rw, hosts_r, sh_r) = gen_moe(hidden, inter, n_experts, seed);
     let exps_ref: Vec<_> = hosts_r.iter().map(|e| (e.gp.as_slice(),e.gc.as_slice(),e.up.as_slice(),e.uc.as_slice(),e.dp.as_slice(),e.dc.as_slice())).collect();
     let shref = (sh_r.gp.as_slice(),sh_r.gc.as_slice(),sh_r.up.as_slice(),sh_r.uc.as_slice(),sh_r.dp.as_slice(),sh_r.dc.as_slice());
-    let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, &rw, exps_ref, Some(shref), inter);
+    let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, &rw, exps_ref, Some(shref), inter, 1.0);
     // offloaded (identical weights via same seed)
     let (nw2, rw2, hosts_o, sh_o) = gen_moe(hidden, inter, n_experts, seed);
     let sho = (sh_o.gp.as_slice(),sh_o.gc.as_slice(),sh_o.up.as_slice(),sh_o.uc.as_slice(),sh_o.dp.as_slice(),sh_o.dc.as_slice());
@@ -1706,7 +1707,7 @@ pub struct MlaAttn {
     cache_ckv: DevHalf,           // [max_seq][d_c]
     cache_kr: DevHalf,            // [max_seq][d_rope]
     n_heads: usize, d_c: usize, d_rope: usize, nope: usize, v_head_dim: usize, hidden: usize,
-    pub eps: f32,
+    pub eps: f32, softmax_scale: f32,
     aq_dev: DevHalf, qr_dev: DevHalf, outl_dev: DevHalf,
     ckv_h: DevHalf, kr_h: DevHalf,
     qf: DevF32, kvf: DevF32, attn_dev: DevHalf, o_out: DevF32,
@@ -1717,7 +1718,7 @@ pub struct MlaAttn {
 impl MlaAttn {
     #[allow(clippy::too_many_arguments)]
     pub fn new(hidden: usize, n_heads: usize, d_c: usize, d_rope: usize, nope: usize, v_head_dim: usize,
-               max_seq: usize, eps: f32, q_w: &[f32], kv_a_w: &[f32], kv_a_norm: &[f32], kv_b: &[f32],
+               max_seq: usize, eps: f32, softmax_scale: f32, q_w: &[f32], kv_a_w: &[f32], kv_a_norm: &[f32], kv_b: &[f32],
                o_w: &[f32], inv_freq: &[f32]) -> Self {
         let qdim = n_heads*(nope+d_rope);
         Self {
@@ -1726,7 +1727,7 @@ impl MlaAttn {
             o_proj: DenseLinear::new(o_w, n_heads*v_head_dim, hidden),
             kv_a_norm: kv_a_norm.to_vec(), kv_b: kv_b.to_vec(), inv_freq: inv_freq.to_vec(),
             cache_ckv: DevHalf::zeros(max_seq*d_c), cache_kr: DevHalf::zeros(max_seq*d_rope),
-            n_heads, d_c, d_rope, nope, v_head_dim, hidden, eps,
+            n_heads, d_c, d_rope, nope, v_head_dim, hidden, eps, softmax_scale,
             aq_dev: DevHalf::zeros(n_heads*d_c), qr_dev: DevHalf::zeros(n_heads*d_rope),
             outl_dev: DevHalf::zeros(n_heads*d_c),
             ckv_h: DevHalf::zeros(d_c), kr_h: DevHalf::zeros(d_rope),
@@ -1785,8 +1786,8 @@ impl MlaAttn {
             op_cache_append(self.cache_ckv.ptr, self.ckv_h.ptr, pos as i32, dc as i32);
             op_cache_append(self.cache_kr.ptr, self.kr_h.ptr, pos as i32, dr as i32);
         }
-        // MLA attention on device
-        let scale = 1.0/((nope+dr) as f32).sqrt();
+        // MLA attention on device (DeepSeek softmax_scale = qk_head_dim^-0.5 * mscale^2)
+        let scale = self.softmax_scale;
         mla_attention(&self.aq_dev, &self.qr_dev, &self.cache_ckv, &self.cache_kr, &mut self.outl_dev, nh, dc, dr, pos+1, scale);
         let outl = self.outl_dev.to_host();
         // per-head value: attn[h][v] = sum_j outl[h][j] * W_UV[h][v][j] ; W_UV[h] rows = kv_b[h*(nope+vhd)+nope+v]
@@ -1822,7 +1823,8 @@ pub fn check_mla_block() -> f64 {
     let kv_b: Vec<f32> = (0..nh*(nope+vhd)*dc).map(|_| r()).collect();
     let o_w: Vec<f32> = (0..hidden*(nh*vhd)).map(|_| r()).collect();
     let inv_freq: Vec<f32> = (0..dr/2).map(|d| 10000f32.powf(-2.0*d as f32/dr as f32)).collect();
-    let mut mla = MlaAttn::new(hidden, nh, dc, dr, nope, vhd, max_seq, eps, &q_w, &kv_a_w, &kv_a_norm, &kv_b, &o_w, &inv_freq);
+    let sms = 1.0f32/((nope+dr) as f32).sqrt();
+    let mut mla = MlaAttn::new(hidden, nh, dc, dr, nope, vhd, max_seq, eps, sms, &q_w, &kv_a_w, &kv_a_norm, &kv_b, &o_w, &inv_freq);
     // host reference state: cache of (ckv, krope) per position
     let mut cache_ckv: Vec<Vec<f32>> = Vec::new();
     let mut cache_kr: Vec<Vec<f32>> = Vec::new();
@@ -1965,7 +1967,7 @@ impl DeepSeekModel {
         let (n_layers, hidden, n_heads, kv_lora, nope, rope, vhd, inter_dense, moe_inter,
              n_routed, n_shared, top_k, vocab, first_k_dense) =
             (cfg[0],cfg[1],cfg[2],cfg[3],cfg[4],cfg[5],cfg[6],cfg[7],cfg[8],cfg[9],cfg[10],cfg[11],cfg[12],cfg[13]);
-        let eps = rd_f32(&mut r); let _rope_theta = rd_f32(&mut r); let _rscale = rd_f32(&mut r);
+        let eps = rd_f32(&mut r); let softmax_scale = rd_f32(&mut r); let rscale = rd_f32(&mut r);
         let inv_freq = rd_f32_vec(&mut r, rope/2);
         let embedding = rd_f16_vec(&mut r, vocab*hidden);
         let qdim = n_heads*(nope+rope);
@@ -1978,7 +1980,7 @@ impl DeepSeekModel {
             let kv_b = rd_f16_vec(&mut r, n_heads*(nope+vhd)*kv_lora);
             let o_w = rd_f16_vec(&mut r, hidden*(n_heads*vhd));
             let post_norm = rd_f32_vec(&mut r, hidden);
-            let attn = MlaAttn::new(hidden, n_heads, kv_lora, rope, nope, vhd, max_seq, eps,
+            let attn = MlaAttn::new(hidden, n_heads, kv_lora, rope, nope, vhd, max_seq, eps, softmax_scale,
                 &q_w, &kv_a_w, &kv_a_norm, &kv_b, &o_w, &inv_freq);
             let ffn = if li < first_k_dense {
                 let (gp,gc) = (rd_u8_vec(&mut r, hidden*(inter_dense/2)), rd_f32_vec(&mut r, K*inter_dense));
@@ -2000,7 +2002,7 @@ impl DeepSeekModel {
                           rd_u8_vec(&mut r, si*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
                 let experts: Vec<_> = estore.iter().map(|e| (e.0.as_slice(),e.1.as_slice(),e.2.as_slice(),e.3.as_slice(),e.4.as_slice(),e.5.as_slice())).collect();
                 let shared = Some((sh.0.as_slice(),sh.1.as_slice(),sh.2.as_slice(),sh.3.as_slice(),sh.4.as_slice(),sh.5.as_slice()));
-                DsFfn::Moe(MoeBlock::new(hidden, moe_inter, n_routed, top_k, eps, &post_norm, &rw, experts, shared, si))
+                DsFfn::Moe(MoeBlock::new(hidden, moe_inter, n_routed, top_k, eps, &post_norm, &rw, experts, shared, si, rscale))
             };
             layers.push(DsLayer { attn_norm: DevF32::from_host(&attn_norm), attn, ffn });
             eprintln!("  loaded layer {}/{}", li+1, n_layers);
