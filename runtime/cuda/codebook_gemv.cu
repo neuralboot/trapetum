@@ -150,7 +150,62 @@ __global__ void attn_k(const __half* __restrict__ q, const __half* __restrict__ 
 #define MMAX 4
 
 // Batched fused 4-bit decode GEMM: X[M][IC] -> Y[M][OC]. One packed-weight read
-// per (ic) serves all M columns; that is what keeps the verify bandwidth-bound.
+// per (ic) serves all M rows; that is what keeps the verify bandwidth-bound.
+// M is a TEMPLATE parameter: with runtime M the acc[][] indexing defeated unrolling
+// and spilled the accumulators to local memory, costing 5.5x (M=2) to 10.7x (M=4)
+// the M=1 GEMV per call (measured on a 4090). Compile-time M keeps everything in
+// registers; the verify then costs about the same weight read as one M=1 forward.
+template<int M>
+__global__ void __launch_bounds__(32*TY)
+gemm_mtile_t(const __half* __restrict__ X, const unsigned char* __restrict__ packed,
+             const __half* __restrict__ cb, float* __restrict__ Yacc, int IC, int OC) {
+    extern __shared__ char sm[];
+    __half* s_cb = (__half*)sm;
+    float* red = (float*)(s_cb + K*CPB);          // M*TY*CPB floats
+    int tx = threadIdx.x, ty = threadIdx.y, tid = ty*32+tx, nth = 32*TY;
+    int j0 = blockIdx.x*CPB;
+    for (int t = tid; t < K*CPB/2; t += nth) {
+        int idx = t*2, k = idx/CPB, jj = j0 + (idx%CPB);
+        *reinterpret_cast<__half2*>(&s_cb[idx]) = *reinterpret_cast<const __half2*>(&cb[(size_t)k*OC+jj]);
+    }
+    __syncthreads();
+    int per = (IC+gridDim.y-1)/gridDim.y, ic0 = blockIdx.y*per, ic1 = min(IC, ic0+per);
+    size_t OCp = OC/2;
+    float acc[M][8];
+    #pragma unroll
+    for (int m = 0; m < M; m++)
+        #pragma unroll
+        for (int c = 0; c < 8; c++) acc[m][c] = 0.f;
+    for (int ic = ic0+ty; ic < ic1; ic += TY) {
+        unsigned f = __ldg((const unsigned*)&packed[(size_t)ic*OCp + (j0 + tx*8)/2]);
+        float xx[M];
+        #pragma unroll
+        for (int m = 0; m < M; m++) xx[m] = __half2float(__ldg(&X[(size_t)m*IC + ic]));
+        #pragma unroll
+        for (int c = 0; c < 8; c++) {
+            unsigned char id = (f>>(4*c))&0xF;
+            float w = __half2float(s_cb[id*CPB+tx*8+c]);
+            #pragma unroll
+            for (int m = 0; m < M; m++) acc[m][c] += xx[m]*w;
+        }
+    }
+    #pragma unroll
+    for (int m = 0; m < M; m++)
+        #pragma unroll
+        for (int c = 0; c < 8; c++) red[((size_t)m*TY+ty)*CPB + tx*8+c] = acc[m][c];
+    __syncthreads();
+    if (ty == 0) {
+        #pragma unroll
+        for (int m = 0; m < M; m++)
+            #pragma unroll
+            for (int c = 0; c < 8; c++) {
+                float s = 0; for (int y = 0; y < TY; y++) s += red[((size_t)m*TY+y)*CPB + tx*8+c];
+                atomicAdd(&Yacc[(size_t)m*OC + j0+tx*8+c], s);
+            }
+    }
+}
+
+// Runtime-M fallback (kept for M values without a template instantiation).
 __global__ void __launch_bounds__(32*TY)
 gemm_mtile(const __half* __restrict__ X, const unsigned char* __restrict__ packed,
            const __half* __restrict__ cb, float* __restrict__ Yacc, int IC, int OC, int M) {
@@ -438,7 +493,15 @@ void qlinear_forward_m(void* handle, const void* d_x, void* d_y, int M) {
     cudaMemsetAsync(d_y, 0, (size_t)M*q->OC*sizeof(float), g_stream);
     size_t smem = (size_t)K*CPB*sizeof(__half) + (size_t)M*TY*CPB*sizeof(float);
     dim3 grid(q->OC/CPB, GS), block(32, TY);
-    gemm_mtile<<<grid, block, smem, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, (float*)d_y, q->IC, q->OC, M);
+    const __half* X = (const __half*)d_x; float* Y = (float*)d_y;
+    // compile-time-M kernels keep the accumulators in registers (see gemm_mtile_t)
+    switch (M) {
+        case 1: gemm_mtile_t<1><<<grid, block, smem, g_stream>>>(X, q->d_packed, q->d_cb, Y, q->IC, q->OC); break;
+        case 2: gemm_mtile_t<2><<<grid, block, smem, g_stream>>>(X, q->d_packed, q->d_cb, Y, q->IC, q->OC); break;
+        case 3: gemm_mtile_t<3><<<grid, block, smem, g_stream>>>(X, q->d_packed, q->d_cb, Y, q->IC, q->OC); break;
+        case 4: gemm_mtile_t<4><<<grid, block, smem, g_stream>>>(X, q->d_packed, q->d_cb, Y, q->IC, q->OC); break;
+        default: gemm_mtile<<<grid, block, smem, g_stream>>>(X, q->d_packed, q->d_cb, Y, q->IC, q->OC, M); break;
+    }
 }
 void op_rmsnorm_m(const void* x_half, const void* w_f32, void* out_half, int n, float eps, int M) {
     ensure_stream();
