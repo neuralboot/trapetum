@@ -1738,12 +1738,14 @@ impl MlaAttn {
     }
 
     fn rope(&self, v: &mut [f32], pos: usize) {
-        let half = self.d_rope/2;
-        for d in 0..half {
+        // DeepSeek-V2 uses INTERLEAVED RoPE (adjacent pairs 2i,2i+1), not Llama split-half:
+        // apply_rotary_pos_emb reshapes view(d/2,2).transpose before rotate_half, equivalent
+        // to rotating adjacent pairs (q.k is permutation-invariant, so rotate in place).
+        for d in 0..self.d_rope/2 {
             let ang = pos as f32 * self.inv_freq[d];
             let (c, s) = (ang.cos(), ang.sin());
-            let (x0, x1) = (v[d], v[d+half]);
-            v[d] = x0*c - x1*s; v[d+half] = x1*c + x0*s;
+            let (x0, x1) = (v[2*d], v[2*d+1]);
+            v[2*d] = x0*c - x1*s; v[2*d+1] = x1*c + x0*s;
         }
     }
 
@@ -1828,10 +1830,9 @@ pub fn check_mla_block() -> f64 {
     // host reference state: cache of (ckv, krope) per position
     let mut cache_ckv: Vec<Vec<f32>> = Vec::new();
     let mut cache_kr: Vec<Vec<f32>> = Vec::new();
-    let rope = |v: &mut [f32], pos: usize| {
-        let half = dr/2;
-        for d in 0..half { let a = pos as f32*inv_freq[d]; let (c,s)=(a.cos(),a.sin());
-            let (x0,x1)=(v[d],v[d+half]); v[d]=x0*c-x1*s; v[d+half]=x1*c+x0*s; }
+    let rope = |v: &mut [f32], pos: usize| {  // interleaved (DeepSeek), matches MlaAttn::rope
+        for d in 0..dr/2 { let a = pos as f32*inv_freq[d]; let (c,s)=(a.cos(),a.sin());
+            let (x0,x1)=(v[2*d],v[2*d+1]); v[2*d]=x0*c-x1*s; v[2*d+1]=x1*c+x0*s; }
     };
     let mv = |w: &[f32], x: &[f32], ic: usize, oc: usize| -> Vec<f32> {  // y[oc] = W[oc][ic] x
         (0..oc).map(|o| (0..ic).map(|i| w[o*ic+i]*x[i]).sum()).collect()
