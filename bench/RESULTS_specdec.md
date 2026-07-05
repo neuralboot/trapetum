@@ -30,34 +30,39 @@ Key finding: the **smaller 160M drafter wins** — lower acceptance (0.648 vs 0.
 cheaper per draft that the net speedup is higher (1.50x vs 1.25x). **K=2 is optimal for both**
 (verify 3 tokens per target forward). All lossless: the output is identical to plain greedy.
 
-## Wall-clock, two-model (MEASURED July 2026) — NEGATIVE result, and why
-The real two-model harness (`Model::spec_decode_two_model` + `wallclock_spec` bin: the drafter
-is a second Model decoding incrementally in its own KV cache, longest-common-prefix row reuse)
-was measured end-to-end on a 4090, 128 tokens, K=1..3:
+## Wall-clock, two-model (MEASURED July 2026): negative -> diagnosed -> FIXED -> WIN
+The real two-model harness (`Model::spec_decode_two_model` + `wallclock_spec`: the drafter is
+a second Model decoding incrementally in its own KV cache, LCP row reuse) went through the
+full arc on a 4090 (128 tokens, K=1..3, lossless verified at every step):
 
-| pair (target + drafter) | plain tok/s | spec K=1 | K=2 | K=3 | accept K=1 | lossless |
+**Round 1 (naive): spec-dec LOSES ~3x** (0.34x at 0.91 acceptance) — same integration law as
+the kernel story. Profiling (`profile_spec` bin) found the root cause: `gemm_mtile` took M at
+RUNTIME, which defeated unrolling and spilled the `acc[M][8]` accumulators to local memory —
+the M<=4 verify cost 5.5x (M=2) to 10.7x (M=4) of one M=1 GEMV. (Two earlier hypotheses —
+the forward_m allocation storm, real but CUDA-neutral, and drafter overhead, actually fine at
+1.14 ms — were fixed/ruled out on the way.)
+
+**Fix: template the kernel on M** (`gemm_mtile_t<M>`, launch-dispatched). Per-call verify:
+M=2 39.7 -> 8.2 ms (**1.11x of M=1**), M=3 59.7 -> 9.6 ms, M=4 77.4 -> 12.8 ms.
+
+**Round 2 (fixed kernel), measured wall-clock:**
+
+| pair (target + drafter) | vocab | plain tok/s | K=1 | K=2 | K=3 | best |
 |---|---|---|---|---|---|---|
-| Llama-2-7B + llama-160m | 123.8 | 0.34x | 0.31x | 0.30x | 0.910 | YES |
-| Llama-3.1-8B + Llama-3.2-1B | 117.9 | 0.26x | 0.24x | 0.22x | 0.684 | YES |
-| Qwen2.5-7B + Qwen2.5-1.5B | 112.3 | n/a | n/a | n/a | — | — |
+| **Llama-2-7B + llama-160m** | 32k | 124.6 | 1.19x | **1.32x** | 1.24x | **K=2 WIN, 164 tok/s** |
+| Qwen2.5-7B + Qwen2.5-1.5B | 152k | 118.2 | 0.82x | 0.92x | 0.92x | near-parity |
+| Llama-3.1-8B + Llama-3.2-1B | 128k | 117.9 | 0.85x | 0.90x | 0.80x | near-parity |
 
-**The projected 1.50x does NOT survive wall-clock today: naive spec-dec LOSES ~3x**, even at
-0.91 acceptance and with losslessness verified at every K. The forward-count mechanics are
-exactly right (67 target forwards for 128 tokens at K=1); the time goes elsewhere:
-1. the batched verify (M=K+1) runs on `gemm_mtile`, which was validated for correctness but
-   never optimized — it is several times slower per call than the fused M=1 GEMV that gives
-   the 123.8 tok/s baseline;
-2. the drafter's per-forward fixed overhead (kernel launches + full-logits readback + host
-   argmax per token) dwarfs its bandwidth cost: a 160m draft forward should cost ~0.1 ms of
-   bandwidth and costs ~15 ms of overhead.
-This is the paper's own integration law repeating: microbenchmark wins vanish without
-graph-level integration. The fix path is known — optimize/fuse the M<=4 codebook GEMM and
-capture the whole speculative step as a single graph — and until it lands, the honest claim
-is: spec-dec is **lossless and mechanically validated; the projected S(K) is the ceiling,
-not the current wall-clock**. Qwen pair: the batched forward_m path does not support
-attention (qkv) bias yet — explicit panic, spec rows n/a; the plain pure-Rust decode numbers
-measured on the way (Qwen2.5-7B 112.3 tok/s, Llama-3.1-8B 117.9 tok/s) update the coverage
-table. Raw log: `bench/runpod_logs/wallclock_4090.log`.
+**Spec-dec now WINS in wall-clock where the projection said it should** (1.32x measured vs
+1.50x projected ceiling on the Llama-2 pair). The two large-vocab pairs sit at parity for two
+measured reasons: (a) every drafter forward reads back the FULL logits (152k x 4B = 608 KB)
+and does a host argmax — at 130+ drafter forwards this dominates; (b) their smallest
+same-tokenizer drafters are 10x bigger than llama-160m (1.5B/1B; Qwen2.5-0.5B is blocked by
+the kernel's %256 shape rule). Next lever: device-side argmax + returning only the argmax id
+(kills the readback), then graph capture. Qwen bias note: the batched path now supports qkv
+bias (repeated-bias vadd) — validated lossless at 0.99+ acceptance. Raw logs:
+`bench/runpod_logs/wallclock_4090.log` (round 1), `wallclock_fixed_4090.log` +
+`profile_mtile_4090.log` (round 2).
 
 ## Decode Pareto (batch-1, gen=128) — quantization vs baselines + energy
 | method | bits | memory (GB) | tok/s (HF loop) | energy net (J/tok) | watts |

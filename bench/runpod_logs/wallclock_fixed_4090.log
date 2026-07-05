@@ -1,0 +1,23 @@
+======= PAIR qwen25: Qwen/Qwen2.5-7B-Instruct + Qwen/Qwen2.5-1.5B-Instruct ======
+Fetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]Fetching 10 files: 100%|██████████| 10/10 [00:00<00:00, 44763.12it/s]
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Fetching 6 files: 100%|██████████| 6/6 [00:00<00:00, 29782.04it/s]
+wrote /root/m_qwen25_t/model.cbk 4506 MB
+wrote /root/m_qwen25_d/model.cbk 1230 MB
+loaded target+drafter in 8.5s  (vocab 152064 / 152064)
+plain greedy :   118.2 tok/s  (128 tokens in 1.08s)
+spec  K=1   :    97.0 tok/s  speedup 0.82x  target_fwds 64  drafter_fwds 133  eff_accept 1.000  lossless YES
+spec  K=2   :   108.4 tok/s  speedup 0.92x  target_fwds 43  drafter_fwds 134  eff_accept 0.988  lossless YES
+spec  K=3   :   109.1 tok/s  speedup 0.92x  target_fwds 32  drafter_fwds 133  eff_accept 1.000  lossless YES
+continuation ids: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+======= PAIR llama3: unsloth/Meta-Llama-3.1-8B-Instruct + unsloth/Llama-3.2-1B-Instruct ======
+Fetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]Fetching 10 files: 100%|██████████| 10/10 [00:00<00:00, 3787.52it/s]
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Fetching 6 files: 100%|██████████| 6/6 [00:00<00:00, 6213.78it/s]
+wrote /root/m_llama3_t/model.cbk 4673 MB
+wrote /root/m_llama3_d/model.cbk 1121 MB
+loaded target+drafter in 7.5s  (vocab 128256 / 128256)
+plain greedy :   117.9 tok/s  (128 tokens in 1.09s)
+spec  K=1   :    99.7 tok/s  speedup 0.85x  target_fwds 76  drafter_fwds 158  eff_accept 0.684  lossless YES
+spec  K=2   :   106.1 tok/s  speedup 0.90x  target_fwds 57  drafter_fwds 177  eff_accept 0.623  lossless YES
+spec  K=3   :    94.0 tok/s  speedup 0.80x  target_fwds 48  drafter_fwds 198  eff_accept 0.556  lossless YES
+continuation ids: [264, 3363, 430, 3966, 912, 17219, 13, 12366, 11, 279, 4409, 315, 8828, 11, 374, 11495, 369, 1202, 20441, 18112, 11, 1917, 15144, 51677]
+===== WC2 ALLDONE =====
