@@ -13,6 +13,10 @@ Runtime tok/s (fused, no Python) is separate and faster than the HF loop.
 | DeepSeek-R1-Distill-Qwen-7B 4-bit | **5.49** | 24.2 | 30.73 | **2.42** |
 | Llama-2-7B fp16 (baseline) | 13.48 | 37.4 | — | 3.87 |
 | Llama-2-7B 4-bit | **3.81** | 23.4 | — | **2.13** |
+| Llama-3.1-8B fp16 | 16.06 | 33.2 | 7.35 | 4.96 |
+| Llama-3.1-8B 4-bit | **5.64** | 21.1 | 8.45 | **2.38** |
+| Mistral-7B fp16 | 14.50 | 36.7 | 5.77 | 4.68 |
+| Mistral-7B 4-bit | **4.07** | 21.2 | 6.19 | **2.22** |
 
 Consistent: ~2.8x less VRAM, ~47% less energy/token. (R1-Distill PPL is high because it is a
 reasoning model measured on plain wikitext, not its domain.)
@@ -29,7 +33,4 @@ softcapping, GeGLU, RMSNorm(1+w), embedding*sqrt(hidden), 4-norm post-sublayer r
 was correct by construction. DeepSeek took 7 fixes (see RESULTS_deepseek.md).
 
 ## Not yet measured
-- Llama-3.1-8B, Mistral-7B, Phi-4: the sweep hit a `tokenizers` version bug on their newer
-  tokenizer.json (`data did not match any variant of ModelWrapper`) with transformers 4.44.2.
-  NOT an architecture issue (they are standard attention; Qwen proves the path). Fix: upgrade
-  tokenizers and rerun.
+- Llama-3.1-8B, Mistral-7B: measured (table above) after fixing the sweep tooling (tokenizers upgrade + protobuf + uninstall the torch-2.2-pinned torchvision that broke transformers 4.48). Phi-4 (14B) still failed the harness (rerun TODO); NOT a Trapetum issue (the runtime is torch-free).
