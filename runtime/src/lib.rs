@@ -270,6 +270,21 @@ pub fn attention_m(q: &DevHalf, ck: &DevHalf, cv: &DevHalf, out: &mut DevHalf,
     unsafe { op_attn_m(q.ptr, ck.ptr, cv.ptr, out.ptr, n_heads as i32, n_kv as i32, head_dim as i32, base as i32, m as i32) };
 }
 
+/// Cached batched-decode scratch (allocated once per M value, then reused). The naive
+/// forward_m allocated ~10 device buffers per layer per call — hundreds of device mallocs
+/// per verify step, each an implicit sync. The M=1 path never does this; neither should M<=4.
+struct MScratchMlp { m: usize, norm: DevHalf, g: DevF32, u: DevF32, act: DevHalf, mlp: DevF32 }
+
+struct MScratchAttn {
+    m: usize,
+    norm: DevHalf,
+    qb: DevF32, kb: DevF32, vb: DevF32,
+    qh: DevHalf, kh: DevHalf, vh: DevHalf,
+    attn_out: DevHalf, ob: DevF32,
+    // qkv bias repeated m times (Qwen-style attention bias on the batched path)
+    qbias_r: Option<DevF32>, kbias_r: Option<DevF32>, vbias_r: Option<DevF32>,
+}
+
 /// A Llama-style gated MLP block: RMSNorm, then `down(SiLU(gate(h)) * up(h))`, plus a
 /// residual. The three projections use the codebook decode kernel; norm, activation and
 /// residual are on-device too, so the whole forward can be captured as one CUDA graph.
@@ -284,6 +299,7 @@ pub struct MlpBlock {
     act: DevHalf,
     mlp: DevF32,
     eps: f32,
+    m_scratch: Option<MScratchMlp>,
 }
 
 impl MlpBlock {
@@ -311,6 +327,7 @@ impl MlpBlock {
             act: DevHalf::zeros(inter),
             mlp: DevF32::zeros(hidden),
             eps,
+            m_scratch: None,
         }
     }
 
@@ -388,6 +405,11 @@ pub struct AttnBlock {
     qbias: Option<DevF32>,
     kbias: Option<DevF32>,
     vbias: Option<DevF32>,
+    // host copies kept to build the repeated (m-row) bias for the batched path
+    qbias_h: Option<Vec<f32>>,
+    kbias_h: Option<Vec<f32>>,
+    vbias_h: Option<Vec<f32>>,
+    m_scratch: Option<MScratchAttn>,
 }
 
 impl AttnBlock {
@@ -434,6 +456,10 @@ impl AttnBlock {
             qbias: biases.map(|b| DevF32::from_host(b.0)),
             kbias: biases.map(|b| DevF32::from_host(b.1)),
             vbias: biases.map(|b| DevF32::from_host(b.2)),
+            qbias_h: biases.map(|b| b.0.to_vec()),
+            kbias_h: biases.map(|b| b.1.to_vec()),
+            vbias_h: biases.map(|b| b.2.to_vec()),
+            m_scratch: None,
         }
     }
 
@@ -483,24 +509,31 @@ impl Layer {
 
 // ---- batched (M-token) forward for the transformer blocks -------------------
 // Verifies K+1 speculative tokens in a single forward. Scratch is allocated per
-// call (a test-grade path; production would preallocate). No attention bias yet.
+// call. Scratch is now allocated ONCE per M value and reused (the naive version paid
+// hundreds of device mallocs per verify step). Attention (qkv) bias supported.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl MlpBlock {
     /// `h` is `m*hidden`, updated in place: `h = h + MLP(RMSNorm(h))` for all M rows.
     pub fn forward_m(&mut self, h: &mut DevHalf, m: usize) {
         let hidden = self.norm_w.len();
         let inter = self.g.n;
-        let mut norm = DevHalf::zeros(m * hidden);
-        let mut g = DevF32::zeros(m * inter);
-        let mut u = DevF32::zeros(m * inter);
-        let mut act = DevHalf::zeros(m * inter);
-        let mut mlp = DevF32::zeros(m * hidden);
-        rmsnorm_m(h, &self.norm_w, &mut norm, self.eps, hidden, m);
-        self.gate.forward_m(&norm, &mut g, m);
-        self.up.forward_m(&norm, &mut u, m);
-        silu_mul(&g, &u, &mut act);
-        self.down.forward_m(&act, &mut mlp, m);
-        residual_add(h, &mlp);
+        if self.m_scratch.as_ref().map(|s| s.m) != Some(m) {
+            self.m_scratch = Some(MScratchMlp {
+                m,
+                norm: DevHalf::zeros(m * hidden),
+                g: DevF32::zeros(m * inter),
+                u: DevF32::zeros(m * inter),
+                act: DevHalf::zeros(m * inter),
+                mlp: DevF32::zeros(m * hidden),
+            });
+        }
+        let s = self.m_scratch.as_mut().unwrap();
+        rmsnorm_m(h, &self.norm_w, &mut s.norm, self.eps, hidden, m);
+        self.gate.forward_m(&s.norm, &mut s.g, m);
+        self.up.forward_m(&s.norm, &mut s.u, m);
+        silu_mul(&s.g, &s.u, &mut s.act);
+        self.down.forward_m(&s.act, &mut s.mlp, m);
+        residual_add(h, &s.mlp);
     }
 }
 
@@ -509,34 +542,49 @@ impl AttnBlock {
     /// Batched decode step: `h` is `m*hidden`, the M new tokens sit at positions
     /// `base..base+m`. Each query attends causally over `base+row+1` keys.
     pub fn forward_m(&mut self, h: &mut DevHalf, base: usize, m: usize) {
-        assert!(self.qbias.is_none(), "batched forward_m does not support attention bias yet");
         let hidden = self.norm_w.len();
         let qdim = self.n_heads * self.head_dim;
         let kvdim = self.n_kv * self.head_dim;
-        let mut norm = DevHalf::zeros(m * hidden);
-        let mut qb = DevF32::zeros(m * qdim);
-        let mut kb = DevF32::zeros(m * kvdim);
-        let mut vb = DevF32::zeros(m * kvdim);
-        let mut qh = DevHalf::zeros(m * qdim);
-        let mut kh = DevHalf::zeros(m * kvdim);
-        let mut vh = DevHalf::zeros(m * kvdim);
-        let mut attn_out = DevHalf::zeros(m * qdim);
-        let mut ob = DevF32::zeros(m * hidden);
-        rmsnorm_m(h, &self.norm_w, &mut norm, self.eps, hidden, m);
-        self.q.forward_m(&norm, &mut qb, m);
-        self.k.forward_m(&norm, &mut kb, m);
-        self.v.forward_m(&norm, &mut vb, m);
-        qh.copy_cast_from(&qb);
-        kh.copy_cast_from(&kb);
-        vh.copy_cast_from(&vb);
-        rope_m(&mut qh, base, self.n_heads, self.head_dim, &self.inv_freq, m);
-        rope_m(&mut kh, base, self.n_kv, self.head_dim, &self.inv_freq, m);
-        cache_append_m(&mut self.cache_k, &kh, base, kvdim, m);
-        cache_append_m(&mut self.cache_v, &vh, base, kvdim, m);
-        attention_m(&qh, &self.cache_k, &self.cache_v, &mut attn_out,
+        if self.m_scratch.as_ref().map(|s| s.m) != Some(m) {
+            let rep = |b: &Option<Vec<f32>>| {
+                b.as_ref().map(|v| DevF32::from_host(&v.repeat(m)))
+            };
+            self.m_scratch = Some(MScratchAttn {
+                m,
+                norm: DevHalf::zeros(m * hidden),
+                qb: DevF32::zeros(m * qdim),
+                kb: DevF32::zeros(m * kvdim),
+                vb: DevF32::zeros(m * kvdim),
+                qh: DevHalf::zeros(m * qdim),
+                kh: DevHalf::zeros(m * kvdim),
+                vh: DevHalf::zeros(m * kvdim),
+                attn_out: DevHalf::zeros(m * qdim),
+                ob: DevF32::zeros(m * hidden),
+                qbias_r: rep(&self.qbias_h),
+                kbias_r: rep(&self.kbias_h),
+                vbias_r: rep(&self.vbias_h),
+            });
+        }
+        let s = self.m_scratch.as_mut().unwrap();
+        rmsnorm_m(h, &self.norm_w, &mut s.norm, self.eps, hidden, m);
+        self.q.forward_m(&s.norm, &mut s.qb, m);
+        self.k.forward_m(&s.norm, &mut s.kb, m);
+        self.v.forward_m(&s.norm, &mut s.vb, m);
+        // Qwen-style qkv bias: the m-row repeated bias makes it a plain vadd.
+        if let Some(b) = &s.qbias_r { vadd(&mut s.qb, b); }
+        if let Some(b) = &s.kbias_r { vadd(&mut s.kb, b); }
+        if let Some(b) = &s.vbias_r { vadd(&mut s.vb, b); }
+        s.qh.copy_cast_from(&s.qb);
+        s.kh.copy_cast_from(&s.kb);
+        s.vh.copy_cast_from(&s.vb);
+        rope_m(&mut s.qh, base, self.n_heads, self.head_dim, &self.inv_freq, m);
+        rope_m(&mut s.kh, base, self.n_kv, self.head_dim, &self.inv_freq, m);
+        cache_append_m(&mut self.cache_k, &s.kh, base, kvdim, m);
+        cache_append_m(&mut self.cache_v, &s.vh, base, kvdim, m);
+        attention_m(&s.qh, &self.cache_k, &self.cache_v, &mut s.attn_out,
                     self.n_heads, self.n_kv, self.head_dim, base, m);
-        self.o.forward_m(&attn_out, &mut ob, m);
-        residual_add(h, &ob);
+        self.o.forward_m(&s.attn_out, &mut s.ob, m);
+        residual_add(h, &s.ob);
     }
 }
 
@@ -563,6 +611,8 @@ pub struct Model {
     hidden: usize,
     vocab: usize,
     eps: f32,
+    // cached batched-forward buffers (allocated once per M, reused every verify)
+    mk_scratch: Option<(usize, DevHalf, DevHalf, DevF32)>,
 }
 
 impl Model {
@@ -587,6 +637,7 @@ impl Model {
             hidden,
             vocab,
             eps,
+            mk_scratch: None,
         }
     }
 
@@ -639,14 +690,21 @@ impl Model {
         for (r, &t) in tokens.iter().enumerate() {
             hm[r * hid..(r + 1) * hid].copy_from_slice(&self.embedding[t * hid..(t + 1) * hid]);
         }
-        let mut h = DevHalf::from_host(&hm);
-        for l in &mut self.layers {
-            l.forward_m(&mut h, pos, m);
+        if self.mk_scratch.as_ref().map(|s| s.0) != Some(m) {
+            self.mk_scratch = Some((
+                m,
+                DevHalf::zeros(m * hid),
+                DevHalf::zeros(m * hid),
+                DevF32::zeros(m * self.vocab),
+            ));
         }
-        let mut normed = DevHalf::zeros(m * hid);
-        rmsnorm_m(&h, &self.final_norm, &mut normed, self.eps, hid, m);
-        let mut logits = DevF32::zeros(m * self.vocab);
-        self.lm_head.forward_m(&normed, &mut logits, m);
+        let (_, h, normed, logits) = self.mk_scratch.as_mut().unwrap();
+        h.upload(&hm);
+        for l in &mut self.layers {
+            l.forward_m(h, pos, m);
+        }
+        rmsnorm_m(h, &self.final_norm, normed, self.eps, hid, m);
+        self.lm_head.forward_m(normed, logits, m);
         let all = logits.to_host();
         (0..m).map(|r| all[r * self.vocab..(r + 1) * self.vocab].to_vec()).collect()
     }
