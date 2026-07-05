@@ -1115,3 +1115,105 @@ pub fn check_spec_decode_k(k: usize) -> (bool, bool, usize, usize, usize) {
     });
     (seq_o == reference, seq_w == reference, fwds_o, fwds_w, n)
 }
+
+impl Model {
+    /// Confidence-scheduled speculative decode (DSpark-style): the drafter returns up to
+    /// `kmax` (token, confidence) proposals, and each step drafts a DYNAMIC K = the leading
+    /// run of proposals with confidence >= `thresh` (at least 1, capped at min(kmax,3) since
+    /// the verify needs M=K+1 <= 4). Draft more when the drafter is sure, fewer when not.
+    /// Still LOSSLESS (the verify guarantees the target's greedy output). Returns
+    /// `(tokens, target_forwards, avg_k)`.
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    pub fn spec_decode_greedy_conf(
+        &mut self,
+        prompt: &[usize],
+        n: usize,
+        kmax: usize,
+        thresh: f32,
+        mut drafter: impl FnMut(&[usize], usize) -> Vec<(usize, f32)>,
+    ) -> (Vec<usize>, usize, f64) {
+        assert!(!prompt.is_empty());
+        let kcap = kmax.min(3);
+        let mut last = vec![];
+        for (i, &t) in prompt.iter().enumerate() { last = self.forward(t, i); }
+        let mut out: Vec<usize> = Vec::with_capacity(n);
+        let mut pos = prompt.len();
+        let mut u0 = argmax(&last);
+        let (mut fwds, mut ksum) = (0usize, 0usize);
+        while out.len() < n {
+            let mut prefix = prompt.to_vec();
+            prefix.extend_from_slice(&out);
+            let prop = drafter(&prefix, kcap);
+            // dynamic K: leading run above the confidence threshold, >=1, <=kcap
+            let mut k = 1usize;
+            while k < prop.len().min(kcap) && prop[k].1 >= thresh { k += 1; }
+            let drafts: Vec<usize> = prop[..k].iter().map(|(t, _)| *t).collect();
+            let mut toks = Vec::with_capacity(k + 1);
+            toks.push(u0); toks.extend_from_slice(&drafts);
+            let logits = self.forward_mk(&toks, pos);
+            fwds += 1; ksum += k;
+            out.push(u0);
+            if out.len() >= n { break; }
+            let mut j = 0usize;
+            while j < k {
+                if drafts[j] == argmax(&logits[j]) { out.push(drafts[j]); j += 1; if out.len() >= n { break; } }
+                else { break; }
+            }
+            if out.len() >= n { break; }
+            if j == k { u0 = argmax(&logits[k]); pos += k + 1; }
+            else { u0 = argmax(&logits[j]); pos += j + 1; }
+        }
+        out.truncate(n);
+        (out, fwds, ksum as f64 / fwds.max(1) as f64)
+    }
+}
+
+/// Lossless check of confidence-scheduled decode: output must equal plain greedy for any
+/// confidence signal. Returns (ok_highconf, ok_mixed, fwds_high, avg_k_high, n).
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn check_spec_decode_conf() -> (bool, bool, usize, f64, usize) {
+    let (hidden, vocab, n_heads, n_kv, head_dim, inter, n_layers) = (256usize, 256usize, 8usize, 8usize, 32usize, 512usize, 2usize);
+    let eps = 1e-5f32; let max_seq = 128usize;
+    let build = || {
+        let mut r = { let mut s = 0x5EEDu64; move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) } };
+        let packed = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<u8> { (0..n).map(|_| ((r()*0.5+0.5)*255.0) as u8).collect() };
+        let cbk = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<f32> { (0..n).map(|_| r()*0.05).collect() };
+        let qdim = n_heads*head_dim; let kvdim = n_kv*head_dim;
+        let emb: Vec<f32> = (0..vocab*hidden).map(|_| r()*0.2).collect();
+        let inv: Vec<f32> = (0..head_dim/2).map(|d| 10000f32.powf(-2.0*d as f32/head_dim as f32)).collect();
+        let mut layers = Vec::new();
+        for _ in 0..n_layers {
+            let an: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
+            let mn: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
+            let a = AttnBlock::new(hidden, n_heads, n_kv, head_dim, max_seq, &an,
+                (&packed(hidden*(qdim/2),&mut r), &cbk(K*qdim,&mut r)),
+                (&packed(hidden*(kvdim/2),&mut r), &cbk(K*kvdim,&mut r)),
+                (&packed(hidden*(kvdim/2),&mut r), &cbk(K*kvdim,&mut r)),
+                (&packed(qdim*(hidden/2),&mut r), &cbk(K*hidden,&mut r)), eps, &inv, None);
+            let mlp = MlpBlock::new(hidden, inter, &mn,
+                &packed(hidden*(inter/2),&mut r), &cbk(K*inter,&mut r),
+                &packed(hidden*(inter/2),&mut r), &cbk(K*inter,&mut r),
+                &packed(inter*(hidden/2),&mut r), &cbk(K*hidden,&mut r), eps);
+            layers.push(Layer::new(a, mlp));
+        }
+        let fnorm: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
+        let lmp = packed(hidden*(vocab/2),&mut r); let lmc = cbk(K*vocab,&mut r);
+        Model::new(hidden, vocab, emb, layers, &fnorm, (&lmp,&lmc), eps)
+    };
+    let prompt = vec![1usize, 5, 9, 2];
+    let n = 21usize;
+    let mut m0 = build();
+    let reference = m0.decode_greedy(&prompt, n);
+    let mut full = prompt.clone(); full.extend_from_slice(&reference);
+    // high-confidence oracle: true tokens, conf=1.0 => always drafts kmax
+    let mut m1 = build(); let fo = full.clone();
+    let (seq_h, fwds_h, avgk) = m1.spec_decode_greedy_conf(&prompt, n, 3, 0.6, move |p: &[usize], kk| {
+        (0..kk).map(|i| (fo.get(p.len()+1+i).copied().unwrap_or(0), 1.0f32)).collect()
+    });
+    // mixed confidence: alternating high/low conf, arbitrary tokens => dynamic K + rejects
+    let mut m2 = build();
+    let (seq_m, _fm, _ak) = m2.spec_decode_greedy_conf(&prompt, n, 3, 0.6, |p: &[usize], kk| {
+        (0..kk).map(|i| ((p.len()*7+3+i*11)%vocab, if i%2==0 {0.9} else {0.3})).collect()
+    });
+    (seq_h == reference, seq_m == reference, fwds_h, avgk, n)
+}

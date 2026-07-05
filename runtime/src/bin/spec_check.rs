@@ -14,5 +14,9 @@ fn main() {
     if bad == 0 {
         println!("\nLOSSLESS at K=1..3. Bigger K = more tokens per target forward (ceiling K+1),");
         println!("bounded by gemm_mtile's validated M<=4 range (so K<=3).");
+    println!("\n== confidence-scheduled decode (dynamic K, DSpark-style) ==");
+    let (ok_h, ok_m, fh, ak, n2) = trapetum::check_spec_decode_conf();
+    println!("  lossless(high-conf={ok_h}, mixed={ok_m}) {}  |  high-conf: {n2} toks in {fh} forwards, avg K={ak:.2}", if ok_h && ok_m {"OK"} else {"FAIL"});
+    if !(ok_h && ok_m) { std::process::exit(1); }
     } else { println!("\nFAIL"); std::process::exit(1); }
 }
