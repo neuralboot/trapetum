@@ -601,6 +601,84 @@ impl Model {
         (all[..self.vocab].to_vec(), all[self.vocab..].to_vec())
     }
 
+    /// Batched forward over M tokens at positions `pos..pos+M`, returning the M next-token
+    /// logit vectors. `logits[j]` predicts the token after `tokens[0..=j]`. M = K+1 for a
+    /// K-token speculative verify (M<=4, the validated range of gemm_mtile).
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    pub fn forward_mk(&mut self, tokens: &[usize], pos: usize) -> Vec<Vec<f32>> {
+        let m = tokens.len();
+        let hid = self.hidden;
+        let mut hm = vec![0f32; m * hid];
+        for (r, &t) in tokens.iter().enumerate() {
+            hm[r * hid..(r + 1) * hid].copy_from_slice(&self.embedding[t * hid..(t + 1) * hid]);
+        }
+        let mut h = DevHalf::from_host(&hm);
+        for l in &mut self.layers {
+            l.forward_m(&mut h, pos, m);
+        }
+        let mut normed = DevHalf::zeros(m * hid);
+        rmsnorm_m(&h, &self.final_norm, &mut normed, self.eps, hid, m);
+        let mut logits = DevF32::zeros(m * self.vocab);
+        self.lm_head.forward_m(&normed, &mut logits, m);
+        let all = logits.to_host();
+        (0..m).map(|r| all[r * self.vocab..(r + 1) * self.vocab].to_vec()).collect()
+    }
+
+    /// Greedy speculative decode with block size K (verify K+1 tokens per target forward).
+    /// `drafter(prefix, k) -> k proposed tokens`. LOSSLESS by construction. K<=3 (the verify
+    /// needs an M=K+1 batched forward, and gemm_mtile is validated to M=4). Returns
+    /// `(tokens, target_forwards)`; fewer forwards = the speedup.
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    pub fn spec_decode_greedy_k(
+        &mut self,
+        prompt: &[usize],
+        n: usize,
+        k: usize,
+        mut drafter: impl FnMut(&[usize], usize) -> Vec<usize>,
+    ) -> (Vec<usize>, usize) {
+        assert!((1..=3).contains(&k), "K must be 1..=3 (verify M=K+1 <= 4)");
+        assert!(!prompt.is_empty());
+        let mut last = vec![];
+        for (i, &t) in prompt.iter().enumerate() { last = self.forward(t, i); }
+        let mut out: Vec<usize> = Vec::with_capacity(n);
+        let mut pos = prompt.len();
+        let mut u0 = argmax(&last);
+        let mut fwds = 0usize;
+        while out.len() < n {
+            let mut prefix = prompt.to_vec();
+            prefix.extend_from_slice(&out);
+            let drafts = drafter(&prefix, k); // k guesses for the tokens after u0
+            assert_eq!(drafts.len(), k, "drafter must return exactly k tokens");
+            let mut toks = Vec::with_capacity(k + 1);
+            toks.push(u0);
+            toks.extend_from_slice(&drafts);
+            let logits = self.forward_mk(&toks, pos); // k+1 logit vectors
+            fwds += 1;
+            out.push(u0); // u0 committed at row pos
+            if out.len() >= n { break; }
+            // accept the longest matching prefix of drafts
+            let mut j = 0usize;
+            while j < k {
+                let a = argmax(&logits[j]); // target token after u0, d_1..d_j
+                if drafts[j] == a {
+                    out.push(drafts[j]);
+                    j += 1;
+                    if out.len() >= n { break; }
+                } else { break; }
+            }
+            if out.len() >= n { break; }
+            if j == k {
+                u0 = argmax(&logits[k]); // all accepted -> bonus token
+                pos += k + 1;
+            } else {
+                u0 = argmax(&logits[j]); // first mismatch -> the correction
+                pos += j + 1;            // stale draft rows overwritten next step
+            }
+        }
+        out.truncate(n);
+        (out, fwds)
+    }
+
     /// Greedy speculative decode, K=1. `drafter(prefix) -> proposed next token`. Emits
     /// `n` tokens after the prompt. LOSSLESS by construction: every emitted token is the
     /// target's greedy argmax, so the output equals plain greedy decode regardless of the
@@ -983,5 +1061,57 @@ pub fn check_spec_decode() -> (bool, bool, usize, usize, usize) {
     // (b) adversarial drafter: propose a token that is usually wrong => many rejects
     let mut m2 = build();
     let (seq_w, fwds_w) = m2.spec_decode_greedy(&prompt, n, |prefix: &[usize]| (prefix.len()*7 + 3) % vocab);
+    (seq_o == reference, seq_w == reference, fwds_o, fwds_w, n)
+}
+
+/// K-general lossless check of the speculative loop (K=1..3). Same tiny random model as
+/// `check_spec_decode`, but verifies K+1 tokens per forward. Returns
+/// (ok_oracle, ok_wrong, fwds_oracle, fwds_wrong, n).
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn check_spec_decode_k(k: usize) -> (bool, bool, usize, usize, usize) {
+    let (hidden, vocab, n_heads, n_kv, head_dim, inter, n_layers) = (256usize, 256usize, 8usize, 8usize, 32usize, 512usize, 2usize);
+    let eps = 1e-5f32; let max_seq = 128usize;
+    let build = || {
+        let mut r = { let mut s = 0x5EEDu64; move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) } };
+        let packed = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<u8> { (0..n).map(|_| ((r()*0.5+0.5)*255.0) as u8).collect() };
+        let cbk = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<f32> { (0..n).map(|_| r()*0.05).collect() };
+        let qdim = n_heads*head_dim; let kvdim = n_kv*head_dim;
+        let emb: Vec<f32> = (0..vocab*hidden).map(|_| r()*0.2).collect();
+        let inv: Vec<f32> = (0..head_dim/2).map(|d| 10000f32.powf(-2.0*d as f32/head_dim as f32)).collect();
+        let mut layers = Vec::new();
+        for _ in 0..n_layers {
+            let an: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
+            let mn: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
+            let a = AttnBlock::new(hidden, n_heads, n_kv, head_dim, max_seq, &an,
+                (&packed(hidden*(qdim/2),&mut r), &cbk(K*qdim,&mut r)),
+                (&packed(hidden*(kvdim/2),&mut r), &cbk(K*kvdim,&mut r)),
+                (&packed(hidden*(kvdim/2),&mut r), &cbk(K*kvdim,&mut r)),
+                (&packed(qdim*(hidden/2),&mut r), &cbk(K*hidden,&mut r)), eps, &inv, None);
+            let mlp = MlpBlock::new(hidden, inter, &mn,
+                &packed(hidden*(inter/2),&mut r), &cbk(K*inter,&mut r),
+                &packed(hidden*(inter/2),&mut r), &cbk(K*inter,&mut r),
+                &packed(inter*(hidden/2),&mut r), &cbk(K*hidden,&mut r), eps);
+            layers.push(Layer::new(a, mlp));
+        }
+        let fnorm: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
+        let lmp = packed(hidden*(vocab/2),&mut r); let lmc = cbk(K*vocab,&mut r);
+        Model::new(hidden, vocab, emb, layers, &fnorm, (&lmp,&lmc), eps)
+    };
+    let prompt = vec![1usize, 5, 9, 2];
+    let n = 21usize;
+    let mut m0 = build();
+    let reference = m0.decode_greedy(&prompt, n);
+    let mut full = prompt.clone(); full.extend_from_slice(&reference);
+    // oracle: the true next k tokens after u0 (u0 = full[prefix.len()]) => all accept
+    let mut m1 = build();
+    let full_o = full.clone();
+    let (seq_o, fwds_o) = m1.spec_decode_greedy_k(&prompt, n, k, move |prefix: &[usize], kk: usize| {
+        (0..kk).map(|i| full_o.get(prefix.len()+1+i).copied().unwrap_or(0)).collect()
+    });
+    // adversarial: k arbitrary tokens => frequent rejects
+    let mut m2 = build();
+    let (seq_w, fwds_w) = m2.spec_decode_greedy_k(&prompt, n, k, |prefix: &[usize], kk: usize| {
+        (0..kk).map(|i| (prefix.len()*7 + 3 + i*11) % vocab).collect()
+    });
     (seq_o == reference, seq_w == reference, fwds_o, fwds_w, n)
 }

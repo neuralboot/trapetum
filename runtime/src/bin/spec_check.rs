@@ -1,16 +1,18 @@
-//! Validates the K=1 speculative decode loop is lossless and that acceptances save forwards.
+//! Validates the speculative decode loop is lossless for K=1..3 and that acceptances save forwards.
 //!   cargo run --release --no-default-features --features metal --bin spec_check
 fn main() {
-    let (ok_o, ok_w, fwds_o, fwds_w, n) = trapetum::check_spec_decode();
-    println!("== speculative decode K=1 (lossless check) ==");
-    println!("  perfect drafter : seq==greedy {}  forwards={}/{}  (accepts save forwards)", if ok_o {"OK"} else {"FAIL"}, fwds_o, n);
-    println!("  adversarial     : seq==greedy {}  forwards={}/{}  (rejects still correct)", if ok_w {"OK"} else {"FAIL"}, fwds_w, n);
-    if ok_o && ok_w {
-        let speedup = n as f64 / fwds_o as f64;
-        println!("\nLOSSLESS: spec-dec output == plain greedy for both drafters.");
-        println!("Perfect-drafter speedup (tokens/forward): {:.2}x  ({} tokens in {} target forwards)", speedup, n, fwds_o);
-    } else {
-        println!("\nFAIL: speculative output diverged from greedy.");
-        std::process::exit(1);
+    let mut bad = 0;
+    println!("== speculative decode: lossless + tokens/forward, K=1..3 ==");
+    for k in [1usize, 2, 3] {
+        let (ok_o, ok_w, fo, fw, n) = trapetum::check_spec_decode_k(k);
+        let tpf = n as f64 / fo as f64; // tokens per target forward, perfect drafter
+        let oks = if ok_o && ok_w {"OK"} else {"FAIL"};
+        println!("  K={k}  lossless(oracle={ok_o}, adversarial={ok_w}) {oks}  |  perfect: {n} toks in {fo} forwards = {tpf:.2} tok/fwd  (ceiling {})", k+1);
+        if !(ok_o && ok_w) { bad += 1; }
+        let _ = fw;
     }
+    if bad == 0 {
+        println!("\nLOSSLESS at K=1..3. Bigger K = more tokens per target forward (ceiling K+1),");
+        println!("bounded by gemm_mtile's validated M<=4 range (so K<=3).");
+    } else { println!("\nFAIL"); std::process::exit(1); }
 }
