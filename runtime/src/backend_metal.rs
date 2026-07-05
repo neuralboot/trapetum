@@ -32,7 +32,7 @@ fn gs() -> u64 {
 const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
 const KERNELS: &[&str] = &[
     "gemv4", "cast_f2h", "rmsnorm_k", "silu_mul_k", "resadd_k", "rope_k", "vadd_k", "attn_k",
-    "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m", "attn_m",
+    "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m", "attn_m", "rope_m",
 ];
 
 struct Ctx {
@@ -633,5 +633,39 @@ pub unsafe fn check_attn_m(n_heads: i32, n_kv: i32, hd: i32, base: i32, m: i32) 
         }
     }
     dev_free(dq); dev_free(dck); dev_free(dcv); dev_free(dout);
+    worst
+}
+
+// Validate rope_m (batched, per-row position base+row) vs per-row M=1 op_rope.
+pub unsafe fn check_rope_m(n_heads: i32, head_dim: i32, base: i32, m: i32) -> f64 {
+    let c = ctx();
+    let qdim = (n_heads * head_dim) as usize;
+    let inv: Vec<f32> = (0..(head_dim/2) as usize).map(|d| 10000f32.powf(-2.0*d as f32/head_dim as f32)).collect();
+    let dinv = dev_alloc_f32(inv.len() as i32); dev_upload_f32(dinv, inv.as_ptr(), inv.len() as i32);
+    let xf: Vec<f32> = (0..(m as usize*qdim)).map(|i| (((i*13+1)%29) as f32 - 14.0)*0.05).collect();
+    // batched
+    let dxb = dev_alloc_half(m*qdim as i32); dev_upload_to_half(dxb, xf.as_ptr(), m*qdim as i32);
+    {
+        let cb = cur_cb(); let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.pl["rope_m"]);
+        enc.set_buffer(0, Some(bufref(dxb)), 0);
+        enc.set_buffer(1, Some(bufref(dinv)), 0);
+        let p: [i32;4] = [base, n_heads, head_dim, m];
+        enc.set_bytes(2, 16, p.as_ptr() as *const c_void);
+        let n = (m * n_heads * (head_dim/2)) as u64;
+        enc.dispatch_thread_groups(MTLSize::new((n+255)/256,1,1), MTLSize::new(256,1,1));
+        enc.end_encoding();
+    }
+    let mut got = vec![0f32; m as usize*qdim]; dev_download_half(got.as_mut_ptr(), dxb, m*qdim as i32);
+    // reference: per-row op_rope
+    let mut worst = 0f64;
+    let dxr = dev_alloc_half(qdim as i32);
+    for row in 0..m as usize {
+        dev_upload_to_half(dxr, xf[row*qdim..].as_ptr(), qdim as i32);
+        op_rope(dxr, base + row as i32, n_heads, head_dim, dinv);
+        let mut r = vec![0f32; qdim]; dev_download_half(r.as_mut_ptr(), dxr, qdim as i32);
+        for i in 0..qdim { let den=(r[i] as f64).abs().max(1e-4); worst=worst.max(((got[row*qdim+i]-r[i]) as f64).abs()/den); }
+    }
+    dev_free(dinv); dev_free(dxb); dev_free(dxr);
     worst
 }

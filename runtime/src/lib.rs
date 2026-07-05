@@ -624,3 +624,9 @@ pub fn check_rmsnorm_m(n: usize, m: usize) -> f64 {
 pub fn check_attn_m(n_heads: usize, n_kv: usize, hd: usize, base: usize, m: usize) -> f64 {
     unsafe { backend::check_attn_m(n_heads as i32, n_kv as i32, hd as i32, base as i32, m as i32) }
 }
+
+/// Validate batched rope_m vs per-row M=1 rope.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn check_rope_m(n_heads: usize, head_dim: usize, base: usize, m: usize) -> f64 {
+    unsafe { backend::check_rope_m(n_heads as i32, head_dim as i32, base as i32, m as i32) }
+}

@@ -382,3 +382,25 @@ kernel void attn_m(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+// Batched RoPE: rotates the M query/key rows, each at absolute position base+row.
+struct RopeMParams { int base; int n_heads; int head_dim; int m; };
+kernel void rope_m(
+    device half* x               [[buffer(0)]],   // [M][n_heads*head_dim]
+    device const float* inv_freq [[buffer(1)]],
+    constant RopeMParams& p      [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int hlf = p.head_dim/2;
+    int per_row = p.n_heads * hlf;
+    if ((int)tid >= p.m * per_row) return;
+    int row = (int)tid / per_row, r = (int)tid % per_row;
+    int h = r / hlf, d = r % hlf;
+    float angle = (float)(p.base + row) * inv_freq[d];
+    float c = cos(angle), s = sin(angle);
+    int qdim = p.n_heads * p.head_dim;
+    int i = row*qdim + h*p.head_dim + d, j = i + hlf;
+    float x0 = (float)x[i], x1 = (float)x[j];
+    x[i] = (half)(x0*c - x1*s);
+    x[j] = (half)(x1*c + x0*s);
+}
