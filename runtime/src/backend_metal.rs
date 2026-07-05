@@ -32,7 +32,7 @@ fn gs() -> u64 {
 const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
 const KERNELS: &[&str] = &[
     "gemv4", "cast_f2h", "rmsnorm_k", "silu_mul_k", "resadd_k", "rope_k", "vadd_k", "attn_k",
-    "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m", "attn_m", "rope_m", "mla_attn", "saxpy", "gelu_mul_k",
+    "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m", "attn_m", "rope_m", "mla_attn", "saxpy", "gelu_mul_k", "resadd_h_k",
 ];
 
 struct Ctx {
@@ -249,6 +249,9 @@ pub unsafe fn op_silu_mul(gate_f32: *const c_void, up_f32: *const c_void, out_ha
     );
 }
 
+pub unsafe fn op_resadd_h(h_half: *mut c_void, delta_half: *const c_void, n: i32) {
+    dispatch1d("resadd_h_k", &[bufref(h_half), bufref(delta_half)], &n.to_ne_bytes(), n as usize);
+}
 pub unsafe fn op_residual_add(h_half: *mut c_void, delta_f32: *const c_void, n: i32) {
     dispatch1d(
         "resadd_k",
@@ -298,6 +301,7 @@ pub unsafe fn op_attn(
     n_kv: i32,
     head_dim: i32,
     seqlen: i32,
+    softcap: f32,
 ) {
     let c = ctx();
     let cb = cur_cb();
@@ -307,8 +311,9 @@ pub unsafe fn op_attn(
     enc.set_buffer(1, Some(bufref(ck_half)), 0);
     enc.set_buffer(2, Some(bufref(cv_half)), 0);
     enc.set_buffer(3, Some(bufref(out_half)), 0);
-    let p: [i32; 4] = [n_heads, n_kv, head_dim, seqlen];
-    enc.set_bytes(4, 16, p.as_ptr() as *const c_void);
+    #[repr(C)] struct P { n_heads: i32, n_kv: i32, head_dim: i32, seqlen: i32, softcap: f32 }
+    let p = P { n_heads, n_kv, head_dim, seqlen, softcap };
+    enc.set_bytes(4, 20, &p as *const P as *const c_void);
     enc.set_threadgroup_memory_length(0, tg(head_dim as usize * 4));
     enc.set_threadgroup_memory_length(1, tg(seqlen as usize * 4));
     enc.dispatch_thread_groups(

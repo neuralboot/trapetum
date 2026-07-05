@@ -111,7 +111,7 @@ __global__ void vadd_k(float* __restrict__ a, const float* __restrict__ b, int n
 // [t][kv_head*head_dim + d]. GQA: kv_head = h / (n_heads/n_kv); MHA: n_kv == n_heads.
 __global__ void attn_k(const __half* __restrict__ q, const __half* __restrict__ ck,
                        const __half* __restrict__ cv, __half* __restrict__ out,
-                       int n_heads, int n_kv, int head_dim, int seqlen) {
+                       int n_heads, int n_kv, int head_dim, int seqlen, float softcap) {
     int h = blockIdx.x;
     int kvh = h / (n_heads / n_kv);
     int d = threadIdx.x;                 // blockDim.x == head_dim
@@ -124,7 +124,7 @@ __global__ void attn_k(const __half* __restrict__ q, const __half* __restrict__ 
         red[d] = qd * __half2float(ck[(size_t)t*n_kv*head_dim + kvh*head_dim + d]);
         __syncthreads();
         for (int s = head_dim/2; s > 0; s >>= 1) { if (d < s) red[d] += red[d+s]; __syncthreads(); }
-        if (d == 0) scores[t] = red[0] * scale;
+        if (d == 0) { float sc = red[0] * scale; if (softcap > 0.f) sc = softcap * tanhf(sc / softcap); scores[t] = sc; }
         __syncthreads();
     }
     if (d == 0) {
@@ -312,6 +312,11 @@ __global__ void gelu_mul_k(const float* __restrict__ gate, const float* __restri
     out[i] = __float2half(gg * up[i]);
 }
 
+__global__ void resadd_h_k(__half* __restrict__ h, const __half* __restrict__ d, int n) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) h[i] = __float2half(__half2float(h[i]) + __half2float(d[i]));
+}
+
 // One dedicated stream for all device ops, so the decode chain can be CUDA-graph
 // captured (launches MUST be on the captured stream, else they are not recorded).
 static cudaStream_t g_stream = 0;
@@ -419,11 +424,11 @@ void op_cache_append(void* cache_half, const void* src_half, int pos, int dim) {
                     (size_t)dim*sizeof(__half), cudaMemcpyDeviceToDevice, g_stream);
 }
 void op_attn(const void* q_half, const void* ck_half, const void* cv_half, void* out_half,
-             int n_heads, int n_kv, int head_dim, int seqlen) {
+             int n_heads, int n_kv, int head_dim, int seqlen, float softcap) {
     ensure_stream();
     size_t smem = ((size_t)head_dim + seqlen) * sizeof(float);
     attn_k<<<n_heads, head_dim, smem, g_stream>>>((const __half*)q_half, (const __half*)ck_half,
-        (const __half*)cv_half, (__half*)out_half, n_heads, n_kv, head_dim, seqlen);
+        (const __half*)cv_half, (__half*)out_half, n_heads, n_kv, head_dim, seqlen, softcap);
 }
 
 // --- batched (M-token) ops for speculative decoding -------------------------------
@@ -479,6 +484,11 @@ void op_gemv_fp16(const void* w_half, const void* x_half, void* y_f32, int ic, i
 void op_gelu_mul(const void* gate_f32, const void* up_f32, void* out_half, int n) {
     ensure_stream();
     gelu_mul_k<<<(n+255)/256, 256, 0, g_stream>>>((const float*)gate_f32, (const float*)up_f32, (__half*)out_half, n);
+}
+
+void op_resadd_h(void* h_half, const void* d_half, int n) {
+    ensure_stream();
+    resadd_h_k<<<(n+255)/256, 256, 0, g_stream>>>((__half*)h_half, (const __half*)d_half, n);
 }
 
 void dev_sync() { cudaDeviceSynchronize(); }

@@ -49,7 +49,9 @@ mod backend {
             n_kv: i32,
             head_dim: i32,
             seqlen: i32,
+            softcap: f32,
         );
+        pub fn op_resadd_h(h_half: *mut c_void, d_half: *const c_void, n: i32);
         // batched (M-token) ops for speculative decoding
         pub fn qlinear_forward_m(handle: *mut c_void, d_x: *const c_void, d_y: *mut c_void, m: i32);
         pub fn op_rmsnorm_m(x_half: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32, m: i32);
@@ -212,6 +214,10 @@ pub fn silu_mul(gate: &DevF32, up: &DevF32, out: &mut DevHalf) {
     unsafe { op_silu_mul(gate.ptr, up.ptr, out.ptr, gate.n as i32) };
 }
 
+/// Residual add, both fp16 (Gemma post-sublayer-norm output into the stream).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn resadd_h(h: &mut DevHalf, d: &DevHalf) { assert_eq!(h.n, d.n); unsafe { op_resadd_h(h.ptr, d.ptr, h.n as i32) }; }
+
 /// Residual add in place: `h += delta`, on-device.
 pub fn residual_add(h: &mut DevHalf, delta: &DevF32) {
     assert_eq!(h.n, delta.n);
@@ -346,9 +352,10 @@ pub fn attention(
     n_kv: usize,
     head_dim: usize,
     seqlen: usize,
+    softcap: f32,
 ) {
     unsafe {
-        op_attn(q.ptr, ck.ptr, cv.ptr, out.ptr, n_heads as i32, n_kv as i32, head_dim as i32, seqlen as i32)
+        op_attn(q.ptr, ck.ptr, cv.ptr, out.ptr, n_heads as i32, n_kv as i32, head_dim as i32, seqlen as i32, softcap)
     };
 }
 
@@ -448,7 +455,7 @@ impl AttnBlock {
         cache_append(&mut self.cache_v, &self.vh, pos);
         attention(
             &self.qh, &self.cache_k, &self.cache_v, &mut self.attn_out,
-            self.n_heads, self.n_kv, self.head_dim, pos + 1,
+            self.n_heads, self.n_kv, self.head_dim, pos + 1, 0.0,
         );
         self.o.forward_into(&self.attn_out, &mut self.ob);
         residual_add(h, &self.ob);
@@ -2033,4 +2040,161 @@ pub fn read_i32s(path: &str) -> Vec<i32> {
 pub fn gelu_mul(gate: &DevF32, up: &DevF32, out: &mut DevHalf) {
     assert_eq!(gate.n, up.n); assert_eq!(gate.n, out.n);
     unsafe { op_gelu_mul(gate.ptr, up.ptr, out.ptr, gate.n as i32) };
+}
+
+// ============================================================================
+// Gemma-2 support. Differs from Llama: GeGLU (not SiLU), RMSNorm (1+w) [baked at
+// export], embedding * sqrt(hidden) [baked], attention logit softcapping, final
+// logit softcapping, and a 4-norm residual (post-norm on each sublayer OUTPUT
+// before the residual add). q_head_dim may differ from hidden (n_heads*head_dim).
+// Sliding-window attention is a no-op for short context, so it is not modeled.
+// ============================================================================
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct GemmaAttn {
+    q: QuantLinear, k: QuantLinear, v: QuantLinear, o: QuantLinear,
+    cache_k: DevHalf, cache_v: DevHalf,
+    qb: DevF32, kb: DevF32, vb: DevF32, qh: DevHalf, kh: DevHalf, vh: DevHalf,
+    attn_out: DevHalf, ob: DevF32, oh: DevHalf,
+    inv_freq: DevF32, n_heads: usize, n_kv: usize, head_dim: usize, softcap: f32,
+}
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl GemmaAttn {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(hidden: usize, n_heads: usize, n_kv: usize, head_dim: usize, max_seq: usize,
+               q: (&[u8],&[f32]), k: (&[u8],&[f32]), v: (&[u8],&[f32]), o: (&[u8],&[f32]),
+               inv_freq: &[f32], softcap: f32) -> Self {
+        let qdim = n_heads*head_dim; let kvdim = n_kv*head_dim;
+        Self {
+            q: QuantLinear::new(q.0,q.1,hidden,qdim), k: QuantLinear::new(k.0,k.1,hidden,kvdim),
+            v: QuantLinear::new(v.0,v.1,hidden,kvdim), o: QuantLinear::new(o.0,o.1,qdim,hidden),
+            cache_k: DevHalf::zeros(max_seq*kvdim), cache_v: DevHalf::zeros(max_seq*kvdim),
+            qb: DevF32::zeros(qdim), kb: DevF32::zeros(kvdim), vb: DevF32::zeros(kvdim),
+            qh: DevHalf::zeros(qdim), kh: DevHalf::zeros(kvdim), vh: DevHalf::zeros(kvdim),
+            attn_out: DevHalf::zeros(qdim), ob: DevF32::zeros(hidden), oh: DevHalf::zeros(hidden),
+            inv_freq: DevF32::from_host(inv_freq), n_heads, n_kv, head_dim, softcap,
+        }
+    }
+    /// `x` is pre-normed (input_layernorm applied by the layer). Returns o_proj output (half).
+    pub fn forward(&mut self, x: &DevHalf, pos: usize) -> &DevHalf {
+        self.q.forward_into(x, &mut self.qb); self.qh.copy_cast_from(&self.qb);
+        self.k.forward_into(x, &mut self.kb); self.kh.copy_cast_from(&self.kb);
+        self.v.forward_into(x, &mut self.vb); self.vh.copy_cast_from(&self.vb);
+        rope(&mut self.qh, pos, self.n_heads, self.head_dim, &self.inv_freq);
+        rope(&mut self.kh, pos, self.n_kv, self.head_dim, &self.inv_freq);
+        cache_append(&mut self.cache_k, &self.kh, pos);
+        cache_append(&mut self.cache_v, &self.vh, pos);
+        attention(&self.qh, &self.cache_k, &self.cache_v, &mut self.attn_out,
+                  self.n_heads, self.n_kv, self.head_dim, pos+1, self.softcap);
+        self.o.forward_into(&self.attn_out, &mut self.ob);
+        self.oh.copy_cast_from(&self.ob);
+        &self.oh
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct GemmaMlp { gate: QuantLinear, up: QuantLinear, down: QuantLinear,
+    g: DevF32, u: DevF32, act: DevHalf, mb: DevF32, mh: DevHalf }
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl GemmaMlp {
+    pub fn new(hidden: usize, inter: usize, gate: (&[u8],&[f32]), up: (&[u8],&[f32]), down: (&[u8],&[f32])) -> Self {
+        Self { gate: QuantLinear::new(gate.0,gate.1,hidden,inter), up: QuantLinear::new(up.0,up.1,hidden,inter),
+            down: QuantLinear::new(down.0,down.1,inter,hidden),
+            g: DevF32::zeros(inter), u: DevF32::zeros(inter), act: DevHalf::zeros(inter),
+            mb: DevF32::zeros(hidden), mh: DevHalf::zeros(hidden) }
+    }
+    /// `x` pre-normed. Returns mlp output (half). Uses GeGLU (gelu_tanh).
+    pub fn forward(&mut self, x: &DevHalf) -> &DevHalf {
+        self.gate.forward_into(x, &mut self.g); self.up.forward_into(x, &mut self.u);
+        gelu_mul(&self.g, &self.u, &mut self.act);
+        self.down.forward_into(&self.act, &mut self.mb); self.mh.copy_cast_from(&self.mb);
+        &self.mh
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct GemmaLayer {
+    input_norm: DevF32, post_attn_norm: DevF32, pre_ff_norm: DevF32, post_ff_norm: DevF32,
+    attn: GemmaAttn, mlp: GemmaMlp, eps: f32,
+    normed: DevHalf, tmp: DevHalf,
+}
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl GemmaLayer {
+    fn forward(&mut self, h: &mut DevHalf, pos: usize) {
+        // attention sub-block: h += post_attn_norm(attn(input_norm(h)))
+        rmsnorm(h, &self.input_norm, &mut self.normed, self.eps);
+        { let ao_ptr = self.attn.forward(&self.normed, pos) as *const DevHalf;
+          let ao = unsafe { &*ao_ptr };
+          rmsnorm(ao, &self.post_attn_norm, &mut self.tmp, self.eps); }
+        resadd_h(h, &self.tmp);
+        // mlp sub-block: h += post_ff_norm(geglu_mlp(pre_ff_norm(h)))
+        rmsnorm(h, &self.pre_ff_norm, &mut self.normed, self.eps);
+        { let mo_ptr = self.mlp.forward(&self.normed) as *const DevHalf;
+          let mo = unsafe { &*mo_ptr };
+          rmsnorm(mo, &self.post_ff_norm, &mut self.tmp, self.eps); }
+        resadd_h(h, &self.tmp);
+    }
+}
+
+/// A full Gemma-2 model (CBKG format). Pure Rust; GeGLU + softcaps + 4-norm layers.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct GemmaModel {
+    embedding: Vec<f32>, layers: Vec<GemmaLayer>, final_norm: DevF32, lm_head: QuantLinear,
+    h: DevHalf, normed: DevHalf, logits: DevF32,
+    hidden: usize, vocab: usize, eps: f32, final_softcap: f32,
+}
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl GemmaModel {
+    pub fn vocab(&self) -> usize { self.vocab }
+    pub fn forward(&mut self, token: usize, pos: usize) -> Vec<f32> {
+        // embedding was scaled by sqrt(hidden) at export
+        self.h.upload(&self.embedding[token*self.hidden..(token+1)*self.hidden]);
+        for l in &mut self.layers { l.forward(&mut self.h, pos); }
+        rmsnorm(&self.h, &self.final_norm, &mut self.normed, self.eps);
+        self.lm_head.forward_into(&self.normed, &mut self.logits);
+        let mut lg = self.logits.to_host();
+        if self.final_softcap > 0.0 { let c = self.final_softcap; for x in lg.iter_mut() { *x = c * (*x / c).tanh(); } }
+        lg
+    }
+    /// Load a Gemma-2 `.cbk` (CBKG) from `model/export_gemma.py`.
+    pub fn load_gemma(path: &str, max_seq: usize) -> std::io::Result<GemmaModel> {
+        let mut r = BufReader::new(File::open(path)?);
+        let mut magic = [0u8;4]; r.read_exact(&mut magic)?;
+        assert_eq!(&magic, b"CBKG", "not a Gemma .cbk");
+        let cfg: Vec<usize> = (0..7).map(|_| rd_i32(&mut r) as usize).collect();
+        let (n_layers, hidden, n_heads, n_kv, head_dim, inter, vocab) =
+            (cfg[0],cfg[1],cfg[2],cfg[3],cfg[4],cfg[5],cfg[6]);
+        let eps = rd_f32(&mut r); let _rope_theta = rd_f32(&mut r);
+        let attn_softcap = rd_f32(&mut r); let final_softcap = rd_f32(&mut r);
+        let inv_freq = rd_f32_vec(&mut r, head_dim/2);
+        let embedding = rd_f16_vec(&mut r, vocab*hidden);
+        let qdim = n_heads*head_dim; let kvdim = n_kv*head_dim;
+        let mut layers = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            let input_norm = rd_f32_vec(&mut r, hidden);
+            let q = (rd_u8_vec(&mut r, hidden*(qdim/2)), rd_f32_vec(&mut r, K*qdim));
+            let k = (rd_u8_vec(&mut r, hidden*(kvdim/2)), rd_f32_vec(&mut r, K*kvdim));
+            let v = (rd_u8_vec(&mut r, hidden*(kvdim/2)), rd_f32_vec(&mut r, K*kvdim));
+            let o = (rd_u8_vec(&mut r, qdim*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
+            let post_attn_norm = rd_f32_vec(&mut r, hidden);
+            let pre_ff_norm = rd_f32_vec(&mut r, hidden);
+            let gate = (rd_u8_vec(&mut r, hidden*(inter/2)), rd_f32_vec(&mut r, K*inter));
+            let up = (rd_u8_vec(&mut r, hidden*(inter/2)), rd_f32_vec(&mut r, K*inter));
+            let down = (rd_u8_vec(&mut r, inter*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
+            let post_ff_norm = rd_f32_vec(&mut r, hidden);
+            let attn = GemmaAttn::new(hidden, n_heads, n_kv, head_dim, max_seq,
+                (&q.0,&q.1),(&k.0,&k.1),(&v.0,&v.1),(&o.0,&o.1), &inv_freq, attn_softcap);
+            let mlp = GemmaMlp::new(hidden, inter, (&gate.0,&gate.1),(&up.0,&up.1),(&down.0,&down.1));
+            layers.push(GemmaLayer {
+                input_norm: DevF32::from_host(&input_norm), post_attn_norm: DevF32::from_host(&post_attn_norm),
+                pre_ff_norm: DevF32::from_host(&pre_ff_norm), post_ff_norm: DevF32::from_host(&post_ff_norm),
+                attn, mlp, eps, normed: DevHalf::zeros(hidden), tmp: DevHalf::zeros(hidden),
+            });
+        }
+        let final_norm = rd_f32_vec(&mut r, hidden);
+        let (lp, lc) = (rd_u8_vec(&mut r, hidden*(vocab/2)), rd_f32_vec(&mut r, K*vocab));
+        Ok(GemmaModel { embedding, layers, final_norm: DevF32::from_host(&final_norm),
+            lm_head: QuantLinear::new(&lp,&lc,hidden,vocab),
+            h: DevHalf::zeros(hidden), normed: DevHalf::zeros(hidden), logits: DevF32::zeros(vocab),
+            hidden, vocab, eps, final_softcap })
+    }
 }

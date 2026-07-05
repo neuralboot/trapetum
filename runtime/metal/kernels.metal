@@ -157,7 +157,7 @@ kernel void vadd_k(
 }
 
 // Batch-1 decode attention. One threadgroup per query head, head_dim threads.
-struct AttnParams { int n_heads; int n_kv; int head_dim; int seqlen; };
+struct AttnParams { int n_heads; int n_kv; int head_dim; int seqlen; float softcap; };
 kernel void attn_k(
     device const half* q   [[buffer(0)]],
     device const half* ck  [[buffer(1)]],
@@ -181,7 +181,7 @@ kernel void attn_k(
             if (d < s) red[d] += red[d+s];
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        if (d == 0) scores[t] = red[0] * scale;
+        if (d == 0) { float sc = red[0] * scale; if (p.softcap > 0.0f) sc = p.softcap * tanh(sc / p.softcap); scores[t] = sc; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (d == 0) {
@@ -475,4 +475,10 @@ kernel void gelu_mul_k(
     float g = gate[i];
     float gg = 0.5f*g*(1.0f + tanh(0.7978845608f*(g + 0.044715f*g*g*g)));
     out[i] = (half)(gg * up[i]);
+}
+
+// residual add, both fp16 (Gemma post-sublayer norm output added to the stream).
+kernel void resadd_h_k(device half* h [[buffer(0)]], device const half* d [[buffer(1)]],
+                       constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i < n) h[i] = (half)((float)h[i] + (float)d[i]);
 }
