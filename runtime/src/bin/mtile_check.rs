@@ -26,5 +26,16 @@ fn main(){
     let e=trapetum::check_rope_m(nh,hd,5,m);
     let ok=e<5e-3; println!("  rope_m nh={nh} hd={hd} M={m}  rel_err={e:.2e}  {}", if ok{"OK"}else{"FAIL"});
     if !ok{bad+=1;} } }
+  println!("== batched attention sublayer only (bisect) ==");
+  for (hid,nh,nkv,hd) in [(256usize,8usize,8usize,32usize),(512,8,4,64)] {
+    let e=trapetum::batched_attn_relerr(hid,nh,nkv,hd,5,2);
+    println!("  attn_only nh={nh} nkv={nkv} hd={hd}  rel_err={e:.2e}  {}", if e<1e-2{"OK"}else{"FAIL"});
+  }
+  println!("== batched full layer (attn+MLP) vs 2x M=1 sequential ==");
+  for (hid,nh,nkv,hd) in [(256usize,8usize,8usize,32usize),(512,8,4,64)] {
+    let e=trapetum::batched_layer_relerr(hid,nh,nkv,hd,512,5,2);
+    let ok=e<1e-2; println!("  layer_m nh={nh} nkv={nkv} hd={hd} base=5 M=2  rel_err={e:.2e}  {}", if ok{"OK"}else{"FAIL"});
+    if !ok{bad+=1;}
+  }
   if bad==0{println!("\nALL PASS (batched forward blocks correct at M<=4)");}else{println!("\n{bad} FAIL");std::process::exit(1);}
 }

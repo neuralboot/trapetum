@@ -198,6 +198,52 @@ pub fn residual_add(h: &mut DevHalf, delta: &DevF32) {
     unsafe { op_residual_add(h.ptr, delta.ptr, h.n as i32) };
 }
 
+// ============================================================================
+// Batched (M-token) API for speculative decoding: verify K+1 draft tokens in
+// one forward. Metal-only for now; the kernels are validated bit-exact / ~7e-4
+// (see check_mtile / check_rmsnorm_m / check_attn_m / check_rope_m).
+// ============================================================================
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+impl QuantLinear {
+    /// Batched decode GEMM: `y[M][oc] = x[M][ic] W^T`, one weight read serves all M rows.
+    pub fn forward_m(&self, x: &DevHalf, y: &mut DevF32, m: usize) {
+        assert_eq!(x.n, m * self.ic, "x must be m*ic");
+        assert_eq!(y.n, m * self.oc, "y must be m*oc");
+        unsafe { qlinear_forward_m(self.handle, x.ptr, y.ptr, m as i32) };
+    }
+}
+
+/// Batched RMSNorm over M rows (`x`,`out` are `m*n`).
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn rmsnorm_m(x: &DevHalf, w: &DevF32, out: &mut DevHalf, eps: f32, n: usize, m: usize) {
+    assert_eq!(x.n, m * n);
+    assert_eq!(w.n, n);
+    unsafe { op_rmsnorm_m(x.ptr, w.ptr, out.ptr, n as i32, eps, m as i32) };
+}
+
+/// Batched RoPE: row `r` rotated at absolute position `base+r` (`x` is `m*n_heads*head_dim`).
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn rope_m(x: &mut DevHalf, base: usize, n_heads: usize, head_dim: usize, inv_freq: &DevF32, m: usize) {
+    assert_eq!(x.n, m * n_heads * head_dim);
+    unsafe { op_rope_m(x.ptr, base as i32, n_heads as i32, head_dim as i32, inv_freq.ptr, m as i32) };
+}
+
+/// Append M contiguous new rows to the KV cache at rows `base..base+m`.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn cache_append_m(cache: &mut DevHalf, src: &DevHalf, base: usize, dim: usize, m: usize) {
+    assert_eq!(src.n, m * dim);
+    unsafe { op_cache_append_m(cache.ptr, src.ptr, base as i32, dim as i32, m as i32) };
+}
+
+/// Batched causal decode attention: query `r` attends over `base+r+1` keys (`q`,`out` are `m*n_heads*head_dim`).
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[allow(clippy::too_many_arguments)]
+pub fn attention_m(q: &DevHalf, ck: &DevHalf, cv: &DevHalf, out: &mut DevHalf,
+                   n_heads: usize, n_kv: usize, head_dim: usize, base: usize, m: usize) {
+    unsafe { op_attn_m(q.ptr, ck.ptr, cv.ptr, out.ptr, n_heads as i32, n_kv as i32, head_dim as i32, base as i32, m as i32) };
+}
+
 /// A Llama-style gated MLP block: RMSNorm, then `down(SiLU(gate(h)) * up(h))`, plus a
 /// residual. The three projections use the codebook decode kernel; norm, activation and
 /// residual are on-device too, so the whole forward can be captured as one CUDA graph.
@@ -405,6 +451,74 @@ impl Layer {
     pub fn forward(&mut self, h: &mut DevHalf, pos: usize) {
         self.attn.forward(h, pos);
         self.mlp.forward(h);
+    }
+}
+
+// ---- batched (M-token) forward for the transformer blocks -------------------
+// Verifies K+1 speculative tokens in a single forward. Scratch is allocated per
+// call (a test-grade path; production would preallocate). No attention bias yet.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+impl MlpBlock {
+    /// `h` is `m*hidden`, updated in place: `h = h + MLP(RMSNorm(h))` for all M rows.
+    pub fn forward_m(&mut self, h: &mut DevHalf, m: usize) {
+        let hidden = self.norm_w.len();
+        let inter = self.g.n;
+        let mut norm = DevHalf::zeros(m * hidden);
+        let mut g = DevF32::zeros(m * inter);
+        let mut u = DevF32::zeros(m * inter);
+        let mut act = DevHalf::zeros(m * inter);
+        let mut mlp = DevF32::zeros(m * hidden);
+        rmsnorm_m(h, &self.norm_w, &mut norm, self.eps, hidden, m);
+        self.gate.forward_m(&norm, &mut g, m);
+        self.up.forward_m(&norm, &mut u, m);
+        silu_mul(&g, &u, &mut act);
+        self.down.forward_m(&act, &mut mlp, m);
+        residual_add(h, &mlp);
+    }
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+impl AttnBlock {
+    /// Batched decode step: `h` is `m*hidden`, the M new tokens sit at positions
+    /// `base..base+m`. Each query attends causally over `base+row+1` keys.
+    pub fn forward_m(&mut self, h: &mut DevHalf, base: usize, m: usize) {
+        assert!(self.qbias.is_none(), "batched forward_m does not support attention bias yet");
+        let hidden = self.norm_w.len();
+        let qdim = self.n_heads * self.head_dim;
+        let kvdim = self.n_kv * self.head_dim;
+        let mut norm = DevHalf::zeros(m * hidden);
+        let mut qb = DevF32::zeros(m * qdim);
+        let mut kb = DevF32::zeros(m * kvdim);
+        let mut vb = DevF32::zeros(m * kvdim);
+        let mut qh = DevHalf::zeros(m * qdim);
+        let mut kh = DevHalf::zeros(m * kvdim);
+        let mut vh = DevHalf::zeros(m * kvdim);
+        let mut attn_out = DevHalf::zeros(m * qdim);
+        let mut ob = DevF32::zeros(m * hidden);
+        rmsnorm_m(h, &self.norm_w, &mut norm, self.eps, hidden, m);
+        self.q.forward_m(&norm, &mut qb, m);
+        self.k.forward_m(&norm, &mut kb, m);
+        self.v.forward_m(&norm, &mut vb, m);
+        qh.copy_cast_from(&qb);
+        kh.copy_cast_from(&kb);
+        vh.copy_cast_from(&vb);
+        rope_m(&mut qh, base, self.n_heads, self.head_dim, &self.inv_freq, m);
+        rope_m(&mut kh, base, self.n_kv, self.head_dim, &self.inv_freq, m);
+        cache_append_m(&mut self.cache_k, &kh, base, kvdim, m);
+        cache_append_m(&mut self.cache_v, &vh, base, kvdim, m);
+        attention_m(&qh, &self.cache_k, &self.cache_v, &mut attn_out,
+                    self.n_heads, self.n_kv, self.head_dim, base, m);
+        self.o.forward_m(&attn_out, &mut ob, m);
+        residual_add(h, &ob);
+    }
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+impl Layer {
+    /// One batched decode step over M tokens at positions `base..base+m`.
+    pub fn forward_m(&mut self, h: &mut DevHalf, base: usize, m: usize) {
+        self.attn.forward_m(h, base, m);
+        self.mlp.forward_m(h, m);
     }
 }
 
@@ -629,4 +743,91 @@ pub fn check_attn_m(n_heads: usize, n_kv: usize, hd: usize, base: usize, m: usiz
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 pub fn check_rope_m(n_heads: usize, head_dim: usize, base: usize, m: usize) -> f64 {
     unsafe { backend::check_rope_m(n_heads as i32, head_dim as i32, base as i32, m as i32) }
+}
+
+/// End-to-end lossless check of the batched decode path: a full transformer layer
+/// (attention + MLP) run once over M tokens must equal M sequential M=1 forwards
+/// through the same weights with a causally growing KV cache. Returns worst rel err
+/// over the M output rows. This validates the whole spec-dec verify forward.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn check_batched_layer(hidden: usize, n_heads: usize, n_kv: usize, head_dim: usize,
+                           inter: usize, base: usize, m: usize) -> f64 {
+    check_batched_impl(hidden, n_heads, n_kv, head_dim, inter, base, m, false)
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[allow(clippy::too_many_arguments)]
+fn check_batched_impl(hidden: usize, n_heads: usize, n_kv: usize, head_dim: usize,
+                      inter: usize, base: usize, m: usize, attn_only: bool) -> f64 {
+    let qdim = n_heads * head_dim;
+    let kvdim = n_kv * head_dim;
+    let eps = 1e-5f32;
+    let mut rng = 0xC0FFEEu64;
+    let mut nx = || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; (((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+    let packed = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<u8> { (0..n).map(|_| ((r()*0.5+0.5)*255.0) as u8).collect() };
+    let cbk = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<f32> { (0..n).map(|_| r()*0.05).collect() };
+    // host weights (generated once, shared by both paths)
+    let anorm: Vec<f32> = (0..hidden).map(|_| nx()*0.1+1.0).collect();
+    let mnorm: Vec<f32> = (0..hidden).map(|_| nx()*0.1+1.0).collect();
+    let (qp,qc)=(packed(hidden*(qdim/2),&mut nx),  cbk(K*qdim,&mut nx));
+    let (kp,kc)=(packed(hidden*(kvdim/2),&mut nx), cbk(K*kvdim,&mut nx));
+    let (vp,vc)=(packed(hidden*(kvdim/2),&mut nx), cbk(K*kvdim,&mut nx));
+    let (op,oc)=(packed(qdim*(hidden/2),&mut nx),  cbk(K*hidden,&mut nx));
+    let (gp,gc)=(packed(hidden*(inter/2),&mut nx), cbk(K*inter,&mut nx));
+    let (up,uc)=(packed(hidden*(inter/2),&mut nx), cbk(K*inter,&mut nx));
+    let (dp,dc)=(packed(inter*(hidden/2),&mut nx), cbk(K*hidden,&mut nx));
+    let inv: Vec<f32> = (0..head_dim/2).map(|d| 10000f32.powf(-2.0*d as f32/head_dim as f32)).collect();
+    let build = || {
+        let a = AttnBlock::new(hidden, n_heads, n_kv, head_dim, base+m+4, &anorm,
+            (&qp,&qc),(&kp,&kc),(&vp,&vc),(&op,&oc), eps, &inv, None);
+        let mlp = MlpBlock::new(hidden, inter, &mnorm, &gp,&gc,&up,&uc,&dp,&dc, eps);
+        Layer::new(a, mlp)
+    };
+    // random hidden states for base+m tokens
+    let hs: Vec<Vec<f32>> = (0..base+m).map(|_| (0..hidden).map(|_| nx()*0.3).collect()).collect();
+    // reference: base+m sequential M=1 forwards; capture the last m outputs
+    let mut refl = build();
+    let mut refout = vec![vec![0f32; hidden]; m];
+    for pos in 0..base+m {
+        let mut hp = DevHalf::from_host(&hs[pos]);
+        if attn_only { refl.attn.forward(&mut hp, pos); } else { refl.forward(&mut hp, pos); }
+        if pos >= base { refout[pos-base] = hp.to_host(); }
+    }
+    // batched: prefill base tokens M=1, then ONE M=2 forward for the last m
+    let mut batl = build();
+    for pos in 0..base {
+        let mut hp = DevHalf::from_host(&hs[pos]);
+        if attn_only { batl.attn.forward(&mut hp, pos); } else { batl.forward(&mut hp, pos); }
+    }
+    let mut hb = vec![0f32; m*hidden];
+    for r in 0..m { hb[r*hidden..(r+1)*hidden].copy_from_slice(&hs[base+r]); }
+    let mut hbat = DevHalf::from_host(&hb);
+    if attn_only { batl.attn.forward_m(&mut hbat, base, m); } else { batl.forward_m(&mut hbat, base, m); }
+    let got = hbat.to_host();
+    // Compare per row with a normalized L2 metric: ||got - ref|| / ||ref||. A per-element
+    // max metric would blow up on near-zero hidden elements, where the tiny absolute noise
+    // from fp16 + non-associative atomic accumulation (identical to normal M=1 decode) reads
+    // as a huge relative error. The L2 metric measures true divergence of the whole vector.
+    let mut worst = 0f64;
+    for r in 0..m {
+        let mut num = 0f64; let mut den = 0f64;
+        for i in 0..hidden {
+            let d = (got[r*hidden+i] - refout[r][i]) as f64;
+            num += d*d; den += (refout[r][i] as f64).powi(2);
+        }
+        worst = worst.max((num / den.max(1e-12)).sqrt());
+    }
+    worst
+}
+
+/// Test wrapper for the batched-layer lossless check.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn batched_layer_relerr(hidden: usize, n_heads: usize, n_kv: usize, head_dim: usize, inter: usize, base: usize, m: usize) -> f64 {
+    check_batched_layer(hidden, n_heads, n_kv, head_dim, inter, base, m)
+}
+
+/// Attention-sublayer-only variant of the batched lossless check (for bisecting).
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn batched_attn_relerr(hidden: usize, n_heads: usize, n_kv: usize, head_dim: usize, base: usize, m: usize) -> f64 {
+    check_batched_impl(hidden, n_heads, n_kv, head_dim, 512, base, m, true)
 }

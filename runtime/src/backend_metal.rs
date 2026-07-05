@@ -669,3 +669,93 @@ pub unsafe fn check_rope_m(n_heads: i32, head_dim: i32, base: i32, m: i32) -> f6
     dev_free(dinv); dev_free(dxb); dev_free(dxr);
     worst
 }
+
+// ============================================================================
+// Batched (M-token) device ops for speculative decoding. Same kernels validated
+// by check_mtile / check_rmsnorm_m / check_attn_m / check_rope_m, wired as ops.
+// ============================================================================
+
+/// Batched decode GEMM: X[M][ic] fp16 -> Y[M][oc] f32 (one weight read serves all M).
+pub unsafe fn qlinear_forward_m(h: *mut c_void, d_x: *const c_void, d_y: *mut c_void, m: i32) {
+    let q = &*(h as *const QLin);
+    let c = ctx();
+    let cb = cur_cb();
+    let blit = cb.new_blit_command_encoder();
+    blit.fill_buffer(bufref(d_y), NSRange::new(0, (m as u64) * (q.oc as u64) * 4), 0);
+    blit.end_encoding();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.pl["gemm_mtile"]);
+    enc.set_buffer(0, Some(bufref(d_x)), 0);
+    enc.set_buffer(1, Some(&q.packed), 0);
+    enc.set_buffer(2, Some(&q.cb), 0);
+    enc.set_buffer(3, Some(bufref(d_y)), 0);
+    let p: [i32; 3] = [q.ic, q.oc, m];
+    enc.set_bytes(4, 12, p.as_ptr() as *const c_void);
+    enc.set_threadgroup_memory_length(0, tg(K * CPB * 2));
+    enc.dispatch_thread_groups(
+        MTLSize::new(q.oc as u64 / CPB as u64, gs(), 1),
+        MTLSize::new(32, TY as u64, 1),
+    );
+    enc.end_encoding();
+}
+
+/// Batched RMSNorm: x[M][n] fp16 -> out[M][n] fp16, one row per threadgroup.
+pub unsafe fn op_rmsnorm_m(x_half: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32, m: i32) {
+    let c = ctx();
+    let cb = cur_cb();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.pl["rmsnorm_m"]);
+    enc.set_buffer(0, Some(bufref(x_half)), 0);
+    enc.set_buffer(1, Some(bufref(w_f32)), 0);
+    enc.set_buffer(2, Some(bufref(out_half)), 0);
+    #[repr(C)]
+    struct P { n: i32, eps: f32 }
+    let p = P { n, eps };
+    enc.set_bytes(3, 8, &p as *const P as *const c_void);
+    enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(256, 1, 1));
+    enc.end_encoding();
+}
+
+/// Batched RoPE: rotates M rows, row r at absolute position base+r.
+pub unsafe fn op_rope_m(x_half: *mut c_void, base: i32, n_heads: i32, head_dim: i32, inv_freq: *const c_void, m: i32) {
+    let c = ctx();
+    let cb = cur_cb();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.pl["rope_m"]);
+    enc.set_buffer(0, Some(bufref(x_half)), 0);
+    enc.set_buffer(1, Some(bufref(inv_freq)), 0);
+    let p: [i32; 4] = [base, n_heads, head_dim, m];
+    enc.set_bytes(2, 16, p.as_ptr() as *const c_void);
+    let n = (m * n_heads * (head_dim / 2)) as u64;
+    enc.dispatch_thread_groups(MTLSize::new((n + 255) / 256, 1, 1), MTLSize::new(256, 1, 1));
+    enc.end_encoding();
+}
+
+/// Append M contiguous new rows to the KV cache at rows base..base+m (one blit copy).
+pub unsafe fn op_cache_append_m(cache_half: *mut c_void, src_half: *const c_void, base: i32, dim: i32, m: i32) {
+    let cb = cur_cb();
+    let blit = cb.new_blit_command_encoder();
+    let nbytes = (m as u64) * (dim as u64) * 2;
+    blit.copy_from_buffer(bufref(src_half), 0, bufref(cache_half), (base as u64) * (dim as u64) * 2, nbytes);
+    blit.end_encoding();
+}
+
+/// Batched causal decode attention: query r attends over base+r+1 keys.
+pub unsafe fn op_attn_m(q_half: *const c_void, ck_half: *const c_void, cv_half: *const c_void, out_half: *mut c_void,
+                        n_heads: i32, n_kv: i32, head_dim: i32, base: i32, m: i32) {
+    let c = ctx();
+    let total = (base + m) as usize;
+    let cb = cur_cb();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.pl["attn_m"]);
+    enc.set_buffer(0, Some(bufref(q_half)), 0);
+    enc.set_buffer(1, Some(bufref(ck_half)), 0);
+    enc.set_buffer(2, Some(bufref(cv_half)), 0);
+    enc.set_buffer(3, Some(bufref(out_half)), 0);
+    let p: [i32; 5] = [n_heads, n_kv, head_dim, base, m];
+    enc.set_bytes(4, 20, p.as_ptr() as *const c_void);
+    enc.set_threadgroup_memory_length(0, tg(head_dim as usize * 4));
+    enc.set_threadgroup_memory_length(1, tg(total * 4));
+    enc.dispatch_thread_groups(MTLSize::new(n_heads as u64, 1, 1), MTLSize::new(head_dim as u64, 1, 1));
+    enc.end_encoding();
+}
