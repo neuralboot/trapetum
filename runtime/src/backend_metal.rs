@@ -837,3 +837,44 @@ pub unsafe fn op_saxpy(acc_f32: *mut c_void, y_f32: *const c_void, alpha: f32, n
     enc.dispatch_thread_groups(MTLSize::new((n as u64 + tpb - 1)/tpb, 1, 1), MTLSize::new(tpb, 1, 1));
     enc.end_encoding();
 }
+
+// Dense fp16 GEMV: y[oc] = W[oc][ic] @ x[ic]. For the MLA projection matrices
+// (q_proj, W_DKV, per-head W_UK/W_UV absorption, o_proj) kept dense.
+pub unsafe fn op_gemv_fp16(w_half: *const c_void, x_half: *const c_void, y_f32: *mut c_void, ic: i32, oc: i32) {
+    let c = ctx();
+    let cb = cur_cb();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.pl["gemv_fp16"]);
+    enc.set_buffer(0, Some(bufref(w_half)), 0);
+    enc.set_buffer(1, Some(bufref(x_half)), 0);
+    enc.set_buffer(2, Some(bufref(y_f32)), 0);
+    #[repr(C)]
+    struct P { ic: i32, oc: i32 }
+    let p = P { ic, oc };
+    enc.set_bytes(3, 8, &p as *const P as *const c_void);
+    let tpb = 256u64;
+    enc.dispatch_thread_groups(MTLSize::new((oc as u64 + tpb - 1)/tpb, 1, 1), MTLSize::new(tpb, 1, 1));
+    enc.end_encoding();
+}
+
+// MLA decode attention op (device buffers), twin of the CUDA op_mla_attn.
+pub unsafe fn op_mla_attn(aq: *const c_void, qr: *const c_void, ckv: *const c_void, kr: *const c_void, outl: *mut c_void,
+                          n_heads: i32, d_c: i32, d_rope: i32, seqlen: i32, scale: f32) {
+    let c = ctx();
+    let cb = cur_cb();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.pl["mla_attn"]);
+    enc.set_buffer(0, Some(bufref(aq)), 0);
+    enc.set_buffer(1, Some(bufref(qr)), 0);
+    enc.set_buffer(2, Some(bufref(ckv)), 0);
+    enc.set_buffer(3, Some(bufref(kr)), 0);
+    enc.set_buffer(4, Some(bufref(outl)), 0);
+    #[repr(C)]
+    struct P { n_heads: i32, d_c: i32, d_rope: i32, seqlen: i32, scale: f32 }
+    let p = P { n_heads, d_c, d_rope, seqlen, scale };
+    enc.set_bytes(5, 20, &p as *const P as *const c_void);
+    enc.set_threadgroup_memory_length(0, tg(d_c as usize*4));
+    enc.set_threadgroup_memory_length(1, tg(seqlen as usize*4));
+    enc.dispatch_thread_groups(MTLSize::new(n_heads as u64,1,1), MTLSize::new(d_c as u64,1,1));
+    enc.end_encoding();
+}

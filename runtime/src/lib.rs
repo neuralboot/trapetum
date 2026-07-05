@@ -55,8 +55,10 @@ mod backend {
         pub fn op_rmsnorm_m(x_half: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32, m: i32);
         pub fn op_rope_m(x_half: *mut c_void, base: i32, n_heads: i32, head_dim: i32, inv_freq: *const c_void, m: i32);
         pub fn op_cache_append_m(cache_half: *mut c_void, src_half: *const c_void, base: i32, dim: i32, m: i32);
-pub fn op_saxpy(acc_f32: *mut c_void, y_f32: *const c_void, alpha: f32, n: i32);
-                pub fn op_attn_m(
+        pub fn op_saxpy(acc_f32: *mut c_void, y_f32: *const c_void, alpha: f32, n: i32);
+        pub fn op_gemv_fp16(w_half: *const c_void, x_half: *const c_void, y_f32: *mut c_void, ic: i32, oc: i32);
+        pub fn op_mla_attn(q_half: *const c_void, qr_half: *const c_void, ckv_half: *const c_void, kr_half: *const c_void, out_half: *mut c_void, n_heads: i32, d_c: i32, d_rope: i32, seqlen: i32, scale: f32);
+        pub fn op_attn_m(
             q_half: *const c_void,
             ck_half: *const c_void,
             cv_half: *const c_void,
@@ -1634,4 +1636,227 @@ pub fn check_moe_offload() -> (f64, usize, usize, usize) {
         for i in 0..hidden { let den=(a[i] as f64).abs().max(1e-3); worst=worst.max(((a[i]-b[i]) as f64).abs()/den); }
     }
     (worst, cap, n_experts, off.uploads)
+}
+
+/// Dense fp16 GEMV: `y = W x` (W is `[oc][ic]` fp16). `saxpy`-free helper for the MLA
+/// projection matrices, which are small and kept dense rather than codebook-quantized.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn gemv_fp16(w: &DevHalf, x: &DevHalf, y: &mut DevF32, ic: usize, oc: usize) {
+    assert_eq!(w.n, ic*oc); assert_eq!(x.n, ic); assert_eq!(y.n, oc);
+    unsafe { op_gemv_fp16(w.ptr, x.ptr, y.ptr, ic as i32, oc as i32) };
+}
+
+/// A dense fp16 linear `y = W x`, weights resident on the GPU (`[oc][ic]` row-major).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct DenseLinear { w: DevHalf, ic: usize, oc: usize }
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl DenseLinear {
+    pub fn new(w_rowmajor: &[f32], ic: usize, oc: usize) -> Self {
+        assert_eq!(w_rowmajor.len(), ic*oc);
+        Self { w: DevHalf::from_host(w_rowmajor), ic, oc }
+    }
+    pub fn forward_into(&self, x: &DevHalf, y: &mut DevF32) { gemv_fp16(&self.w, x, y, self.ic, self.oc); }
+    pub fn oc(&self) -> usize { self.oc }
+}
+
+/// MLA (DeepSeek) decode attention on-device: `out_latent[h] = softmax(absorbed_q[h]·c_KV +
+/// q_R[h]·k_R) · c_KV`. Inputs/outputs are device fp16; a W_UV GEMM turns out_latent into
+/// per-head values. See the `mla_attn` kernel.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+#[allow(clippy::too_many_arguments)]
+pub fn mla_attention(aq: &DevHalf, qr: &DevHalf, ckv: &DevHalf, kr: &DevHalf, out: &mut DevHalf,
+                     n_heads: usize, d_c: usize, d_rope: usize, seqlen: usize, scale: f32) {
+    unsafe { op_mla_attn(aq.ptr, qr.ptr, ckv.ptr, kr.ptr, out.ptr, n_heads as i32, d_c as i32, d_rope as i32, seqlen as i32, scale) };
+}
+
+/// A DeepSeek MLA (Multi-head Latent Attention) decode block. q_lora_rank=0 variant
+/// (DeepSeek-V2-Lite): q_proj is a single dense. The KV cache stores only the shared
+/// low-rank latent c_KV (d_c) + decoupled rope key k_R (d_rope) per token. Uses the
+/// validated `mla_attn` kernel with absorbed queries; the small projection matrices are
+/// dense fp16. Correctness-first: the per-head absorption (W_UK/W_UV) + rope + splits run
+/// on the host, the heavy projections + attention on the GPU. Solves the attention wall.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct MlaAttn {
+    q_proj: DenseLinear,
+    kv_a: DenseLinear,
+    o_proj: DenseLinear,
+    kv_a_norm: Vec<f32>,          // [d_c]
+    kv_b: Vec<f32>,               // [n_heads*(nope+v_head_dim)][d_c]  (W_UK ++ W_UV per head)
+    inv_freq: Vec<f32>,           // [d_rope/2]
+    cache_ckv: DevHalf,           // [max_seq][d_c]
+    cache_kr: DevHalf,            // [max_seq][d_rope]
+    n_heads: usize, d_c: usize, d_rope: usize, nope: usize, v_head_dim: usize, hidden: usize,
+    eps: f32,
+    aq_dev: DevHalf, qr_dev: DevHalf, outl_dev: DevHalf,
+    ckv_h: DevHalf, kr_h: DevHalf,
+    qf: DevF32, kvf: DevF32, attn_dev: DevHalf, o_out: DevF32,
+    pub last_attn: Vec<f32>,      // pre-o_proj per-head values (for validation)
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl MlaAttn {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(hidden: usize, n_heads: usize, d_c: usize, d_rope: usize, nope: usize, v_head_dim: usize,
+               max_seq: usize, eps: f32, q_w: &[f32], kv_a_w: &[f32], kv_a_norm: &[f32], kv_b: &[f32],
+               o_w: &[f32], inv_freq: &[f32]) -> Self {
+        let qdim = n_heads*(nope+d_rope);
+        Self {
+            q_proj: DenseLinear::new(q_w, hidden, qdim),
+            kv_a: DenseLinear::new(kv_a_w, hidden, d_c + d_rope),
+            o_proj: DenseLinear::new(o_w, n_heads*v_head_dim, hidden),
+            kv_a_norm: kv_a_norm.to_vec(), kv_b: kv_b.to_vec(), inv_freq: inv_freq.to_vec(),
+            cache_ckv: DevHalf::zeros(max_seq*d_c), cache_kr: DevHalf::zeros(max_seq*d_rope),
+            n_heads, d_c, d_rope, nope, v_head_dim, hidden, eps,
+            aq_dev: DevHalf::zeros(n_heads*d_c), qr_dev: DevHalf::zeros(n_heads*d_rope),
+            outl_dev: DevHalf::zeros(n_heads*d_c),
+            ckv_h: DevHalf::zeros(d_c), kr_h: DevHalf::zeros(d_rope),
+            qf: DevF32::zeros(qdim), kvf: DevF32::zeros(d_c + d_rope),
+            attn_dev: DevHalf::zeros(n_heads*v_head_dim), o_out: DevF32::zeros(hidden),
+            last_attn: vec![0f32; n_heads*v_head_dim],
+        }
+    }
+
+    fn rope(&self, v: &mut [f32], pos: usize) {
+        let half = self.d_rope/2;
+        for d in 0..half {
+            let ang = pos as f32 * self.inv_freq[d];
+            let (c, s) = (ang.cos(), ang.sin());
+            let (x0, x1) = (v[d], v[d+half]);
+            v[d] = x0*c - x1*s; v[d+half] = x1*c + x0*s;
+        }
+    }
+
+    /// `h_normed` = RMSNorm(h). Returns the attention output (hidden,), to be residual-added.
+    pub fn forward(&mut self, h_normed: &DevHalf, pos: usize) -> &DevF32 {
+        let (nh, dc, dr, nope, vhd) = (self.n_heads, self.d_c, self.d_rope, self.nope, self.v_head_dim);
+        self.q_proj.forward_into(h_normed, &mut self.qf);
+        self.kv_a.forward_into(h_normed, &mut self.kvf);
+        let q = self.qf.to_host();
+        let kv = self.kvf.to_host();
+        // latent c_KV: RMSNorm; decoupled rope key
+        let mut ckv: Vec<f32> = kv[..dc].to_vec();
+        let ss: f32 = ckv.iter().map(|x| x*x).sum::<f32>() / dc as f32;
+        let sc = 1.0/(ss + self.eps).sqrt();
+        for (i, x) in ckv.iter_mut().enumerate() { *x = *x * sc * self.kv_a_norm[i]; }
+        let mut krope: Vec<f32> = kv[dc..dc+dr].to_vec();
+        self.rope(&mut krope, pos);
+        // per-head absorbed query + rope query
+        let mut aq = vec![0f32; nh*dc];
+        let mut qr = vec![0f32; nh*dr];
+        let hd = nope + dr;
+        for h in 0..nh {
+            let mut qn = q[h*hd..h*hd+nope].to_vec();
+            let mut qrope = q[h*hd+nope..h*hd+hd].to_vec();
+            self.rope(&mut qrope, pos);
+            qr[h*dr..(h+1)*dr].copy_from_slice(&qrope);
+            // absorbed_q[h][j] = sum_i qn[i] * W_UK[h][i][j] ; W_UK[h] rows = kv_b[h*(nope+vhd)+i]
+            let base = h*(nope+vhd);
+            for j in 0..dc {
+                let mut acc = 0f32;
+                for i in 0..nope { acc += qn[i] * self.kv_b[(base+i)*dc + j]; }
+                aq[h*dc + j] = acc;
+            }
+            let _ = &mut qn;
+        }
+        // upload + append cache
+        self.aq_dev.upload(&aq); self.qr_dev.upload(&qr);
+        self.ckv_h.upload(&ckv); self.kr_h.upload(&krope);
+        unsafe {
+            op_cache_append(self.cache_ckv.ptr, self.ckv_h.ptr, pos as i32, dc as i32);
+            op_cache_append(self.cache_kr.ptr, self.kr_h.ptr, pos as i32, dr as i32);
+        }
+        // MLA attention on device
+        let scale = 1.0/((nope+dr) as f32).sqrt();
+        mla_attention(&self.aq_dev, &self.qr_dev, &self.cache_ckv, &self.cache_kr, &mut self.outl_dev, nh, dc, dr, pos+1, scale);
+        let outl = self.outl_dev.to_host();
+        // per-head value: attn[h][v] = sum_j outl[h][j] * W_UV[h][v][j] ; W_UV[h] rows = kv_b[h*(nope+vhd)+nope+v]
+        for h in 0..nh {
+            let base = h*(nope+vhd) + nope;
+            for v in 0..vhd {
+                let mut acc = 0f32;
+                for j in 0..dc { acc += outl[h*dc + j] * self.kv_b[(base+v)*dc + j]; }
+                self.last_attn[h*vhd + v] = acc;
+            }
+        }
+        self.attn_dev.upload(&self.last_attn);
+        self.o_proj.forward_into(&self.attn_dev, &mut self.o_out);
+        &self.o_out
+    }
+}
+
+/// Validate the full MLA attention block (absorbed kernel path) vs a full-reconstruction
+/// CPU reference (rebuild per-head K/V from the latent, standard attention). Lossless up
+/// to fp16 noise. Returns worst rel err over the per-head attention output.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn check_mla_block() -> f64 {
+    let (hidden, nh, dc, dr, nope, vhd) = (512usize, 4usize, 128usize, 32usize, 64usize, 64usize);
+    let eps = 1e-6f32; let max_seq = 24usize; let tpos = 6usize;
+    let mut s = 0xDEE5EE0Fu64;
+    // realistic (small) weight magnitudes: the absorbed query folds W_UK over `nope` terms,
+    // so large synthetic weights blow up fp16 precision (real model weights are ~0.02).
+    let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0)*0.03 };
+    let qdim = nh*(nope+dr);
+    let q_w: Vec<f32> = (0..qdim*hidden).map(|_| r()).collect();
+    let kv_a_w: Vec<f32> = (0..(dc+dr)*hidden).map(|_| r()).collect();
+    let kv_a_norm: Vec<f32> = (0..dc).map(|_| r()*0.1+1.0).collect();
+    let kv_b: Vec<f32> = (0..nh*(nope+vhd)*dc).map(|_| r()).collect();
+    let o_w: Vec<f32> = (0..hidden*(nh*vhd)).map(|_| r()).collect();
+    let inv_freq: Vec<f32> = (0..dr/2).map(|d| 10000f32.powf(-2.0*d as f32/dr as f32)).collect();
+    let mut mla = MlaAttn::new(hidden, nh, dc, dr, nope, vhd, max_seq, eps, &q_w, &kv_a_w, &kv_a_norm, &kv_b, &o_w, &inv_freq);
+    // host reference state: cache of (ckv, krope) per position
+    let mut cache_ckv: Vec<Vec<f32>> = Vec::new();
+    let mut cache_kr: Vec<Vec<f32>> = Vec::new();
+    let rope = |v: &mut [f32], pos: usize| {
+        let half = dr/2;
+        for d in 0..half { let a = pos as f32*inv_freq[d]; let (c,s)=(a.cos(),a.sin());
+            let (x0,x1)=(v[d],v[d+half]); v[d]=x0*c-x1*s; v[d+half]=x1*c+x0*s; }
+    };
+    let mv = |w: &[f32], x: &[f32], ic: usize, oc: usize| -> Vec<f32> {  // y[oc] = W[oc][ic] x
+        (0..oc).map(|o| (0..ic).map(|i| w[o*ic+i]*x[i]).sum()).collect()
+    };
+    let h16 = |v: f32| half::f16::from_f32(v).to_f32();
+    let mut worst = 0f64;
+    for pos in 0..tpos {
+        let hn: Vec<f32> = (0..hidden).map(|_| r()).collect();
+        // block
+        let mut hd = DevHalf::from_host(&hn);
+        mla.forward(&hd, pos);
+        let got = mla.last_attn.clone();
+        let _ = &mut hd;
+        // reference (host, f32 but round key parts to fp16 to match the kernel's inputs)
+        let q = mv(&q_w, &hn, hidden, qdim);
+        let kv = mv(&kv_a_w, &hn, hidden, dc+dr);
+        let mut ckv: Vec<f32> = kv[..dc].to_vec();
+        let ss: f32 = ckv.iter().map(|x| x*x).sum::<f32>()/dc as f32; let scn = 1.0/(ss+eps).sqrt();
+        for (i,x) in ckv.iter_mut().enumerate() { *x = h16(*x*scn*kv_a_norm[i]); }
+        let mut krope: Vec<f32> = kv[dc..dc+dr].to_vec(); rope(&mut krope, pos);
+        for x in krope.iter_mut() { *x = h16(*x); }
+        cache_ckv.push(ckv.clone()); cache_kr.push(krope.clone());
+        let seqlen = pos+1; let scale = 1.0/((nope+dr) as f32).sqrt();
+        let hdw = nope+dr;
+        for h in 0..nh {
+            let qn: Vec<f32> = (0..nope).map(|i| h16(q[h*hdw+i])).collect();
+            let mut qrope: Vec<f32> = (0..dr).map(|i| q[h*hdw+nope+i]).collect(); rope(&mut qrope, pos);
+            for x in qrope.iter_mut() { *x = h16(*x); }
+            let base = h*(nope+vhd);
+            let mut sc = vec![0f32; seqlen];
+            for t in 0..seqlen {
+                // k_nope[h][t] = W_UK[h] @ ckv[t] ; W_UK[h] rows = kv_b[(base+i)*dc..]
+                let mut s_nope = 0f32;
+                for i in 0..nope { let kni: f32 = (0..dc).map(|j| h16(kv_b[(base+i)*dc+j])*cache_ckv[t][j]).sum(); s_nope += qn[i]*h16(kni); }
+                let s_rope: f32 = (0..dr).map(|i| qrope[i]*cache_kr[t][i]).sum();
+                sc[t] = (s_nope + s_rope)*scale;
+            }
+            let mx = sc.iter().cloned().fold(f32::MIN,f32::max);
+            let mut sum=0f32; for x in sc.iter_mut(){*x=(*x-mx).exp();sum+=*x;} for x in sc.iter_mut(){*x/=sum;}
+            for v in 0..vhd {
+                // attn[h][v] = sum_t p_t * (W_UV[h][v] @ ckv[t]) ; W_UV[h] rows = kv_b[(base+nope+v)*dc..]
+                let mut acc=0f32;
+                for t in 0..seqlen { let vv: f32 = (0..dc).map(|j| h16(kv_b[(base+nope+v)*dc+j])*cache_ckv[t][j]).sum(); acc += sc[t]*h16(vv); }
+                let g = got[h*vhd+v]; let den=(acc as f64).abs().max(1e-2);
+                worst = worst.max(((g-acc) as f64).abs()/den);
+            }
+        }
+    }
+    worst
 }

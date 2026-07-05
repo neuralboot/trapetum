@@ -296,6 +296,14 @@ __global__ void saxpy_k(float* __restrict__ acc, const float* __restrict__ y, fl
     if (i < n) acc[i] += alpha * y[i];
 }
 
+__global__ void gemv_fp16_k(const __half* __restrict__ W, const __half* __restrict__ X, float* __restrict__ Y, int ic, int oc) {
+    int o = blockIdx.x*blockDim.x + threadIdx.x;
+    if (o >= oc) return;
+    float acc = 0.f; const __half* row = W + (size_t)o*ic;
+    for (int i = 0; i < ic; i++) acc += __half2float(row[i]) * __half2float(X[i]);
+    Y[o] = acc;
+}
+
 // One dedicated stream for all device ops, so the decode chain can be CUDA-graph
 // captured (launches MUST be on the captured stream, else they are not recorded).
 static cudaStream_t g_stream = 0;
@@ -453,6 +461,11 @@ void op_mla_attn(const void* aq, const void* qr, const void* ckv, const void* kr
 void op_saxpy(void* acc_f32, const void* y_f32, float alpha, int n) {
     ensure_stream();
     saxpy_k<<<(n+255)/256, 256, 0, g_stream>>>((float*)acc_f32, (const float*)y_f32, alpha, n);
+}
+
+void op_gemv_fp16(const void* w_half, const void* x_half, void* y_f32, int ic, int oc) {
+    ensure_stream();
+    gemv_fp16_k<<<(oc+255)/256, 256, 0, g_stream>>>((const __half*)w_half, (const __half*)x_half, (float*)y_f32, ic, oc);
 }
 
 void dev_sync() { cudaDeviceSynchronize(); }
