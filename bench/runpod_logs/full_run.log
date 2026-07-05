@@ -1,0 +1,528 @@
+### env ###
+ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
+torchaudio 2.2.0 requires torch==2.2.0, but you have torch 2.4.0+cu121 which is incompatible.
+torchvision 0.17.0 requires torch==2.2.0, but you have torch 2.4.0+cu121 which is incompatible.
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+[notice] A new release of pip is available: 24.0 -> 26.1.2
+[notice] To update, run: python -m pip install --upgrade pip
+### build CUDA runtime + bins ###
+    Updating crates.io index
+     Locking 87 packages to latest compatible versions
+      Adding aho-corasick v1.1.4
+      Adding ascii v1.1.0
+      Adding base64 v0.13.1
+      Adding bitflags v1.3.2
+      Adding bitflags v2.13.0
+      Adding block v0.1.6
+      Adding cc v1.2.65
+      Adding chunked_transfer v1.5.0
+      Adding core-foundation v0.9.4
+      Adding core-foundation-sys v0.8.7
+      Adding core-graphics-types v0.1.3
+      Adding crossbeam-deque v0.8.6
+      Adding crossbeam-epoch v0.9.18
+      Adding crossbeam-utils v0.8.21
+      Adding darling v0.20.11
+      Adding darling_core v0.20.11
+      Adding darling_macro v0.20.11
+      Adding derive_builder v0.20.2
+      Adding derive_builder_core v0.20.2
+      Adding derive_builder_macro v0.20.2
+      Adding either v1.16.0
+      Adding equivalent v1.0.2
+      Adding esaxx-rs v0.1.10
+      Adding find-msvc-tools v0.1.9
+      Adding fnv v1.0.7
+      Adding foreign-types v0.5.0
+      Adding foreign-types-macros v0.2.3
+      Adding foreign-types-shared v0.3.1
+      Adding getrandom v0.2.17 (available: v0.4.3)
+      Adding hashbrown v0.17.1
+      Adding httpdate v1.0.3
+      Adding ident_case v1.0.1
+      Adding indexmap v2.14.0
+      Adding itertools v0.11.0
+      Adding itertools v0.12.1
+      Adding itoa v1.0.18
+      Adding lazy_static v1.5.0
+      Adding libc v0.2.186
+      Adding log v0.4.33
+      Adding macro_rules_attribute v0.2.2
+      Adding macro_rules_attribute-proc_macro v0.2.2
+      Adding malloc_buf v0.0.6
+      Adding memchr v2.8.2
+      Adding metal v0.29.0 (available: v0.33.0)
+      Adding minimal-lexical v0.2.1
+      Adding monostate v0.1.18
+      Adding monostate-impl v0.1.18
+      Adding nom v7.1.3
+      Adding objc v0.2.7
+      Adding once_cell v1.21.4
+      Adding onig v6.5.3
+      Adding onig_sys v69.9.3
+      Adding paste v1.0.15
+      Adding pkg-config v0.3.33
+      Adding ppv-lite86 v0.2.21
+      Adding rand v0.8.6
+      Adding rand_chacha v0.3.1
+      Adding rand_core v0.6.4
+      Adding rayon v1.12.0
+      Adding rayon-cond v0.3.0
+      Adding rayon-core v1.13.0
+      Adding regex v1.12.4
+      Adding regex-automata v0.4.14
+      Adding regex-syntax v0.8.11
+      Adding serde v1.0.228
+      Adding serde_core v1.0.228
+      Adding serde_derive v1.0.228
+      Adding serde_json v1.0.150
+      Adding serde_spanned v0.6.9
+      Adding shlex v2.0.1
+      Adding smallvec v1.15.2
+      Adding spm_precompiled v0.1.4
+      Adding strsim v0.11.1
+      Adding thiserror v1.0.69
+      Adding thiserror-impl v1.0.69
+      Adding tiny_http v0.12.0
+      Adding tokenizers v0.20.4 (available: v0.23.1)
+      Adding toml v0.8.23 (available: v1.1.2+spec-1.1.0)
+      Adding toml_datetime v0.6.11
+      Adding toml_edit v0.22.27
+      Adding toml_write v0.1.2
+      Adding unicode-normalization-alignments v0.1.12
+      Adding unicode-segmentation v1.13.3
+      Adding unicode_categories v0.1.1
+      Adding wasi v0.11.1+wasi-snapshot-preview1
+      Adding winnow v0.7.15
+      Adding zmij v1.0.21
+ Downloading crates ...
+  Downloaded cfg-if v1.0.4
+  Downloaded ascii v1.1.0
+  Downloaded httpdate v1.0.3
+  Downloaded equivalent v1.0.2
+  Downloaded itoa v1.0.18
+  Downloaded darling_macro v0.20.11
+  Downloaded ident_case v1.0.1
+  Downloaded lazy_static v1.5.0
+  Downloaded fnv v1.0.7
+  Downloaded rayon-cond v0.3.0
+  Downloaded rand_chacha v0.3.1
+  Downloaded derive_builder_macro v0.20.2
+  Downloaded chunked_transfer v1.5.0
+  Downloaded toml_datetime v0.6.11
+  Downloaded monostate v0.1.18
+  Downloaded toml_write v0.1.2
+  Downloaded macro_rules_attribute-proc_macro v0.2.2
+  Downloaded macro_rules_attribute v0.2.2
+  Downloaded serde_spanned v0.6.9
+  Downloaded monostate-impl v0.1.18
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded rand_core v0.6.4
+  Downloaded zmij v1.0.21
+  Downloaded paste v1.0.15
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded toml v0.8.23
+  Downloaded base64 v0.13.1
+  Downloaded getrandom v0.2.17
+  Downloaded tiny_http v0.12.0
+  Downloaded unicode-ident v1.0.24
+  Downloaded unicode_categories v0.1.1
+  Downloaded zerocopy-derive v0.8.52
+  Downloaded unicode-segmentation v1.13.3
+  Downloaded itertools v0.11.0
+  Downloaded nom v7.1.3
+  Downloaded tokenizers v0.20.4
+  Downloaded winnow v0.7.15
+  Downloaded esaxx-rs v0.1.10
+  Downloaded rayon v1.12.0
+  Downloaded serde_json v1.0.150
+  Downloaded regex v1.12.4
+  Downloaded zerocopy v0.8.52
+  Downloaded syn v2.0.118
+  Downloaded hashbrown v0.17.1
+  Downloaded itertools v0.12.1
+  Downloaded aho-corasick v1.1.4
+  Downloaded rand v0.8.6
+  Downloaded minimal-lexical v0.2.1
+  Downloaded regex-syntax v0.8.11
+  Downloaded memchr v2.8.2
+  Downloaded indexmap v2.14.0
+  Downloaded unicode-normalization-alignments v0.1.12
+  Downloaded serde v1.0.228
+  Downloaded rayon-core v1.13.0
+  Downloaded toml_edit v0.22.27
+  Downloaded spm_precompiled v0.1.4
+  Downloaded log v0.4.33
+  Downloaded darling_core v0.20.11
+  Downloaded regex-automata v0.4.14
+  Downloaded darling v0.20.11
+  Downloaded onig_sys v69.9.3
+  Downloaded cc v1.2.65
+  Downloaded serde_derive v1.0.228
+  Downloaded serde_core v1.0.228
+  Downloaded proc-macro2 v1.0.106
+  Downloaded once_cell v1.21.4
+  Downloaded half v2.7.1
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded smallvec v1.15.2
+  Downloaded either v1.16.0
+  Downloaded libc v0.2.186
+  Downloaded derive_builder v0.20.2
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded thiserror-impl v1.0.69
+  Downloaded thiserror v1.0.69
+  Downloaded strsim v0.11.1
+  Downloaded shlex v2.0.1
+  Downloaded quote v1.0.46
+  Downloaded pkg-config v0.3.33
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded bitflags v2.13.0
+  Downloaded onig v6.5.3
+  Downloaded derive_builder_core v0.20.2
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.46
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling crossbeam-utils v0.8.21
+   Compiling memchr v2.8.2
+   Compiling fnv v1.0.7
+   Compiling strsim v0.11.1
+   Compiling zerocopy v0.8.52
+   Compiling libc v0.2.186
+   Compiling ident_case v1.0.1
+   Compiling cfg-if v1.0.4
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v2.0.1
+   Compiling pkg-config v0.3.33
+   Compiling either v1.16.0
+   Compiling cc v1.2.65
+   Compiling rayon-core v1.13.0
+   Compiling paste v1.0.15
+   Compiling zmij v1.0.21
+   Compiling thiserror v1.0.69
+   Compiling esaxx-rs v0.1.10
+   Compiling hashbrown v0.17.1
+   Compiling minimal-lexical v0.2.1
+   Compiling serde_json v1.0.150
+   Compiling equivalent v1.0.2
+   Compiling regex-syntax v0.8.11
+   Compiling aho-corasick v1.1.4
+   Compiling nom v7.1.3
+   Compiling itertools v0.11.0
+   Compiling crossbeam-epoch v0.9.18
+   Compiling winnow v0.7.15
+   Compiling syn v2.0.118
+   Compiling indexmap v2.14.0
+   Compiling itoa v1.0.18
+   Compiling getrandom v0.2.17
+   Compiling crossbeam-deque v0.8.6
+   Compiling once_cell v1.21.4
+   Compiling bitflags v2.13.0
+   Compiling rand_core v0.6.4
+   Compiling macro_rules_attribute-proc_macro v0.2.2
+   Compiling onig_sys v69.9.3
+   Compiling toml_write v0.1.2
+   Compiling log v0.4.33
+   Compiling smallvec v1.15.2
+   Compiling unicode-segmentation v1.13.3
+   Compiling base64 v0.13.1
+   Compiling macro_rules_attribute v0.2.2
+   Compiling rayon v1.12.0
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling itertools v0.12.1
+   Compiling regex-automata v0.4.14
+   Compiling ascii v1.1.0
+   Compiling unicode_categories v0.1.1
+   Compiling trapetum v0.1.0 (/workspace/trapetum/runtime)
+   Compiling httpdate v1.0.3
+   Compiling chunked_transfer v1.5.0
+   Compiling lazy_static v1.5.0
+   Compiling tiny_http v0.12.0
+   Compiling darling_core v0.20.11
+   Compiling rayon-cond v0.3.0
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.52
+   Compiling thiserror-impl v1.0.69
+   Compiling monostate-impl v0.1.18
+   Compiling regex v1.12.4
+   Compiling monostate v0.1.18
+   Compiling darling_macro v0.20.11
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+   Compiling derive_builder_macro v0.20.2
+   Compiling derive_builder v0.20.2
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling spm_precompiled v0.1.4
+   Compiling toml_edit v0.22.27
+   Compiling toml v0.8.23
+   Compiling ppv-lite86 v0.2.21
+   Compiling half v2.7.1
+   Compiling rand_chacha v0.3.1
+   Compiling rand v0.8.6
+   Compiling onig v6.5.3
+   Compiling tokenizers v0.20.4
+warning: unnecessary parentheses around block return value
+   --> src/lib.rs:926:70
+    |
+926 |     let mut nx = || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; (((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+    |                                                                      ^                                            ^
+    |
+    = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+    |
+926 -     let mut nx = || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; (((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+926 +     let mut nx = || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; ((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+    |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:1033:75
+     |
+1033 |     let mut nx = move || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; (((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+     |                                                                           ^                                            ^
+     |
+help: remove these parentheses
+     |
+1033 -     let mut nx = move || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; (((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+1033 +     let mut nx = move || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; ((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+     |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:1036:91
+     |
+1036 | ... || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) } };
+     |                                             ^                                          ^
+     |
+help: remove these parentheses
+     |
+1036 -         let mut r = { let mut s = 0x5EEDu64; move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) } };
+1036 +         let mut r = { let mut s = 0x5EEDu64; move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 } };
+     |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:1091:91
+     |
+1091 | ... || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) } };
+     |                                             ^                                          ^
+     |
+help: remove these parentheses
+     |
+1091 -         let mut r = { let mut s = 0x5EEDu64; move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) } };
+1091 +         let mut r = { let mut s = 0x5EEDu64; move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 } };
+     |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:1194:91
+     |
+1194 | ... || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) } };
+     |                                             ^                                          ^
+     |
+help: remove these parentheses
+     |
+1194 -         let mut r = { let mut s = 0x5EEDu64; move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) } };
+1194 +         let mut r = { let mut s = 0x5EEDu64; move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 } };
+     |
+
+warning: `trapetum` (lib) generated 5 warnings (run `cargo fix --lib -p trapetum` to apply 5 suggestions)
+    Finished `release` profile [optimized] target(s) in 46.60s
+### (#1,#3,#4) LOSSLESS validation of batched forward + K>1 + confidence on real CUDA ###
+== speculative decode: lossless + tokens/forward, K=1..3 ==
+  K=1  lossless(oracle=true, adversarial=true) OK  |  perfect: 21 toks in 11 forwards = 1.91 tok/fwd  (ceiling 2)
+  K=2  lossless(oracle=true, adversarial=true) OK  |  perfect: 21 toks in 7 forwards = 3.00 tok/fwd  (ceiling 3)
+  K=3  lossless(oracle=true, adversarial=true) OK  |  perfect: 21 toks in 6 forwards = 3.50 tok/fwd  (ceiling 4)
+
+LOSSLESS at K=1..3. Bigger K = more tokens per target forward (ceiling K+1),
+bounded by gemm_mtile's validated M<=4 range (so K<=3).
+
+== confidence-scheduled decode (dynamic K, DSpark-style) ==
+  lossless(high-conf=true, mixed=true) OK  |  high-conf: 21 toks in 6 forwards, avg K=3.00
+### compress target + drafters ###
+loading NousResearch/Llama-2-7b-hf
+Downloading shards:   0%|          | 0/2 [00:00<?, ?it/s]Downloading shards:  50%|█████     | 1/2 [00:37<00:37, 37.99s/it]Downloading shards: 100%|██████████| 2/2 [01:02<00:00, 30.17s/it]Downloading shards: 100%|██████████| 2/2 [01:02<00:00, 31.34s/it]
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:02<00:02,  2.52s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:03<00:00,  1.51s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:03<00:00,  1.66s/it]
+config: L=32 hidden=4096 heads=32/32 hd=128 inter=11008 vocab=32000
+rope: theta=10000.0 type=None has_bias=0 inv_freq[64]
+  layer 1/32 quantized
+  layer 2/32 quantized
+  layer 3/32 quantized
+  layer 4/32 quantized
+  layer 5/32 quantized
+  layer 6/32 quantized
+  layer 7/32 quantized
+  layer 8/32 quantized
+  layer 9/32 quantized
+  layer 10/32 quantized
+  layer 11/32 quantized
+  layer 12/32 quantized
+  layer 13/32 quantized
+  layer 14/32 quantized
+  layer 15/32 quantized
+  layer 16/32 quantized
+  layer 17/32 quantized
+  layer 18/32 quantized
+  layer 19/32 quantized
+  layer 20/32 quantized
+  layer 21/32 quantized
+  layer 22/32 quantized
+  layer 23/32 quantized
+  layer 24/32 quantized
+  layer 25/32 quantized
+  layer 26/32 quantized
+  layer 27/32 quantized
+  layer 28/32 quantized
+  layer 29/32 quantized
+  layer 30/32 quantized
+  layer 31/32 quantized
+  layer 32/32 quantized
+wrote /workspace/cbk/target/model.cbk 3486 MB
+prompt: 'The capital of France is' -> [[1, 450, 7483, 310, 3444, 338]]
+We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)
+/usr/local/lib/python3.10/dist-packages/transformers/generation/configuration_utils.py:567: UserWarning: `do_sample` is set to `False`. However, `temperature` is set to `0.9` -- this flag is only used in sample-based generation modes. You should set `do_sample=True` or unset `temperature`.
+  warnings.warn(
+/usr/local/lib/python3.10/dist-packages/transformers/generation/configuration_utils.py:572: UserWarning: `do_sample` is set to `False`. However, `top_p` is set to `0.6` -- this flag is only used in sample-based generation modes. You should set `do_sample=True` or unset `top_p`.
+  warnings.warn(
+continuation: ', of course, Paris.óg. The 2018 FIFA World'
+wrote prompt.bin ref.bin cont.bin
+loading TinyLlama/TinyLlama-1.1B-Chat-v1.0
+config: L=22 hidden=2048 heads=32/4 hd=64 inter=5632 vocab=32000
+rope: theta=10000.0 type=None has_bias=0 inv_freq[32]
+  layer 1/22 quantized
+  layer 2/22 quantized
+  layer 3/22 quantized
+  layer 4/22 quantized
+  layer 5/22 quantized
+  layer 6/22 quantized
+  layer 7/22 quantized
+  layer 8/22 quantized
+  layer 9/22 quantized
+  layer 10/22 quantized
+  layer 11/22 quantized
+  layer 12/22 quantized
+  layer 13/22 quantized
+  layer 14/22 quantized
+  layer 15/22 quantized
+  layer 16/22 quantized
+  layer 17/22 quantized
+  layer 18/22 quantized
+  layer 19/22 quantized
+  layer 20/22 quantized
+  layer 21/22 quantized
+  layer 22/22 quantized
+wrote /workspace/cbk/draft1/model.cbk 644 MB
+prompt: 'The capital of France is' -> [[1, 450, 7483, 310, 3444, 338]]
+We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)
+continuation: 'Paris. The capital of France is Paris. The capital of France is Paris.'
+wrote prompt.bin ref.bin cont.bin
+loading JackFram/llama-160m
+config: L=12 hidden=768 heads=12/12 hd=64 inter=3072 vocab=32000
+rope: theta=10000.0 type=None has_bias=0 inv_freq[32]
+  layer 1/12 quantized
+  layer 2/12 quantized
+  layer 3/12 quantized
+  layer 4/12 quantized
+  layer 5/12 quantized
+  layer 6/12 quantized
+  layer 7/12 quantized
+  layer 8/12 quantized
+  layer 9/12 quantized
+  layer 10/12 quantized
+  layer 11/12 quantized
+  layer 12/12 quantized
+wrote /workspace/cbk/draft2/model.cbk 121 MB
+prompt: 'The capital of France is' -> [[1, 450, 7483, 310, 3444, 338]]
+We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)
+continuation: 'Paris.\nThe capital of the United Kingdom is London.\nThe capital of'
+wrote prompt.bin ref.bin cont.bin
+### validate target reproduces HF ###
+loaded /workspace/cbk/target/model.cbk in 4.0s, vocab=32000, prompt=6 tokens
+logits rel err vs HF (worst over prompt): 7.11e-3
+top-1 agreement with HF                 : 6/6
+greedy continuation matches HF          : 16/16 tokens
+decode throughput                       : 7.027 ms/token  (142.3 tok/s)
+real model, pure Rust, on-device, no Python at runtime.
+OK
+### (#2) alpha + K-sweep: TinyLlama-1.1B drafter ###
+target=/workspace/cbk/target/model.cbk
+drafter=/workspace/cbk/draft1/model.cbk
+vocab=32000 prompt=6 tokens N=128
+
+=== speculative decode: measured ===
+acceptance alpha        : 0.734  (94/128)
+target latency          : 7.83 ms/token  (127.7 tok/s)
+drafter latency         : 3.18 ms/token  (314.1 tok/s)
+draft/target cost ratio : 0.407
+
+=== projected speedup by block size K (from measured alpha, ratio) ===
+  K=1  tokens/forward=1.73  speedup=1.23x
+  K=2  tokens/forward=2.27  speedup=1.25x
+  K=3  tokens/forward=2.67  speedup=1.20x
+optimal K = 2  ->  1.25x  (lossless; verify validated on CUDA via spec_check)
+### (#2) alpha + K-sweep: llama-160m drafter ###
+target=/workspace/cbk/target/model.cbk
+drafter=/workspace/cbk/draft2/model.cbk
+vocab=32000 prompt=6 tokens N=128
+
+=== speculative decode: measured ===
+acceptance alpha        : 0.648  (83/128)
+target latency          : 7.90 ms/token  (126.6 tok/s)
+drafter latency         : 1.50 ms/token  (664.7 tok/s)
+draft/target cost ratio : 0.190
+
+=== projected speedup by block size K (from measured alpha, ratio) ===
+  K=1  tokens/forward=1.65  speedup=1.38x
+  K=2  tokens/forward=2.07  speedup=1.50x
+  K=3  tokens/forward=2.34  speedup=1.49x
+optimal K = 2  ->  1.50x  (lossless; verify validated on CUDA via spec_check)
+### (#5) Pareto with aqlm-2bit baseline ###
+/usr/local/lib/python3.10/dist-packages/torch/utils/cpp_extension.py:1965: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+== fp16 ==
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:00<00:00,  7.87it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  8.80it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  8.63it/s]
+idle baseline: 55.3 W
+We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)
+{'method': 'fp16', 'bits': 16.0, 'gb': 13.476831232, 'ppl': None, 'tps': 37.38691272082213, 'jpt': 5.344949697856424, 'jpt_std': 0.3796307021451403, 'jpt_net': 3.8666338208708133, 'watts': 201.4405373677249, 'idle_w': 55.26966666666665}
+== codebook-4bit (ours) ==
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:00<00:00,  5.30it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  7.03it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  6.70it/s]
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:00<00:00,  5.88it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  7.39it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  7.10it/s]
+{'method': 'codebook-4bit', 'bits': 4.05, 'gb': 3.81, 'ppl': None, 'tps': 23.361855409682054, 'jpt': 4.496255608735628, 'jpt_std': 0.44123797230331385, 'jpt_net': 2.130447512698839, 'watts': 105.96694363554002, 'idle_w': 55.26966666666665}
+== aqlm-2bit (best-effort) ==
+`low_cpu_mem_usage` was None, now set to True since model is quantized.
+/usr/local/lib/python3.10/dist-packages/torch/utils/cpp_extension.py:1965: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+  warnings.warn(
+/usr/local/lib/python3.10/dist-packages/aqlm/inference_kernels/cuda_kernel.py:20: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("aqlm::code1x16_matmat")
+/usr/local/lib/python3.10/dist-packages/aqlm/inference_kernels/cuda_kernel.py:33: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("aqlm::code1x16_matmat_dequant")
+/usr/local/lib/python3.10/dist-packages/aqlm/inference_kernels/cuda_kernel.py:48: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("aqlm::code1x16_matmat_dequant_transposed")
+/usr/local/lib/python3.10/dist-packages/aqlm/inference_kernels/cuda_kernel.py:62: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("aqlm::code2x8_matmat")
+/usr/local/lib/python3.10/dist-packages/aqlm/inference_kernels/cuda_kernel.py:75: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("aqlm::code2x8_matmat_dequant")
+/usr/local/lib/python3.10/dist-packages/aqlm/inference_kernels/cuda_kernel.py:88: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("aqlm::code2x8_matmat_dequant_transposed")
+/usr/local/lib/python3.10/dist-packages/aqlm/inference_kernels/cuda_kernel.py:102: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("aqlm::code1x8_matmat")
+/usr/local/lib/python3.10/dist-packages/aqlm/inference_kernels/cuda_kernel.py:115: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("aqlm::code1x8_matmat_dequant")
+/usr/local/lib/python3.10/dist-packages/aqlm/inference_kernels/cuda_kernel.py:128: FutureWarning: `torch.library.impl_abstract` was renamed to `torch.library.register_fake`. Please use that instead; we will remove `torch.library.impl_abstract` in a future version of PyTorch.
+  @torch.library.impl_abstract("aqlm::code1x8_matmat_dequant_transposed")
+{'method': 'aqlm-2bit', 'bits': 2.0, 'gb': 2.148376576, 'ppl': None, 'tps': 19.427657154645345, 'jpt': 4.087428750939243, 'jpt_std': 0.0530773039205261, 'jpt_net': 1.2425326202984404, 'watts': 79.85344464450095, 'idle_w': 55.26966666666665}
+
+| method | bits | mem GB | PPL | tok/s | J/token (gross, +/-std) | J/token (net of idle) | gCO2/1k tok (FR/US) |
+|---|---|---|---|---|---|---|---|
+| fp16 | 16.00 | 13.48 | n/a | 37.4 | 5.34 +/- 0.38 | 3.87 | 0.074 / 0.59 |
+| codebook-4bit | 4.05 | 3.81 | n/a | 23.4 | 4.50 +/- 0.44 | 2.13 | 0.062 / 0.50 |
+| aqlm-2bit | 2.00 | 2.15 | n/a | 19.4 | 4.09 +/- 0.05 | 1.24 | 0.057 / 0.45 |
+
+NOTE J/token gross = trapezoidal integral of sampled GPU power / tokens, mean over 3 runs.
+J/token NET subtracts the idle baseline (55.3 W) so the figure is the ACTIVE decode energy.
+NOTE J/token is the measured primary axis. gCO2/1k-tok = J/token x grid intensity
+(FR ~50, US ~400 gCO2/kWh) -- a projection, not a measurement (RunPod grid mix unknown).
+Batch-1 decode; Marlin (uniform 4-bit) and batched throughput are TODO.
+### ALL DONE (items 1-5). ###
