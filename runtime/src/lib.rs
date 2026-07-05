@@ -56,7 +56,8 @@ mod backend {
         pub fn op_rope_m(x_half: *mut c_void, base: i32, n_heads: i32, head_dim: i32, inv_freq: *const c_void, m: i32);
         pub fn op_cache_append_m(cache_half: *mut c_void, src_half: *const c_void, base: i32, dim: i32, m: i32);
         pub fn op_saxpy(acc_f32: *mut c_void, y_f32: *const c_void, alpha: f32, n: i32);
-        pub fn op_gemv_fp16(w_half: *const c_void, x_half: *const c_void, y_f32: *mut c_void, ic: i32, oc: i32);
+pub fn op_gelu_mul(gate_f32: *const c_void, up_f32: *const c_void, out_half: *mut c_void, n: i32);
+                pub fn op_gemv_fp16(w_half: *const c_void, x_half: *const c_void, y_f32: *mut c_void, ic: i32, oc: i32);
         pub fn op_mla_attn(q_half: *const c_void, qr_half: *const c_void, ckv_half: *const c_void, kr_half: *const c_void, out_half: *mut c_void, n_heads: i32, d_c: i32, d_rope: i32, seqlen: i32, scale: f32);
         pub fn op_attn_m(
             q_half: *const c_void,
@@ -2025,4 +2026,11 @@ pub fn read_i32s(path: &str) -> Vec<i32> {
     let mut f = BufReader::new(File::open(path).unwrap());
     let mut buf = Vec::new(); f.read_to_end(&mut buf).unwrap();
     buf.chunks_exact(4).map(|c| i32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect()
+}
+
+/// GeGLU (Gemma): `out = gelu_tanh(gate) * up`, on-device.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn gelu_mul(gate: &DevF32, up: &DevF32, out: &mut DevHalf) {
+    assert_eq!(gate.n, up.n); assert_eq!(gate.n, out.n);
+    unsafe { op_gelu_mul(gate.ptr, up.ptr, out.ptr, gate.n as i32) };
 }

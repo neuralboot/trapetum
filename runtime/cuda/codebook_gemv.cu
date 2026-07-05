@@ -304,6 +304,14 @@ __global__ void gemv_fp16_k(const __half* __restrict__ W, const __half* __restri
     Y[o] = acc;
 }
 
+__global__ void gelu_mul_k(const float* __restrict__ gate, const float* __restrict__ up, __half* __restrict__ out, int n) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i];
+    float gg = 0.5f*g*(1.0f + tanhf(0.7978845608f*(g + 0.044715f*g*g*g)));
+    out[i] = __float2half(gg * up[i]);
+}
+
 // One dedicated stream for all device ops, so the decode chain can be CUDA-graph
 // captured (launches MUST be on the captured stream, else they are not recorded).
 static cudaStream_t g_stream = 0;
@@ -466,6 +474,11 @@ void op_saxpy(void* acc_f32, const void* y_f32, float alpha, int n) {
 void op_gemv_fp16(const void* w_half, const void* x_half, void* y_f32, int ic, int oc) {
     ensure_stream();
     gemv_fp16_k<<<(oc+255)/256, 256, 0, g_stream>>>((const __half*)w_half, (const __half*)x_half, (float*)y_f32, ic, oc);
+}
+
+void op_gelu_mul(const void* gate_f32, const void* up_f32, void* out_half, int n) {
+    ensure_stream();
+    gelu_mul_k<<<(n+255)/256, 256, 0, g_stream>>>((const float*)gate_f32, (const float*)up_f32, (__half*)out_half, n);
 }
 
 void dev_sync() { cudaDeviceSynchronize(); }

@@ -462,3 +462,17 @@ kernel void saxpy(
 {
     if ((int)i < p.n) acc[i] += p.alpha * y[i];
 }
+
+// GeGLU activation (Gemma): out = gelu_tanh(gate) * up. gelu_tanh(x) = 0.5x(1+tanh(sqrt(2/pi)(x+0.044715x^3))).
+kernel void gelu_mul_k(
+    device const float* gate [[buffer(0)]],
+    device const float* up   [[buffer(1)]],
+    device half* out         [[buffer(2)]],
+    constant uint& n         [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n) return;
+    float g = gate[i];
+    float gg = 0.5f*g*(1.0f + tanh(0.7978845608f*(g + 0.044715f*g*g*g)));
+    out[i] = (half)(gg * up[i]);
+}

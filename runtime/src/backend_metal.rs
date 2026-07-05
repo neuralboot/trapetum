@@ -32,7 +32,7 @@ fn gs() -> u64 {
 const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
 const KERNELS: &[&str] = &[
     "gemv4", "cast_f2h", "rmsnorm_k", "silu_mul_k", "resadd_k", "rope_k", "vadd_k", "attn_k",
-    "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m", "attn_m", "rope_m", "mla_attn", "saxpy",
+    "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m", "attn_m", "rope_m", "mla_attn", "saxpy", "gelu_mul_k",
 ];
 
 struct Ctx {
@@ -877,4 +877,9 @@ pub unsafe fn op_mla_attn(aq: *const c_void, qr: *const c_void, ckv: *const c_vo
     enc.set_threadgroup_memory_length(1, tg(seqlen as usize*4));
     enc.dispatch_thread_groups(MTLSize::new(n_heads as u64,1,1), MTLSize::new(d_c as u64,1,1));
     enc.end_encoding();
+}
+
+// GeGLU (Gemma): out = gelu_tanh(gate) * up.
+pub unsafe fn op_gelu_mul(gate_f32: *const c_void, up_f32: *const c_void, out_half: *mut c_void, n: i32) {
+    dispatch1d("gelu_mul_k", &[bufref(gate_f32), bufref(up_f32), bufref(out_half)], &n.to_ne_bytes(), n as usize);
 }
