@@ -1888,3 +1888,118 @@ impl DeepSeekLayer {
         self.moe.forward(h); // MoeBlock norms + residual-adds internally
     }
 }
+
+/// The feed-forward of a DeepSeek layer: a dense MLP (first_k_dense layers) or MoE.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub enum DsFfn { Dense(MlpBlock), Moe(MoeBlock) }
+
+/// A DeepSeek decoder layer at the model level (dense or MoE FFN).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct DsLayer { attn_norm: DevF32, attn: MlaAttn, ffn: DsFfn }
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl DsLayer {
+    fn forward(&mut self, h: &mut DevHalf, pos: usize) {
+        let mut normed = DevHalf::zeros(h.n);
+        rmsnorm(h, &self.attn_norm, &mut normed, self.attn.eps);
+        { let o = self.attn.forward(&normed, pos); residual_add(h, o); }
+        match &mut self.ffn { DsFfn::Dense(m) => m.forward(h), DsFfn::Moe(m) => m.forward(h) }
+    }
+}
+
+/// A full DeepSeek-V2/V3 (MLA + MoE) model, loaded from the `CBKD` .cbk format. MLA
+/// projections dense fp16; experts/router/dense-MLP/LM-head 4-bit codebook. Pure Rust.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct DeepSeekModel {
+    embedding: Vec<f32>,
+    layers: Vec<DsLayer>,
+    final_norm: DevF32,
+    lm_head: QuantLinear,
+    h: DevHalf,
+    normed: DevHalf,
+    logits: DevF32,
+    hidden: usize,
+    vocab: usize,
+    eps: f32,
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl DeepSeekModel {
+    pub fn vocab(&self) -> usize { self.vocab }
+
+    /// Process one token at `pos`, returning the `vocab` next-token logits.
+    pub fn forward(&mut self, token: usize, pos: usize) -> Vec<f32> {
+        let row = &self.embedding[token*self.hidden..(token+1)*self.hidden];
+        self.h.upload(row);
+        for l in &mut self.layers { l.forward(&mut self.h, pos); }
+        rmsnorm(&self.h, &self.final_norm, &mut self.normed, self.eps);
+        self.lm_head.forward_into(&self.normed, &mut self.logits);
+        self.logits.to_host()
+    }
+
+    /// Load a DeepSeek `.cbk` (CBKD) exported by `model/export_deepseek.py`.
+    pub fn load_deepseek(path: &str, max_seq: usize) -> std::io::Result<DeepSeekModel> {
+        let mut r = BufReader::new(File::open(path)?);
+        let mut magic = [0u8; 4]; r.read_exact(&mut magic)?;
+        assert_eq!(&magic, b"CBKD", "not a DeepSeek .cbk");
+        let cfg: Vec<usize> = (0..14).map(|_| rd_i32(&mut r) as usize).collect();
+        let (n_layers, hidden, n_heads, kv_lora, nope, rope, vhd, inter_dense, moe_inter,
+             n_routed, n_shared, top_k, vocab, first_k_dense) =
+            (cfg[0],cfg[1],cfg[2],cfg[3],cfg[4],cfg[5],cfg[6],cfg[7],cfg[8],cfg[9],cfg[10],cfg[11],cfg[12],cfg[13]);
+        let eps = rd_f32(&mut r); let _rope_theta = rd_f32(&mut r); let _rscale = rd_f32(&mut r);
+        let inv_freq = rd_f32_vec(&mut r, rope/2);
+        let embedding = rd_f16_vec(&mut r, vocab*hidden);
+        let qdim = n_heads*(nope+rope);
+        let mut layers = Vec::with_capacity(n_layers);
+        for li in 0..n_layers {
+            let attn_norm = rd_f32_vec(&mut r, hidden);
+            let q_w = rd_f16_vec(&mut r, qdim*hidden);
+            let kv_a_w = rd_f16_vec(&mut r, (kv_lora+rope)*hidden);
+            let kv_a_norm = rd_f32_vec(&mut r, kv_lora);
+            let kv_b = rd_f16_vec(&mut r, n_heads*(nope+vhd)*kv_lora);
+            let o_w = rd_f16_vec(&mut r, hidden*(n_heads*vhd));
+            let post_norm = rd_f32_vec(&mut r, hidden);
+            let attn = MlaAttn::new(hidden, n_heads, kv_lora, rope, nope, vhd, max_seq, eps,
+                &q_w, &kv_a_w, &kv_a_norm, &kv_b, &o_w, &inv_freq);
+            let ffn = if li < first_k_dense {
+                let (gp,gc) = (rd_u8_vec(&mut r, hidden*(inter_dense/2)), rd_f32_vec(&mut r, K*inter_dense));
+                let (up,uc) = (rd_u8_vec(&mut r, hidden*(inter_dense/2)), rd_f32_vec(&mut r, K*inter_dense));
+                let (dp,dc) = (rd_u8_vec(&mut r, inter_dense*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
+                DsFfn::Dense(MlpBlock::new(hidden, inter_dense, &post_norm, &gp,&gc,&up,&uc,&dp,&dc, eps))
+            } else {
+                let (rp,rc) = (rd_u8_vec(&mut r, hidden*(n_routed/2)), rd_f32_vec(&mut r, K*n_routed));
+                let mut estore: Vec<(Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>)> = Vec::with_capacity(n_routed);
+                for _ in 0..n_routed {
+                    estore.push((
+                        rd_u8_vec(&mut r, hidden*(moe_inter/2)), rd_f32_vec(&mut r, K*moe_inter),
+                        rd_u8_vec(&mut r, hidden*(moe_inter/2)), rd_f32_vec(&mut r, K*moe_inter),
+                        rd_u8_vec(&mut r, moe_inter*(hidden/2)), rd_f32_vec(&mut r, K*hidden)));
+                }
+                let si = n_shared*moe_inter;
+                let sh = (rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
+                          rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
+                          rd_u8_vec(&mut r, si*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
+                let experts: Vec<_> = estore.iter().map(|e| (e.0.as_slice(),e.1.as_slice(),e.2.as_slice(),e.3.as_slice(),e.4.as_slice(),e.5.as_slice())).collect();
+                let shared = Some((sh.0.as_slice(),sh.1.as_slice(),sh.2.as_slice(),sh.3.as_slice(),sh.4.as_slice(),sh.5.as_slice()));
+                DsFfn::Moe(MoeBlock::new(hidden, moe_inter, n_routed, top_k, eps, &post_norm, (&rp,&rc), experts, shared))
+            };
+            layers.push(DsLayer { attn_norm: DevF32::from_host(&attn_norm), attn, ffn });
+            eprintln!("  loaded layer {}/{}", li+1, n_layers);
+        }
+        let final_norm = rd_f32_vec(&mut r, hidden);
+        let (lp, lc) = (rd_u8_vec(&mut r, hidden*(vocab/2)), rd_f32_vec(&mut r, K*vocab));
+        Ok(DeepSeekModel {
+            embedding, layers,
+            final_norm: DevF32::from_host(&final_norm),
+            lm_head: QuantLinear::new(&lp, &lc, hidden, vocab),
+            h: DevHalf::zeros(hidden), normed: DevHalf::zeros(hidden), logits: DevF32::zeros(vocab),
+            hidden, vocab, eps,
+        })
+    }
+}
+
+/// Read a little-endian i32 binary file into a Vec<i32> (prompt.bin / cont.bin).
+pub fn read_i32s(path: &str) -> Vec<i32> {
+    let mut f = BufReader::new(File::open(path).unwrap());
+    let mut buf = Vec::new(); f.read_to_end(&mut buf).unwrap();
+    buf.chunks_exact(4).map(|c| i32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect()
+}
