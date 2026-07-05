@@ -8,7 +8,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 OUT=/workspace/sweep2; mkdir -p "$OUT"; PPL_TOKENS="${PPL_TOKENS:-40000}"
 echo "### env (newer transformers/tokenizers) ###"
 pip install -q torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
-pip install -q -U "transformers>=4.47,<4.49" tokenizers accelerate sentencepiece numpy ninja pynvml datasets tiktoken || echo WARN
+pip install -q -U "transformers>=4.47,<4.49" tokenizers accelerate sentencepiece protobuf numpy ninja pynvml datasets tiktoken || echo WARN
 python -c "import transformers,tokenizers;print('tf',transformers.__version__,'tok',tokenizers.__version__)"
 MODELS=(
   "unsloth/Meta-Llama-3.1-8B-Instruct"
