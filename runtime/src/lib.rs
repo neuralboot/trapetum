@@ -1302,3 +1302,9 @@ pub fn spec_decode_two_model(
     out.truncate(n);
     (out, tf, df)
 }
+
+/// Validate the MLA (DeepSeek-V2/V3) decode attention kernel vs a CPU reference.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn check_mla_attn(n_heads: usize, d_c: usize, d_rope: usize, seqlen: usize) -> f64 {
+    unsafe { backend::check_mla_attn(n_heads as i32, d_c as i32, d_rope as i32, seqlen as i32) }
+}

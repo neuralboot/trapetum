@@ -32,7 +32,7 @@ fn gs() -> u64 {
 const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
 const KERNELS: &[&str] = &[
     "gemv4", "cast_f2h", "rmsnorm_k", "silu_mul_k", "resadd_k", "rope_k", "vadd_k", "attn_k",
-    "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m", "attn_m", "rope_m",
+    "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m", "attn_m", "rope_m", "mla_attn",
 ];
 
 struct Ctx {
@@ -758,4 +758,65 @@ pub unsafe fn op_attn_m(q_half: *const c_void, ck_half: *const c_void, cv_half: 
     enc.set_threadgroup_memory_length(1, tg(total * 4));
     enc.dispatch_thread_groups(MTLSize::new(n_heads as u64, 1, 1), MTLSize::new(head_dim as u64, 1, 1));
     enc.end_encoding();
+}
+
+// Validate mla_attn (MLA decode attention, absorption form) vs a CPU reference.
+// Returns worst rel err over the n_heads*d_c out-latent elements.
+pub unsafe fn check_mla_attn(n_heads: i32, d_c: i32, d_rope: i32, seqlen: i32) -> f64 {
+    let c = ctx();
+    let (nh, dc, dr, sl) = (n_heads as usize, d_c as usize, d_rope as usize, seqlen as usize);
+    let mut rng = 0x9E37u64;
+    let mut nx = || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; (((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0)*0.4 };
+    let aq: Vec<f32> = (0..nh*dc).map(|_| nx()).collect();
+    let qr: Vec<f32> = (0..nh*dr).map(|_| nx()).collect();
+    let ckv: Vec<f32> = (0..sl*dc).map(|_| nx()).collect();
+    let kr: Vec<f32> = (0..sl*dr).map(|_| nx()).collect();
+    let daq = dev_alloc_half((nh*dc) as i32); dev_upload_to_half(daq, aq.as_ptr(), (nh*dc) as i32);
+    let dqr = dev_alloc_half((nh*dr) as i32); dev_upload_to_half(dqr, qr.as_ptr(), (nh*dr) as i32);
+    let dckv = dev_alloc_half((sl*dc) as i32); dev_upload_to_half(dckv, ckv.as_ptr(), (sl*dc) as i32);
+    let dkr = dev_alloc_half((sl*dr) as i32); dev_upload_to_half(dkr, kr.as_ptr(), (sl*dr) as i32);
+    let dout = dev_alloc_half((nh*dc) as i32);
+    let scale = 1.0f32 / ((dc + dr) as f32).sqrt();
+    {
+        let cb = cur_cb();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.pl["mla_attn"]);
+        enc.set_buffer(0, Some(bufref(daq)), 0);
+        enc.set_buffer(1, Some(bufref(dqr)), 0);
+        enc.set_buffer(2, Some(bufref(dckv)), 0);
+        enc.set_buffer(3, Some(bufref(dkr)), 0);
+        enc.set_buffer(4, Some(bufref(dout)), 0);
+        #[repr(C)]
+        struct P { n_heads: i32, d_c: i32, d_rope: i32, seqlen: i32, scale: f32 }
+        let p = P { n_heads, d_c, d_rope, seqlen, scale };
+        enc.set_bytes(5, 20, &p as *const P as *const c_void);
+        enc.set_threadgroup_memory_length(0, tg(dc*4));
+        enc.set_threadgroup_memory_length(1, tg(sl*4));
+        enc.dispatch_thread_groups(MTLSize::new(nh as u64,1,1), MTLSize::new(dc as u64,1,1));
+        enc.end_encoding();
+    }
+    let mut got = vec![0f32; nh*dc]; dev_download_half(got.as_mut_ptr(), dout, (nh*dc) as i32);
+    // CPU reference (fp16 rounding)
+    let h16 = |v:f32| half::f16::from_f32(v).to_f32();
+    let mut worst = 0f64;
+    for h in 0..nh {
+        let mut sc = vec![0f32; sl];
+        for t in 0..sl {
+            let mut cont = 0f32;
+            for d in 0..dc { cont += h16(aq[h*dc+d]) * h16(ckv[t*dc+d]); }
+            let mut rp = 0f32;
+            for r in 0..dr { rp += h16(qr[h*dr+r]) * h16(kr[t*dr+r]); }
+            sc[t] = (cont + rp) * scale;
+        }
+        let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+        let mut sum = 0f32; for s in sc.iter_mut() { *s = (*s-mx).exp(); sum += *s; } for s in sc.iter_mut() { *s /= sum; }
+        for d in 0..dc {
+            let mut acc = 0f32; for t in 0..sl { acc += sc[t]*h16(ckv[t*dc+d]); }
+            let r = h16(acc); let g = got[h*dc+d];
+            let den = (r as f64).abs().max(1e-3);
+            worst = worst.max(((g-r) as f64).abs()/den);
+        }
+    }
+    dev_free(daq); dev_free(dqr); dev_free(dckv); dev_free(dkr); dev_free(dout);
+    worst
 }

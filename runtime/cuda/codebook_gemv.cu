@@ -256,6 +256,41 @@ __global__ void attn_m(const __half* __restrict__ q, const __half* __restrict__ 
     }
 }
 
+// MLA (Multi-head Latent Attention, DeepSeek-V2/V3) decode attention, absorption form.
+// Twin of the Metal `mla_attn` (validated there vs a CPU reference). The KV cache stores
+// only a shared low-rank latent c_KV (dim d_c) + a decoupled RoPE key k_R (dim d_rope) per
+// token, not per-head K/V. Per head: score = absorbed_q.c_KV (d_c) + q_R.k_R (d_rope);
+// out latent = softmax-weighted sum of c_KV. A separate W_UV GEMM makes per-head values.
+// One block per head, d_c threads (power of two; kv_lora_rank=512 in DeepSeek-V2).
+__global__ void mla_attn(const __half* __restrict__ aq, const __half* __restrict__ qr,
+                         const __half* __restrict__ ckv, const __half* __restrict__ kr,
+                         __half* __restrict__ outl, int n_heads, int d_c, int d_rope, int seqlen, float scale) {
+    int h = blockIdx.x, d = threadIdx.x;
+    extern __shared__ float smem[];
+    float* red = smem;               // d_c
+    float* scores = smem + d_c;      // seqlen
+    for (int t = 0; t < seqlen; t++) {
+        red[d] = __half2float(aq[h*d_c + d]) * __half2float(ckv[(size_t)t*d_c + d]);
+        __syncthreads();
+        for (int s = d_c/2; s > 0; s >>= 1) { if (d < s) red[d] += red[d+s]; __syncthreads(); }
+        if (d == 0) {
+            float rp = 0;
+            for (int r = 0; r < d_rope; r++) rp += __half2float(qr[h*d_rope + r]) * __half2float(kr[(size_t)t*d_rope + r]);
+            scores[t] = (red[0] + rp) * scale;
+        }
+        __syncthreads();
+    }
+    if (d == 0) {
+        float mx = -1e30f; for (int t = 0; t < seqlen; t++) mx = fmaxf(mx, scores[t]);
+        float sum = 0; for (int t = 0; t < seqlen; t++) { scores[t] = expf(scores[t]-mx); sum += scores[t]; }
+        for (int t = 0; t < seqlen; t++) scores[t] /= sum;
+    }
+    __syncthreads();
+    float acc = 0;
+    for (int t = 0; t < seqlen; t++) acc += scores[t] * __half2float(ckv[(size_t)t*d_c + d]);
+    outl[h*d_c + d] = __float2half(acc);
+}
+
 // One dedicated stream for all device ops, so the decode chain can be CUDA-graph
 // captured (launches MUST be on the captured stream, else they are not recorded).
 static cudaStream_t g_stream = 0;
@@ -399,6 +434,15 @@ void op_attn_m(const void* q_half, const void* ck_half, const void* cv_half, voi
     size_t smem = ((size_t)head_dim + base + M) * sizeof(float);
     attn_m<<<n_heads, head_dim, smem, g_stream>>>((const __half*)q_half, (const __half*)ck_half,
         (const __half*)cv_half, (__half*)out_half, n_heads, n_kv, head_dim, base, M);
+}
+
+// MLA decode attention (DeepSeek-V2/V3). Twin of the Metal path; validated there.
+void op_mla_attn(const void* aq, const void* qr, const void* ckv, const void* kr, void* outl,
+                 int n_heads, int d_c, int d_rope, int seqlen, float scale) {
+    ensure_stream();
+    size_t smem = ((size_t)d_c + seqlen) * sizeof(float);
+    mla_attn<<<n_heads, d_c, smem, g_stream>>>((const __half*)aq, (const __half*)qr,
+        (const __half*)ckv, (const __half*)kr, (__half*)outl, n_heads, d_c, d_rope, seqlen, scale);
 }
 
 void dev_sync() { cudaDeviceSynchronize(); }

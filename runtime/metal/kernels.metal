@@ -404,3 +404,49 @@ kernel void rope_m(
     x[i] = (half)(x0*c - x1*s);
     x[j] = (half)(x1*c + x0*s);
 }
+
+// ============================================================================
+// MLA (Multi-head Latent Attention, DeepSeek-V2/V3) decode attention, absorption
+// form. The KV cache stores only a shared low-rank latent c_KV (dim d_c) plus a
+// decoupled RoPE key k_R (dim d_rope) per token -- NOT per-head K/V. Per head the
+// score is a content dot (absorbed_q . c_KV, dim d_c) plus a rope dot (q_R . k_R,
+// dim d_rope); the output is the softmax-weighted sum of the latent (dim d_c),
+// which a separate W_UV GEMM turns into per-head values. This is the novel piece;
+// the pre-absorption (W_UK into q) and post (W_UV) are standard GEMMs. d_c must be
+// a power of two (kv_lora_rank=512 in DeepSeek-V2). Validated vs a CPU reference.
+struct MlaParams { int n_heads; int d_c; int d_rope; int seqlen; float scale; };
+kernel void mla_attn(
+    device const half* aq   [[buffer(0)]],   // [n_heads][d_c]   absorbed content query (W_UK^T q_nope)
+    device const half* qr   [[buffer(1)]],   // [n_heads][d_rope] rope query
+    device const half* ckv  [[buffer(2)]],   // [seqlen][d_c]    latent KV cache
+    device const half* kr   [[buffer(3)]],   // [seqlen][d_rope] decoupled rope key cache
+    device half* outl       [[buffer(4)]],   // [n_heads][d_c]   out latent (pre W_UV)
+    constant MlaParams& p   [[buffer(5)]],
+    threadgroup float* red    [[threadgroup(0)]],   // d_c
+    threadgroup float* scores [[threadgroup(1)]],   // seqlen
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tptg  [[thread_position_in_threadgroup]])
+{
+    int h = tgpig.x, d = tptg.x;           // one threadgroup per head, d_c threads
+    int dc = p.d_c, dr = p.d_rope;
+    for (int t = 0; t < p.seqlen; t++) {
+        red[d] = (float)aq[h*dc + d] * (float)ckv[t*dc + d];   // content partial
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int s = dc/2; s > 0; s >>= 1) { if (d < s) red[d] += red[d+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+        if (d == 0) {
+            float rp = 0;
+            for (int r = 0; r < dr; r++) rp += (float)qr[h*dr + r] * (float)kr[t*dr + r];  // rope dot
+            scores[t] = (red[0] + rp) * p.scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (d == 0) {
+        float mx = -1e30f; for (int t = 0; t < p.seqlen; t++) mx = fmax(mx, scores[t]);
+        float sum = 0; for (int t = 0; t < p.seqlen; t++) { scores[t] = exp(scores[t]-mx); sum += scores[t]; }
+        for (int t = 0; t < p.seqlen; t++) scores[t] /= sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float acc = 0;
+    for (int t = 0; t < p.seqlen; t++) acc += scores[t] * (float)ckv[t*dc + d];   // weighted latent sum
+    outl[h*dc + d] = (half)acc;
+}
