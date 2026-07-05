@@ -1233,3 +1233,72 @@ pub fn check_spec_decode_conf() -> (bool, bool, usize, f64, usize) {
     });
     (seq_h == reference, seq_m == reference, fwds_h, avgk, n)
 }
+
+/// Two-model end-to-end speculative decode with real KV rollback: a separate `drafter`
+/// proposes K tokens (its own cache), the `target` verifies K+1 in one batched forward,
+/// and the longest matching prefix is committed. Stale draft rows in BOTH caches are
+/// overwritten on the next step (implicit rollback); the accept-all case resyncs the
+/// drafter by feeding it the bonus token's predecessor. LOSSLESS: output == plain greedy.
+/// Both models decode from position 0, so re-running reuses the same loaded models (the
+/// cache is position-addressed and causal, so old rows are never read). Returns
+/// `(tokens, target_forwards, drafter_forwards)`.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn spec_decode_two_model(
+    target: &mut Model,
+    drafter: &mut Model,
+    prompt: &[usize],
+    n: usize,
+    k: usize,
+) -> (Vec<usize>, usize, usize) {
+    assert!((1..=3).contains(&k));
+    assert_eq!(target.vocab(), drafter.vocab(), "target and drafter must share a tokenizer");
+    let mut tl = vec![];
+    for (i, &t) in prompt.iter().enumerate() {
+        tl = target.forward(t, i);
+        let _ = drafter.forward(t, i);
+    }
+    let mut out: Vec<usize> = Vec::with_capacity(n);
+    let mut pos = prompt.len();
+    let mut u0 = argmax(&tl);
+    let (mut tf, mut df) = (0usize, 0usize);
+    while out.len() < n {
+        // drafter proposes k tokens after u0 (it consumes u0 first), advancing its own cache
+        let mut drafts = Vec::with_capacity(k);
+        let mut dcur = u0;
+        for j in 0..k {
+            let dl = drafter.forward(dcur, pos + j);
+            df += 1;
+            dcur = argmax(&dl);
+            drafts.push(dcur);
+        }
+        // target verifies u0,d_1..d_k in one forward
+        let mut toks = Vec::with_capacity(k + 1);
+        toks.push(u0);
+        toks.extend_from_slice(&drafts);
+        let logits = target.forward_mk(&toks, pos);
+        tf += 1;
+        out.push(u0);
+        if out.len() >= n { break; }
+        let mut acc = 0;
+        while acc < k {
+            if drafts[acc] == argmax(&logits[acc]) {
+                out.push(drafts[acc]);
+                acc += 1;
+                if out.len() >= n { break; }
+            } else { break; }
+        }
+        if out.len() >= n { break; }
+        if acc == k {
+            // all accepted: drafter cache is missing d_k (only consumed u0..d_{k-1}) -> sync it
+            let _ = drafter.forward(drafts[k - 1], pos + k);
+            df += 1;
+            u0 = argmax(&logits[k]); // bonus token
+            pos += k + 1;
+        } else {
+            u0 = argmax(&logits[acc]); // correction; stale draft rows overwritten next step
+            pos += acc + 1;
+        }
+    }
+    out.truncate(n);
+    (out, tf, df)
+}
