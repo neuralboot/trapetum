@@ -1332,7 +1332,7 @@ pub struct Expert { gate: QuantLinear, up: QuantLinear, down: QuantLinear }
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct MoeBlock {
     norm_w: DevF32,
-    router: QuantLinear,
+    router: DenseLinear,
     experts: Vec<Expert>,
     shared: Option<Expert>,
     top_k: usize,
@@ -1352,7 +1352,7 @@ pub struct MoeBlock {
 impl MoeBlock {
     #[allow(clippy::too_many_arguments)]
     pub fn new(hidden: usize, inter: usize, n_experts: usize, top_k: usize, eps: f32,
-               norm_w: &[f32], router: (&[u8], &[f32]),
+               norm_w: &[f32], router_w: &[f32],
                experts: Vec<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
                shared: Option<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>) -> Self {
         assert_eq!(experts.len(), n_experts);
@@ -1363,7 +1363,7 @@ impl MoeBlock {
         };
         Self {
             norm_w: DevF32::from_host(norm_w),
-            router: QuantLinear::new(router.0, router.1, hidden, n_experts),
+            router: DenseLinear::new(router_w, hidden, n_experts),
             experts: experts.iter().map(mk).collect(),
             shared: shared.as_ref().map(mk),
             top_k, hidden, inter, n_experts, eps,
@@ -1450,7 +1450,7 @@ pub fn check_moe() -> f64 {
     let packed = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<u8> { (0..n).map(|_| ((r()*0.5+0.5)*255.0) as u8).collect() };
     let cbk = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<f32> { (0..n).map(|_| r()*0.05).collect() };
     let nw: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
-    let rp = packed(hidden*(n_experts/2), &mut r); let rc = cbk(K*n_experts, &mut r);
+    let rw: Vec<f32> = (0..n_experts*hidden).map(|_| r()*0.05).collect();
     // experts
     let mut exp_store: Vec<(Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>)> = Vec::new();
     for _ in 0..n_experts {
@@ -1464,7 +1464,7 @@ pub fn check_moe() -> f64 {
               packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
               packed(inter*(hidden/2),&mut r), cbk(K*hidden,&mut r));
     let shared = Some((sh.0.as_slice(),sh.1.as_slice(),sh.2.as_slice(),sh.3.as_slice(),sh.4.as_slice(),sh.5.as_slice()));
-    let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, (&rp,&rc), experts, shared);
+    let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, &rw, experts, shared);
     let h0: Vec<f32> = (0..hidden).map(|_| r()*0.3).collect();
     let mut ha = DevHalf::from_host(&h0); moe.forward(&mut ha); let a = ha.to_host();
     let mut hb = DevHalf::from_host(&h0); moe.forward_dense_ref(&mut hb); let b = hb.to_host();
@@ -1488,7 +1488,7 @@ pub struct ExpertHost { gp: Vec<u8>, gc: Vec<f32>, up: Vec<u8>, uc: Vec<f32>, dp
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct MoeBlockOffload {
     norm_w: DevF32,
-    router: QuantLinear,
+    router: DenseLinear,
     hosts: Vec<ExpertHost>,
     shared: Expert,
     cache: std::collections::HashMap<usize, Expert>,
@@ -1512,13 +1512,13 @@ pub struct MoeBlockOffload {
 impl MoeBlockOffload {
     #[allow(clippy::too_many_arguments)]
     pub fn new(hidden: usize, inter: usize, n_experts: usize, top_k: usize, cap: usize, eps: f32,
-               norm_w: &[f32], router: (&[u8], &[f32]), hosts: Vec<ExpertHost>,
+               norm_w: &[f32], router_w: &[f32], hosts: Vec<ExpertHost>,
                shared: (&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])) -> Self {
         assert_eq!(hosts.len(), n_experts);
         assert!(cap >= top_k, "cache must hold at least top_k experts");
         Self {
             norm_w: DevF32::from_host(norm_w),
-            router: QuantLinear::new(router.0, router.1, hidden, n_experts),
+            router: DenseLinear::new(router_w, hidden, n_experts),
             hosts,
             shared: Expert { gate: QuantLinear::new(shared.0,shared.1,hidden,inter),
                              up: QuantLinear::new(shared.2,shared.3,hidden,inter),
@@ -1593,20 +1593,20 @@ impl MoeBlockOffload {
 // Deterministic MoE weight generator (same seed -> identical model), for the offload check.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 fn gen_moe(hidden: usize, inter: usize, n_experts: usize, seed: u64)
-    -> (Vec<f32>, Vec<u8>, Vec<f32>, Vec<ExpertHost>, ExpertHost) {
+    -> (Vec<f32>, Vec<f32>, Vec<ExpertHost>, ExpertHost) {
     let mut s = seed;
     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
     let pk = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<u8> { (0..n).map(|_| ((r()*0.5+0.5)*255.0) as u8).collect() };
     let cb = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<f32> { (0..n).map(|_| r()*0.05).collect() };
     let nw: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
-    let rp = pk(hidden*(n_experts/2), &mut r); let rc = cb(K*n_experts, &mut r);
+    let rw: Vec<f32> = (0..n_experts*hidden).map(|_| r()*0.05).collect();
     let mkh = |r: &mut dyn FnMut()->f32| ExpertHost {
         gp: pk(hidden*(inter/2), r), gc: cb(K*inter, r),
         up: pk(hidden*(inter/2), r), uc: cb(K*inter, r),
         dp: pk(inter*(hidden/2), r), dc: cb(K*hidden, r) };
     let hosts: Vec<ExpertHost> = (0..n_experts).map(|_| mkh(&mut r)).collect();
     let shared = mkh(&mut r);
-    (nw, rp, rc, hosts, shared)
+    (nw, rw, hosts, shared)
 }
 
 /// Validate expert OFFLOADING: the offloaded block (only `cap` experts resident, streamed
@@ -1617,14 +1617,14 @@ pub fn check_moe_offload() -> (f64, usize, usize, usize) {
     let (hidden, inter, n_experts, top_k, cap) = (256usize, 256usize, 256usize, 8usize, 16usize);
     let eps = 1e-5f32; let seed = 0x0FF10AD5u64;
     // all-resident reference
-    let (nw, rp, rc, hosts_r, sh_r) = gen_moe(hidden, inter, n_experts, seed);
+    let (nw, rw, hosts_r, sh_r) = gen_moe(hidden, inter, n_experts, seed);
     let exps_ref: Vec<_> = hosts_r.iter().map(|e| (e.gp.as_slice(),e.gc.as_slice(),e.up.as_slice(),e.uc.as_slice(),e.dp.as_slice(),e.dc.as_slice())).collect();
     let shref = (sh_r.gp.as_slice(),sh_r.gc.as_slice(),sh_r.up.as_slice(),sh_r.uc.as_slice(),sh_r.dp.as_slice(),sh_r.dc.as_slice());
-    let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, (&rp,&rc), exps_ref, Some(shref));
+    let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, &rw, exps_ref, Some(shref));
     // offloaded (identical weights via same seed)
-    let (nw2, rp2, rc2, hosts_o, sh_o) = gen_moe(hidden, inter, n_experts, seed);
+    let (nw2, rw2, hosts_o, sh_o) = gen_moe(hidden, inter, n_experts, seed);
     let sho = (sh_o.gp.as_slice(),sh_o.gc.as_slice(),sh_o.up.as_slice(),sh_o.uc.as_slice(),sh_o.dp.as_slice(),sh_o.dc.as_slice());
-    let mut off = MoeBlockOffload::new(hidden, inter, n_experts, top_k, cap, eps, &nw2, (&rp2,&rc2), hosts_o, sho);
+    let mut off = MoeBlockOffload::new(hidden, inter, n_experts, top_k, cap, eps, &nw2, &rw2, hosts_o, sho);
     // run several distinct tokens through both, compare
     let mut worst = 0f64;
     let mut sh = 0xABCDu64;
@@ -1966,7 +1966,7 @@ impl DeepSeekModel {
                 let (dp,dc) = (rd_u8_vec(&mut r, inter_dense*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
                 DsFfn::Dense(MlpBlock::new(hidden, inter_dense, &post_norm, &gp,&gc,&up,&uc,&dp,&dc, eps))
             } else {
-                let (rp,rc) = (rd_u8_vec(&mut r, hidden*(n_routed/2)), rd_f32_vec(&mut r, K*n_routed));
+                let rw = rd_f16_vec(&mut r, n_routed*hidden);
                 let mut estore: Vec<(Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>)> = Vec::with_capacity(n_routed);
                 for _ in 0..n_routed {
                     estore.push((
@@ -1980,7 +1980,7 @@ impl DeepSeekModel {
                           rd_u8_vec(&mut r, si*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
                 let experts: Vec<_> = estore.iter().map(|e| (e.0.as_slice(),e.1.as_slice(),e.2.as_slice(),e.3.as_slice(),e.4.as_slice(),e.5.as_slice())).collect();
                 let shared = Some((sh.0.as_slice(),sh.1.as_slice(),sh.2.as_slice(),sh.3.as_slice(),sh.4.as_slice(),sh.5.as_slice()));
-                DsFfn::Moe(MoeBlock::new(hidden, moe_inter, n_routed, top_k, eps, &post_norm, (&rp,&rc), experts, shared))
+                DsFfn::Moe(MoeBlock::new(hidden, moe_inter, n_routed, top_k, eps, &post_norm, &rw, experts, shared))
             };
             layers.push(DsLayer { attn_norm: DevF32::from_host(&attn_norm), attn, ffn });
             eprintln!("  loaded layer {}/{}", li+1, n_layers);

@@ -59,7 +59,6 @@ def main():
     rscale = float(getattr(c, "routed_scaling_factor", 1.0))
     assert kv_lora % 256 == 0, f"kv_lora_rank {kv_lora} must be %256 (kv_b/absorption is dense so ok, but experts need it)"
     assert vocab % 256 == 0, f"vocab {vocab} must be %256 for the quantized LM head"
-    assert n_routed % 256 == 0, f"n_routed_experts {n_routed} must be %256 for the quantized router"
     print(f"cfg: L={n_layers} hidden={hidden} heads={n_heads} kv_lora={kv_lora} nope={nope} rope={rope} "
           f"vhd={vhd} inter={inter_dense} moe_inter={moe_inter} n_routed={n_routed} n_shared={n_shared} "
           f"top_k={top_k} vocab={vocab} first_k_dense={first_k_dense}", flush=True)
@@ -94,7 +93,7 @@ def main():
             qwrite(f, M.gate_proj); qwrite(f, M.up_proj); qwrite(f, M.down_proj)
         else:
             M = L.mlp
-            qwrite(f, M.gate)                               # router [n_routed][hidden]
+            w_f16(f, M.gate.weight)                          # router [n_routed][hidden] DENSE fp16
             for e in M.experts:
                 qwrite(f, e.gate_proj); qwrite(f, e.up_proj); qwrite(f, e.down_proj)
             S = M.shared_experts
