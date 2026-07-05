@@ -27,28 +27,34 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${OUT:-/workspace/cbk}"
 mkdir -p "$OUT/target" "$OUT/drafter"
 
-echo "### 1/5  python env (torch 2.4 cu121 + transformers 4.44.2, pinned) ###"
+echo "### 1/6  python env (torch 2.4 cu121 + transformers 4.44.2, pinned) ###"
 PIN="torch==2.4.0 transformers==4.44.2"
 pip install -q torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
 pip install -q transformers==4.44.2 accelerate sentencepiece numpy $PIN
 
-echo "### 2/5  compress TARGET  ($TARGET_MODEL) -> 4-bit .cbk ###"
+echo "### 2/6  compress TARGET  ($TARGET_MODEL) -> 4-bit .cbk ###"
 python "$ROOT/model/export_runtime.py" --model "$TARGET_MODEL" --out "$OUT/target" --prompt "$PROMPT" --gen 16
 
-echo "### 3/5  compress DRAFTER ($DRAFTER_MODEL) -> 4-bit .cbk ###"
+echo "### 3/6  compress DRAFTER ($DRAFTER_MODEL) -> 4-bit .cbk ###"
 python "$ROOT/model/export_runtime.py" --model "$DRAFTER_MODEL" --out "$OUT/drafter" --prompt "$PROMPT" --gen 16
 
-echo "### 4/5  build the CUDA runtime + validate the target reproduces HF ###"
+echo "### 4/6  build the CUDA runtime + validate the target reproduces HF ###"
 cd "$ROOT/runtime"
 cargo build --release --features cuda --bin generate --bin alpha_check
 ./target/release/generate "$OUT/target/model.cbk" "$OUT/target/prompt.bin" "$OUT/target/ref.bin" "$OUT/target/cont.bin"
 
-echo "### 5/5  measure REAL alpha + projected spec-dec K=1 speedup ###"
+echo "### 5/6  measure REAL alpha + projected spec-dec K=1 speedup ###"
 # prompt tokens from the exported prompt.bin (i32)
 PROMPT_TOKS=$(python -c "import numpy as np,sys; print(' '.join(map(str, np.fromfile('$OUT/target/prompt.bin', dtype='<i4').tolist())))")
 echo "prompt tokens: $PROMPT_TOKS"
 ./target/release/alpha_check "$OUT/target/model.cbk" "$OUT/drafter/model.cbk" "$N" $PROMPT_TOKS
 
+echo "### 6/6  decode/Pareto benchmark (quantization vs cuBLAS/Marlin/AQLM + energy) ###"
+# best-effort: pareto.py skips any baseline whose backend is absent. PPL skipped by default
+# (--ppl-tokens 0) to keep the run short; add it back for the full paper table.
+pip install -q pynvml || true
+python "$ROOT/bench/pareto.py" --model "$TARGET_MODEL" --out /workspace/bench --gen 128 --ppl-tokens 0 || echo "WARN: pareto bench partial/failed (non-fatal)"
+echo "### ALL BENCHMARKS DONE. Spec-dec alpha/speedup + decode Pareto printed above. ###"
 echo "### DONE. alpha and projected speedup printed above. ###"
 echo "Note: the projected speedup = (1+alpha)/(1 + t_draft/t_target); the M=2 verify is"
 echo "bandwidth-bound (M0 bench: ms/token flat to M=4), so it costs ~one target forward."
