@@ -37,7 +37,7 @@ cheaper per draft that the net speedup is higher (1.50x vs 1.25x). **K=2 is opti
 | **codebook-4bit (ours)** | 4.05 | 3.81 | 23.4 | 2.13 | 106 |
 | aqlm-2bit | 2.0 | 2.15 | 19.4 | 1.24 | 80 |
 
-- 4-bit vs fp16: **3.5x less memory, ~45% less energy/token.**
+- 4-bit vs fp16: **3.5x less memory, ~45% less energy/token** (Llama-2-7B, this run; the multi-model average is ~47%, see RESULTS_models.md).
 - aqlm-2bit is smaller/lower-energy but slower decode; our 4-bit is the speed/accuracy middle.
 - The HF-loop tok/s has quantized < fp16 (the known per-op Python dispatch overhead); the
   quantized speed win is realized in the fused runtime (136 tok/s), not the HF loop.

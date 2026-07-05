@@ -27,7 +27,12 @@ Y[m, j]     = sum_i  X[m, i] * W_deq[i, j]
   and the build/run harness (`benchmark.py`, `shapes_test.py`).
 - [`model/`](model/): model-level scripts on Llama-2: the cast-free CUDA-graph serving
   integration that realizes the 2.0x/2.45x end-to-end decode speedup, the AQLM-style
-  additive-VQ training that beats the scalar codebook, and the accuracy probes.
+  additive-VQ training that beats the scalar codebook, the accuracy probes, and the
+  **torch-free exporter** (`export_safetensors.py`): it reads `safetensors` directly
+  (no PyTorch, no transformers) and compresses any Llama- or Phi-3-architecture model
+  to the runtime's format — this is how Phi-4 (14B) was exported and run at 79.9 tok/s.
+  Eight architectures run end-to-end in pure Rust, including Gemma-2-9B, Phi-4 and
+  DeepSeek-V2-Lite (MLA + MoE); see [`bench/RESULTS_models.md`](bench/RESULTS_models.md).
 - [`bench/`](bench/): a fair single-harness speed vs accuracy vs memory benchmark of
   fp16, AWQ and AQLM (the `pareto`/`mem70` figures and `results*.json`).
 - [`paper/`](paper/): the write-up (`trapetum.pdf`).
