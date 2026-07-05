@@ -1974,7 +1974,7 @@ impl DeepSeekModel {
                         rd_u8_vec(&mut r, hidden*(moe_inter/2)), rd_f32_vec(&mut r, K*moe_inter),
                         rd_u8_vec(&mut r, moe_inter*(hidden/2)), rd_f32_vec(&mut r, K*hidden)));
                 }
-                let si = n_shared*moe_inter;
+                let si = ((n_shared*moe_inter + 255)/256)*256; // shared expert inter is padded to %256 in export
                 let sh = (rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
                           rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
                           rd_u8_vec(&mut r, si*(hidden/2)), rd_f32_vec(&mut r, K*hidden));

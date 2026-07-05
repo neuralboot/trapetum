@@ -18,9 +18,22 @@ from export_runtime import quantize, w_f32, w_f16, K   # shared codebook helpers
 DEV = os.environ.get("EXPORT_DEV", "cuda")
 
 
-def qwrite(f, lin):
-    packed, cb, _ = quantize(lin.weight)
+def pad256(n): return ((n + 255) // 256) * 256
+
+def _pad_out(w, oc):  # pad output rows (dim 0) with zeros to oc (kernel tiles oc in 256s)
+    if w.shape[0] >= oc: return w
+    return torch.cat([w, torch.zeros(oc - w.shape[0], w.shape[1], dtype=w.dtype, device=w.device)], 0)
+
+def _pad_in(w, ic):   # pad input cols (dim 1) with zeros to ic (down-proj input = padded inter)
+    if w.shape[1] >= ic: return w
+    return torch.cat([w, torch.zeros(w.shape[0], ic - w.shape[1], dtype=w.dtype, device=w.device)], 1)
+
+def qw(f, w):         # quantize a raw [out][in] weight tensor
+    packed, cb, _ = quantize(w)
     f.write(packed.tobytes()); f.write(cb.tobytes())
+
+def qffn(f, gate, up, down, inter_pad):   # gate/up padded on output, down padded on input; zeros are lossless (silu(0)=0)
+    qw(f, _pad_out(gate.weight, inter_pad)); qw(f, _pad_out(up.weight, inter_pad)); qw(f, _pad_in(down.weight, inter_pad))
 
 
 @torch.no_grad()
@@ -54,6 +67,9 @@ def main():
     vocab = c.vocab_size
     first_k_dense = getattr(c, "first_k_dense_replace", 0)
     n_layers = c.num_hidden_layers
+    inter_dense_pad = pad256(inter_dense)
+    moe_inter_pad = pad256(moe_inter)
+    shared_inter_pad = pad256(n_shared * moe_inter_pad)
     eps = c.rms_norm_eps
     rope_theta = float(getattr(c, "rope_theta", 10000.0))
     rscale = float(getattr(c, "routed_scaling_factor", 1.0))
@@ -68,7 +84,7 @@ def main():
     f = open(path, "wb")
     f.write(b"CBKD")
     f.write(struct.pack("<14i", n_layers, hidden, n_heads, kv_lora, nope, rope, vhd,
-                        inter_dense, moe_inter, n_routed, n_shared, top_k, vocab, first_k_dense))
+                        inter_dense_pad, moe_inter_pad, n_routed, n_shared, top_k, vocab, first_k_dense))
     f.write(struct.pack("<3f", eps, rope_theta, rscale))
     f.write(inv_freq.numpy().astype("<f4").tobytes())
     w_f16(f, model.model.embed_tokens.weight)   # [vocab][hidden] fp16
@@ -90,18 +106,18 @@ def main():
         # MLP: dense (first_k_dense layers) or MoE
         if li < first_k_dense:
             M = L.mlp
-            qwrite(f, M.gate_proj); qwrite(f, M.up_proj); qwrite(f, M.down_proj)
+            qffn(f, M.gate_proj, M.up_proj, M.down_proj, inter_dense_pad)
         else:
             M = L.mlp
             w_f16(f, M.gate.weight)                          # router [n_routed][hidden] DENSE fp16
             for e in M.experts:
-                qwrite(f, e.gate_proj); qwrite(f, e.up_proj); qwrite(f, e.down_proj)
+                qffn(f, e.gate_proj, e.up_proj, e.down_proj, moe_inter_pad)
             S = M.shared_experts
-            qwrite(f, S.gate_proj); qwrite(f, S.up_proj); qwrite(f, S.down_proj)
+            qffn(f, S.gate_proj, S.up_proj, S.down_proj, shared_inter_pad)
         print(f"  layer {li+1}/{n_layers} ({'dense' if li<first_k_dense else 'moe'}) written", flush=True)
 
     w_f32(f, model.model.norm.weight)
-    qwrite(f, model.lm_head)
+    qw(f, model.lm_head.weight)
     f.close()
     print("wrote", path, os.path.getsize(path)//(1024*1024), "MB", flush=True)
 
