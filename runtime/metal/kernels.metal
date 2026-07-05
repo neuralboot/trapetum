@@ -450,3 +450,15 @@ kernel void mla_attn(
     for (int t = 0; t < p.seqlen; t++) acc += scores[t] * (float)ckv[t*dc + d];   // weighted latent sum
     outl[h*dc + d] = (half)acc;
 }
+
+// Scaled add into an f32 accumulator: acc[i] += alpha * y[i]. Used to combine the
+// top-k MoE expert outputs weighted by their router probabilities.
+struct SaxpyP { float alpha; int n; };
+kernel void saxpy(
+    device float* acc       [[buffer(0)]],
+    device const float* y   [[buffer(1)]],
+    constant SaxpyP& p      [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if ((int)i < p.n) acc[i] += p.alpha * y[i];
+}

@@ -291,6 +291,11 @@ __global__ void mla_attn(const __half* __restrict__ aq, const __half* __restrict
     outl[h*d_c + d] = __float2half(acc);
 }
 
+__global__ void saxpy_k(float* __restrict__ acc, const float* __restrict__ y, float alpha, int n) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) acc[i] += alpha * y[i];
+}
+
 // One dedicated stream for all device ops, so the decode chain can be CUDA-graph
 // captured (launches MUST be on the captured stream, else they are not recorded).
 static cudaStream_t g_stream = 0;
@@ -443,6 +448,11 @@ void op_mla_attn(const void* aq, const void* qr, const void* ckv, const void* kr
     size_t smem = ((size_t)d_c + seqlen) * sizeof(float);
     mla_attn<<<n_heads, d_c, smem, g_stream>>>((const __half*)aq, (const __half*)qr,
         (const __half*)ckv, (const __half*)kr, (__half*)outl, n_heads, d_c, d_rope, seqlen, scale);
+}
+
+void op_saxpy(void* acc_f32, const void* y_f32, float alpha, int n) {
+    ensure_stream();
+    saxpy_k<<<(n+255)/256, 256, 0, g_stream>>>((float*)acc_f32, (const float*)y_f32, alpha, n);
 }
 
 void dev_sync() { cudaDeviceSynchronize(); }

@@ -32,7 +32,7 @@ fn gs() -> u64 {
 const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
 const KERNELS: &[&str] = &[
     "gemv4", "cast_f2h", "rmsnorm_k", "silu_mul_k", "resadd_k", "rope_k", "vadd_k", "attn_k",
-    "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m", "attn_m", "rope_m", "mla_attn",
+    "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m", "attn_m", "rope_m", "mla_attn", "saxpy",
 ];
 
 struct Ctx {
@@ -819,4 +819,21 @@ pub unsafe fn check_mla_attn(n_heads: i32, d_c: i32, d_rope: i32, seqlen: i32) -
     }
     dev_free(daq); dev_free(dqr); dev_free(dckv); dev_free(dkr); dev_free(dout);
     worst
+}
+
+// acc += alpha * y  (f32 accumulator), for weighted MoE expert combine.
+pub unsafe fn op_saxpy(acc_f32: *mut c_void, y_f32: *const c_void, alpha: f32, n: i32) {
+    let c = ctx();
+    let cb = cur_cb();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.pl["saxpy"]);
+    enc.set_buffer(0, Some(bufref(acc_f32)), 0);
+    enc.set_buffer(1, Some(bufref(y_f32)), 0);
+    #[repr(C)]
+    struct P { alpha: f32, n: i32 }
+    let p = P { alpha, n };
+    enc.set_bytes(2, 8, &p as *const P as *const c_void);
+    let tpb = 256u64;
+    enc.dispatch_thread_groups(MTLSize::new((n as u64 + tpb - 1)/tpb, 1, 1), MTLSize::new(tpb, 1, 1));
+    enc.end_encoding();
 }

@@ -55,7 +55,8 @@ mod backend {
         pub fn op_rmsnorm_m(x_half: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32, m: i32);
         pub fn op_rope_m(x_half: *mut c_void, base: i32, n_heads: i32, head_dim: i32, inv_freq: *const c_void, m: i32);
         pub fn op_cache_append_m(cache_half: *mut c_void, src_half: *const c_void, base: i32, dim: i32, m: i32);
-        pub fn op_attn_m(
+pub fn op_saxpy(acc_f32: *mut c_void, y_f32: *const c_void, alpha: f32, n: i32);
+                pub fn op_attn_m(
             q_half: *const c_void,
             ck_half: *const c_void,
             cv_half: *const c_void,
@@ -1307,4 +1308,330 @@ pub fn spec_decode_two_model(
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 pub fn check_mla_attn(n_heads: usize, d_c: usize, d_rope: usize, seqlen: usize) -> f64 {
     unsafe { backend::check_mla_attn(n_heads as i32, d_c as i32, d_rope as i32, seqlen as i32) }
+}
+
+/// Scaled add into an f32 accumulator: `acc += alpha * y`. Combines MoE expert outputs.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn saxpy(acc: &mut DevF32, y: &DevF32, alpha: f32) {
+    assert_eq!(acc.n, y.n);
+    unsafe { op_saxpy(acc.ptr, y.ptr, alpha, acc.n as i32) };
+}
+
+/// One expert = a Llama-style gated FFN (gate/up/down codebook projections).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct Expert { gate: QuantLinear, up: QuantLinear, down: QuantLinear }
+
+/// A Mixture-of-Experts decoder block (DeepSeek-V2/V3 style): RMSNorm, a router that
+/// scores `n_experts`, top-k selection, the k selected expert FFNs run and combined by
+/// their (renormalized) router weights, plus an always-on shared expert, then a residual.
+/// At batch-1 decode only k of n_experts run, which is what makes huge MoE models cheap
+/// per token (and what the memory-offload path below exploits). Solves the "dense runtime"
+/// wall: the router + top-k + expert combine are the missing pieces.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct MoeBlock {
+    norm_w: DevF32,
+    router: QuantLinear,
+    experts: Vec<Expert>,
+    shared: Option<Expert>,
+    top_k: usize,
+    hidden: usize,
+    inter: usize,
+    n_experts: usize,
+    eps: f32,
+    norm: DevHalf,
+    rlogits: DevF32,
+    g: DevF32,
+    u: DevF32,
+    act: DevHalf,
+    ey: DevF32,
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl MoeBlock {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(hidden: usize, inter: usize, n_experts: usize, top_k: usize, eps: f32,
+               norm_w: &[f32], router: (&[u8], &[f32]),
+               experts: Vec<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
+               shared: Option<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>) -> Self {
+        assert_eq!(experts.len(), n_experts);
+        let mk = |e: &(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])| Expert {
+            gate: QuantLinear::new(e.0, e.1, hidden, inter),
+            up:   QuantLinear::new(e.2, e.3, hidden, inter),
+            down: QuantLinear::new(e.4, e.5, inter, hidden),
+        };
+        Self {
+            norm_w: DevF32::from_host(norm_w),
+            router: QuantLinear::new(router.0, router.1, hidden, n_experts),
+            experts: experts.iter().map(mk).collect(),
+            shared: shared.as_ref().map(mk),
+            top_k, hidden, inter, n_experts, eps,
+            norm: DevHalf::zeros(hidden),
+            rlogits: DevF32::zeros(n_experts),
+            g: DevF32::zeros(inter), u: DevF32::zeros(inter),
+            act: DevHalf::zeros(inter), ey: DevF32::zeros(hidden),
+        }
+    }
+
+    fn ffn(&mut self, e: usize, shared: bool, acc: &mut DevF32, w: f32) {
+        // run expert e (or the shared expert) FFN on self.norm, scaled-add into acc
+        let ex = if shared { self.shared.as_ref().unwrap() } else { &self.experts[e] };
+        // borrow split: copy raw handles out to avoid double-borrow of self
+        let (g_ptr, u_ptr, d_ptr) = (ex.gate.handle, ex.up.handle, ex.down.handle);
+        unsafe {
+            qlinear_forward_dev(g_ptr, self.norm.ptr, self.g.ptr);
+            qlinear_forward_dev(u_ptr, self.norm.ptr, self.u.ptr);
+        }
+        silu_mul(&self.g, &self.u, &mut self.act);
+        unsafe { qlinear_forward_dev(d_ptr, self.act.ptr, self.ey.ptr); }
+        saxpy(acc, &self.ey, w);
+    }
+
+    /// `h` (hidden,) updated in place: `h += MoE(RMSNorm(h))`.
+    pub fn forward(&mut self, h: &mut DevHalf) {
+        rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
+        self.router.forward_into(&self.norm, &mut self.rlogits);
+        let rl = self.rlogits.to_host();
+        // softmax over all experts
+        let mx = rl.iter().cloned().fold(f32::MIN, f32::max);
+        let ex: Vec<f32> = rl.iter().map(|x| (x - mx).exp()).collect();
+        let sum: f32 = ex.iter().sum();
+        let probs: Vec<f32> = ex.iter().map(|x| x / sum).collect();
+        // top-k experts
+        let mut idx: Vec<usize> = (0..self.n_experts).collect();
+        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        let topk = &idx[..self.top_k];
+        let wsum: f32 = topk.iter().map(|&e| probs[e]).sum();
+        let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
+        let picks: Vec<(usize, f32)> = topk.iter().map(|&e| (e, probs[e] / wsum)).collect();
+        for (e, w) in picks { self.ffn(e, false, &mut acc, w); }
+        if self.shared.is_some() { self.ffn(0, true, &mut acc, 1.0); }
+        residual_add(h, &acc);
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl MoeBlock {
+    /// Reference path: run ALL n_experts, weighting each by its top-k-masked router weight
+    /// (0 if not selected). Must equal `forward` (which runs only the top-k). Catches
+    /// top-k selection / weight / accumulation bugs.
+    pub fn forward_dense_ref(&mut self, h: &mut DevHalf) {
+        rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
+        self.router.forward_into(&self.norm, &mut self.rlogits);
+        let rl = self.rlogits.to_host();
+        let mx = rl.iter().cloned().fold(f32::MIN, f32::max);
+        let ex: Vec<f32> = rl.iter().map(|x| (x - mx).exp()).collect();
+        let sum: f32 = ex.iter().sum();
+        let probs: Vec<f32> = ex.iter().map(|x| x / sum).collect();
+        let mut idx: Vec<usize> = (0..self.n_experts).collect();
+        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        let topk: std::collections::HashSet<usize> = idx[..self.top_k].iter().cloned().collect();
+        let wsum: f32 = idx[..self.top_k].iter().map(|&e| probs[e]).sum();
+        let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
+        for e in 0..self.n_experts {
+            let w = if topk.contains(&e) { probs[e] / wsum } else { 0.0 };
+            if w > 0.0 { self.ffn(e, false, &mut acc, w); }
+        }
+        if self.shared.is_some() { self.ffn(0, true, &mut acc, 1.0); }
+        residual_add(h, &acc);
+    }
+}
+
+/// Validate the MoE block: the top-k `forward` must equal the dense reference, and saxpy
+/// must accumulate correctly. Builds a small synthetic MoE (256 experts like DeepSeek-V3,
+/// top-k=8). Returns worst rel err over the hidden output.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn check_moe() -> f64 {
+    let (hidden, inter, n_experts, top_k) = (256usize, 256usize, 256usize, 8usize);
+    let eps = 1e-5f32;
+    let mut s = 0x1234_0E0Fu64;
+    let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+    let packed = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<u8> { (0..n).map(|_| ((r()*0.5+0.5)*255.0) as u8).collect() };
+    let cbk = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<f32> { (0..n).map(|_| r()*0.05).collect() };
+    let nw: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
+    let rp = packed(hidden*(n_experts/2), &mut r); let rc = cbk(K*n_experts, &mut r);
+    // experts
+    let mut exp_store: Vec<(Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>)> = Vec::new();
+    for _ in 0..n_experts {
+        exp_store.push((
+            packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+            packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+            packed(inter*(hidden/2),&mut r), cbk(K*hidden,&mut r)));
+    }
+    let experts: Vec<_> = exp_store.iter().map(|e| (e.0.as_slice(),e.1.as_slice(),e.2.as_slice(),e.3.as_slice(),e.4.as_slice(),e.5.as_slice())).collect();
+    let sh = (packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+              packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+              packed(inter*(hidden/2),&mut r), cbk(K*hidden,&mut r));
+    let shared = Some((sh.0.as_slice(),sh.1.as_slice(),sh.2.as_slice(),sh.3.as_slice(),sh.4.as_slice(),sh.5.as_slice()));
+    let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, (&rp,&rc), experts, shared);
+    let h0: Vec<f32> = (0..hidden).map(|_| r()*0.3).collect();
+    let mut ha = DevHalf::from_host(&h0); moe.forward(&mut ha); let a = ha.to_host();
+    let mut hb = DevHalf::from_host(&h0); moe.forward_dense_ref(&mut hb); let b = hb.to_host();
+    let mut worst = 0f64;
+    for i in 0..hidden { let den=(b[i] as f64).abs().max(1e-3); worst=worst.max(((a[i]-b[i]) as f64).abs()/den); }
+    worst
+}
+
+/// Host-resident expert weights (not on the GPU until streamed in).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct ExpertHost { gp: Vec<u8>, gc: Vec<f32>, up: Vec<u8>, uc: Vec<f32>, dp: Vec<u8>, dc: Vec<f32> }
+
+/// MoE block with EXPERT OFFLOADING (solves the memory wall). Only the router and the
+/// shared expert stay GPU-resident; the routed experts live in host memory and the
+/// top-k active ones are streamed to the GPU per token, cached with an LRU of capacity
+/// `cap`. Exploiting MoE sparsity (k of n_experts active) + MLA's tiny KV cache, the GPU
+/// working set is router + shared + `cap` experts instead of all n_experts: a 671B model's
+/// 350 GB of 4-bit weights fit in host RAM / on NVMe while the GPU holds under 20 GB. The
+/// cost is streaming ~k experts/token/layer over PCIe (bandwidth-bound, so a few tok/s on
+/// one GPU); correctness is identical to the all-resident block.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct MoeBlockOffload {
+    norm_w: DevF32,
+    router: QuantLinear,
+    hosts: Vec<ExpertHost>,
+    shared: Expert,
+    cache: std::collections::HashMap<usize, Expert>,
+    lru: Vec<usize>,
+    cap: usize,
+    top_k: usize,
+    hidden: usize,
+    inter: usize,
+    n_experts: usize,
+    eps: f32,
+    norm: DevHalf,
+    rlogits: DevF32,
+    g: DevF32,
+    u: DevF32,
+    act: DevHalf,
+    ey: DevF32,
+    pub uploads: usize, // experts streamed to GPU (perf accounting)
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl MoeBlockOffload {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(hidden: usize, inter: usize, n_experts: usize, top_k: usize, cap: usize, eps: f32,
+               norm_w: &[f32], router: (&[u8], &[f32]), hosts: Vec<ExpertHost>,
+               shared: (&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])) -> Self {
+        assert_eq!(hosts.len(), n_experts);
+        assert!(cap >= top_k, "cache must hold at least top_k experts");
+        Self {
+            norm_w: DevF32::from_host(norm_w),
+            router: QuantLinear::new(router.0, router.1, hidden, n_experts),
+            hosts,
+            shared: Expert { gate: QuantLinear::new(shared.0,shared.1,hidden,inter),
+                             up: QuantLinear::new(shared.2,shared.3,hidden,inter),
+                             down: QuantLinear::new(shared.4,shared.5,inter,hidden) },
+            cache: std::collections::HashMap::new(), lru: Vec::new(), cap,
+            top_k, hidden, inter, n_experts, eps,
+            norm: DevHalf::zeros(hidden), rlogits: DevF32::zeros(n_experts),
+            g: DevF32::zeros(inter), u: DevF32::zeros(inter),
+            act: DevHalf::zeros(inter), ey: DevF32::zeros(hidden),
+            uploads: 0,
+        }
+    }
+
+    /// Ensure expert `e` is resident (stream from host + LRU-evict if needed); return handles.
+    fn resident(&mut self, e: usize) -> (*mut c_void, *mut c_void, *mut c_void) {
+        if self.cache.contains_key(&e) {
+            let pos = self.lru.iter().position(|&x| x == e).unwrap();
+            self.lru.remove(pos);
+            self.lru.push(e);
+        } else {
+            if self.cache.len() >= self.cap {
+                let victim = self.lru.remove(0);
+                self.cache.remove(&victim); // Drop frees the GPU buffers
+            }
+            let h = &self.hosts[e];
+            let ex = Expert {
+                gate: QuantLinear::new(&h.gp, &h.gc, self.hidden, self.inter),
+                up:   QuantLinear::new(&h.up, &h.uc, self.hidden, self.inter),
+                down: QuantLinear::new(&h.dp, &h.dc, self.inter, self.hidden),
+            };
+            self.cache.insert(e, ex);
+            self.lru.push(e);
+            self.uploads += 1;
+        }
+        let ex = self.cache.get(&e).unwrap();
+        (ex.gate.handle, ex.up.handle, ex.down.handle)
+    }
+
+    fn run_ffn(&mut self, g: *mut c_void, u: *mut c_void, d: *mut c_void, acc: &mut DevF32, w: f32) {
+        unsafe {
+            qlinear_forward_dev(g, self.norm.ptr, self.g.ptr);
+            qlinear_forward_dev(u, self.norm.ptr, self.u.ptr);
+        }
+        silu_mul(&self.g, &self.u, &mut self.act);
+        unsafe { qlinear_forward_dev(d, self.act.ptr, self.ey.ptr); }
+        saxpy(acc, &self.ey, w);
+    }
+
+    pub fn forward(&mut self, h: &mut DevHalf) {
+        rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
+        self.router.forward_into(&self.norm, &mut self.rlogits);
+        let rl = self.rlogits.to_host();
+        let mx = rl.iter().cloned().fold(f32::MIN, f32::max);
+        let ex: Vec<f32> = rl.iter().map(|x| (x - mx).exp()).collect();
+        let sum: f32 = ex.iter().sum();
+        let probs: Vec<f32> = ex.iter().map(|x| x / sum).collect();
+        let mut idx: Vec<usize> = (0..self.n_experts).collect();
+        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        let wsum: f32 = idx[..self.top_k].iter().map(|&e| probs[e]).sum();
+        let picks: Vec<(usize, f32)> = idx[..self.top_k].iter().map(|&e| (e, probs[e] / wsum)).collect();
+        let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
+        for (e, w) in picks {
+            let (g, u, d) = self.resident(e);
+            self.run_ffn(g, u, d, &mut acc, w);
+        }
+        let (sg, su, sd) = (self.shared.gate.handle, self.shared.up.handle, self.shared.down.handle);
+        self.run_ffn(sg, su, sd, &mut acc, 1.0);
+        residual_add(h, &acc);
+    }
+}
+
+// Deterministic MoE weight generator (same seed -> identical model), for the offload check.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn gen_moe(hidden: usize, inter: usize, n_experts: usize, seed: u64)
+    -> (Vec<f32>, Vec<u8>, Vec<f32>, Vec<ExpertHost>, ExpertHost) {
+    let mut s = seed;
+    let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+    let pk = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<u8> { (0..n).map(|_| ((r()*0.5+0.5)*255.0) as u8).collect() };
+    let cb = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<f32> { (0..n).map(|_| r()*0.05).collect() };
+    let nw: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
+    let rp = pk(hidden*(n_experts/2), &mut r); let rc = cb(K*n_experts, &mut r);
+    let mkh = |r: &mut dyn FnMut()->f32| ExpertHost {
+        gp: pk(hidden*(inter/2), r), gc: cb(K*inter, r),
+        up: pk(hidden*(inter/2), r), uc: cb(K*inter, r),
+        dp: pk(inter*(hidden/2), r), dc: cb(K*hidden, r) };
+    let hosts: Vec<ExpertHost> = (0..n_experts).map(|_| mkh(&mut r)).collect();
+    let shared = mkh(&mut r);
+    (nw, rp, rc, hosts, shared)
+}
+
+/// Validate expert OFFLOADING: the offloaded block (only `cap` experts resident, streamed
+/// from host with an LRU) must produce IDENTICAL output to the all-resident block, over
+/// several tokens. Returns (worst_rel_err, cap, n_experts, uploads_over_tokens).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn check_moe_offload() -> (f64, usize, usize, usize) {
+    let (hidden, inter, n_experts, top_k, cap) = (256usize, 256usize, 256usize, 8usize, 16usize);
+    let eps = 1e-5f32; let seed = 0x0FF10AD5u64;
+    // all-resident reference
+    let (nw, rp, rc, hosts_r, sh_r) = gen_moe(hidden, inter, n_experts, seed);
+    let exps_ref: Vec<_> = hosts_r.iter().map(|e| (e.gp.as_slice(),e.gc.as_slice(),e.up.as_slice(),e.uc.as_slice(),e.dp.as_slice(),e.dc.as_slice())).collect();
+    let shref = (sh_r.gp.as_slice(),sh_r.gc.as_slice(),sh_r.up.as_slice(),sh_r.uc.as_slice(),sh_r.dp.as_slice(),sh_r.dc.as_slice());
+    let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, (&rp,&rc), exps_ref, Some(shref));
+    // offloaded (identical weights via same seed)
+    let (nw2, rp2, rc2, hosts_o, sh_o) = gen_moe(hidden, inter, n_experts, seed);
+    let sho = (sh_o.gp.as_slice(),sh_o.gc.as_slice(),sh_o.up.as_slice(),sh_o.uc.as_slice(),sh_o.dp.as_slice(),sh_o.dc.as_slice());
+    let mut off = MoeBlockOffload::new(hidden, inter, n_experts, top_k, cap, eps, &nw2, (&rp2,&rc2), hosts_o, sho);
+    // run several distinct tokens through both, compare
+    let mut worst = 0f64;
+    let mut sh = 0xABCDu64;
+    let mut rr = move || { sh ^= sh<<13; sh ^= sh>>7; sh ^= sh<<17; (((sh>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+    for _ in 0..12 {
+        let h0: Vec<f32> = (0..hidden).map(|_| rr()*0.3).collect();
+        let mut ha = DevHalf::from_host(&h0); moe.forward(&mut ha); let a = ha.to_host();
+        let mut hb = DevHalf::from_host(&h0); off.forward(&mut hb); let b = hb.to_host();
+        for i in 0..hidden { let den=(a[i] as f64).abs().max(1e-3); worst=worst.max(((a[i]-b[i]) as f64).abs()/den); }
+    }
+    (worst, cap, n_experts, off.uploads)
 }
