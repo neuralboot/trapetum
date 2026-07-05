@@ -42,15 +42,24 @@ fn main() {
     let alpha = accepts as f64 / n as f64;
     let t_target = tt / n as f64 * 1e3;   // ms/token
     let t_draft = dt / n as f64 * 1e3;
-    let ratio = t_draft / (tt / n as f64) / (1.0) ; // t_draft/t_target
-    let r = (dt / n as f64) / (tt / n as f64);
-    let speedup = (1.0 + alpha) / (1.0 + r);
-    let _ = ratio;
-    println!("\n=== speculative decode K=1: measured ===");
+    let r = (dt / n as f64) / (tt / n as f64); // t_draft/t_target
+    println!("\n=== speculative decode: measured ===");
     println!("acceptance alpha        : {alpha:.3}  ({accepts}/{n})");
     println!("target latency          : {t_target:.2} ms/token  ({:.1} tok/s)", 1e3/t_target);
     println!("drafter latency         : {t_draft:.2} ms/token  ({:.1} tok/s)", 1e3/t_draft);
     println!("draft/target cost ratio : {r:.3}");
-    println!("projected speedup       : {speedup:.2}x   [(1+alpha)/(1+ratio)]");
-    println!("  (tokens/target-forward = 1+alpha = {:.2}; verify is ~free, bandwidth-bound)", 1.0+alpha);
+    // K-sweep: expected tokens per target forward = sum_{i=0..K} alpha^i = (1-a^(K+1))/(1-a);
+    // per iteration cost = 1 target verify + K drafter forwards. Speedup vs plain decode:
+    //   S(K) = tokens_per_forward(K) / (1 + K*ratio). The verify is bandwidth-bound (M<=4),
+    //   so the target forward stays ~1 regardless of K.
+    println!("\n=== projected speedup by block size K (from measured alpha, ratio) ===");
+    let mut best = (1usize, 0f64);
+    for k in 1usize..=3 {
+        let toks = if (alpha - 1.0).abs() < 1e-9 { (k + 1) as f64 }
+                   else { (1.0 - alpha.powi(k as i32 + 1)) / (1.0 - alpha) };
+        let speedup = toks / (1.0 + k as f64 * r);
+        if speedup > best.1 { best = (k, speedup); }
+        println!("  K={k}  tokens/forward={toks:.2}  speedup={speedup:.2}x");
+    }
+    println!("optimal K = {}  ->  {:.2}x  (lossless; verify validated on CUDA via spec_check)", best.0, best.1);
 }
