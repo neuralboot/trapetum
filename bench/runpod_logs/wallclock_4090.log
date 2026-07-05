@@ -1,0 +1,104 @@
+===== [0] env =====
+NVIDIA GeForce RTX 4090, 24564 MiB
+               total        used        free      shared  buff/cache   available
+Mem:             503          43          79           0         380         454
+[notice] To update, run: python -m pip install --upgrade pip
+numpy 1.26.3 torch 2.2.0+cu121
+===== [1] unpack + build =====
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'SCHILY.fflags'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.FinderInfo'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+warning: `trapetum` (lib) generated 10 warnings (run `cargo fix --lib -p trapetum` to apply 8 suggestions)
+    Finished `release` profile [optimized] target(s) in 34.06s
+======= PAIR llama2: NousResearch/Llama-2-7b-hf + JackFram/llama-160m ======
+Fetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 10 files:  30%|███       | 3/10 [00:24<00:58,  8.30s/it]Fetching 10 files: 100%|██████████| 10/10 [00:24<00:00,  2.49s/it]
+Fetching 8 files:   0%|          | 0/8 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 8 files:  38%|███▊      | 3/8 [00:02<00:04,  1.10it/s]Fetching 8 files: 100%|██████████| 8/8 [00:02<00:00,  2.94it/s]
+target snap /root/.cache/huggingface/hub/models--NousResearch--Llama-2-7b-hf/snapshots/8efe6c9b93655b934e27bd9981e3ec13e55aee9d
+drafter snap /root/.cache/huggingface/hub/models--JackFram--llama-160m/snapshots/aca9b687d1425f863dcf5de9a4c96e3fe36266dd
+  layer 32/32
+wrote /root/m_llama2_t/model.cbk 3486 MB
+  layer 12/12
+wrote /root/m_llama2_d/model.cbk 121 MB
+prompt ids: 1 450 7483 310 3444 338
+loaded target+drafter in 2.9s  (vocab 32000 / 32000)
+plain greedy :   123.8 tok/s  (128 tokens in 1.03s)
+spec  K=1   :    41.6 tok/s  speedup 0.34x  target_fwds 67  drafter_fwds 140  eff_accept 0.910  lossless YES
+spec  K=2   :    39.0 tok/s  speedup 0.31x  target_fwds 48  drafter_fwds 150  eff_accept 0.833  lossless YES
+spec  K=3   :    37.5 tok/s  speedup 0.30x  target_fwds 39  drafter_fwds 162  eff_accept 0.761  lossless YES
+continuation ids: [29892, 1728, 263, 7404, 29892, 697, 310, 278, 1556, 9560, 14368, 297, 278, 3186, 29889, 8510, 29894, 13, 1576, 29871, 29896, 29900, 1556, 9560]
+======= PAIR qwen25: Qwen/Qwen2.5-7B-Instruct + Qwen/Qwen2.5-1.5B-Instruct ======
+Fetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 10 files:  30%|███       | 3/10 [00:06<00:15,  2.22s/it]Fetching 10 files:  40%|████      | 4/10 [00:07<00:10,  1.80s/it]Fetching 10 files: 100%|██████████| 10/10 [00:07<00:00,  1.32it/s]
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 6 files:  50%|█████     | 3/6 [00:04<00:04,  1.59s/it]Fetching 6 files: 100%|██████████| 6/6 [00:04<00:00,  1.26it/s]
+target snap /root/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
+drafter snap /root/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306
+  layer 28/28
+wrote /root/m_qwen25_t/model.cbk 4506 MB
+  layer 28/28
+wrote /root/m_qwen25_d/model.cbk 1230 MB
+prompt ids: 785 6722 315 9625 374
+loaded target+drafter in 6.8s  (vocab 152064 / 152064)
+plain greedy :   112.3 tok/s  (128 tokens in 1.14s)
+
+thread 'main' (3856) panicked at src/lib.rs:512:9:
+batched forward_m does not support attention bias yet
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+======= PAIR llama3: unsloth/Meta-Llama-3.1-8B-Instruct + unsloth/Llama-3.2-1B-Instruct ======
+Fetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 10 files:  30%|███       | 3/10 [00:05<00:11,  1.70s/it]Fetching 10 files: 100%|██████████| 10/10 [00:05<00:00,  1.97it/s]
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 6 files:  50%|█████     | 3/6 [00:04<00:04,  1.45s/it]Fetching 6 files: 100%|██████████| 6/6 [00:04<00:00,  1.38it/s]
+target snap /root/.cache/huggingface/hub/models--unsloth--Meta-Llama-3.1-8B-Instruct/snapshots/a2856192dd7c25b842431f39c179a6c2c2f627d1
+drafter snap /root/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct/snapshots/5a8abab4a5d6f164389b1079fb721cfab8d7126c
+  layer 32/32
+wrote /root/m_llama3_t/model.cbk 4673 MB
+  layer 16/16
+wrote /root/m_llama3_d/model.cbk 1121 MB
+prompt ids: 128000 791 6864 315 9822 374
+loaded target+drafter in 5.7s  (vocab 128256 / 128256)
+plain greedy :   117.9 tok/s  (128 tokens in 1.09s)
+spec  K=1   :    30.6 tok/s  speedup 0.26x  target_fwds 76  drafter_fwds 158  eff_accept 0.684  lossless YES
+spec  K=2   :    28.2 tok/s  speedup 0.24x  target_fwds 57  drafter_fwds 177  eff_accept 0.623  lossless YES
+spec  K=3   :    26.1 tok/s  speedup 0.22x  target_fwds 48  drafter_fwds 198  eff_accept 0.556  lossless YES
+continuation ids: [264, 3363, 430, 3966, 912, 17219, 13, 12366, 11, 279, 4409, 315, 8828, 11, 374, 11495, 369, 1202, 20441, 18112, 11, 1917, 15144, 51677]
+===== WALLCLOCK ALLDONE =====
