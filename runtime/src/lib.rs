@@ -1338,6 +1338,7 @@ pub struct MoeBlock {
     top_k: usize,
     hidden: usize,
     inter: usize,
+    shared_inter: usize,
     n_experts: usize,
     eps: f32,
     norm: DevHalf,
@@ -1346,17 +1347,22 @@ pub struct MoeBlock {
     u: DevF32,
     act: DevHalf,
     ey: DevF32,
+    g_sh: DevF32,
+    u_sh: DevF32,
+    act_sh: DevHalf,
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl MoeBlock {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(hidden: usize, inter: usize, n_experts: usize, top_k: usize, eps: f32,
                norm_w: &[f32], router_w: &[f32],
                experts: Vec<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
-               shared: Option<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>) -> Self {
+               shared: Option<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
+               shared_inter: usize) -> Self {
         assert_eq!(experts.len(), n_experts);
-        let mk = |e: &(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])| Expert {
+        let mk = |e: &(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32]), inter: usize| Expert {
             gate: QuantLinear::new(e.0, e.1, hidden, inter),
             up:   QuantLinear::new(e.2, e.3, hidden, inter),
             down: QuantLinear::new(e.4, e.5, inter, hidden),
@@ -1364,20 +1370,21 @@ impl MoeBlock {
         Self {
             norm_w: DevF32::from_host(norm_w),
             router: DenseLinear::new(router_w, hidden, n_experts),
-            experts: experts.iter().map(mk).collect(),
-            shared: shared.as_ref().map(mk),
-            top_k, hidden, inter, n_experts, eps,
+            experts: experts.iter().map(|e| mk(e, inter)).collect(),
+            shared: shared.as_ref().map(|e| mk(e, shared_inter)),  // DeepSeek shared expert is bigger (n_shared*moe_inter)
+            top_k, hidden, inter, shared_inter, n_experts, eps,
             norm: DevHalf::zeros(hidden),
             rlogits: DevF32::zeros(n_experts),
             g: DevF32::zeros(inter), u: DevF32::zeros(inter),
             act: DevHalf::zeros(inter), ey: DevF32::zeros(hidden),
+            g_sh: DevF32::zeros(shared_inter.max(1)), u_sh: DevF32::zeros(shared_inter.max(1)),
+            act_sh: DevHalf::zeros(shared_inter.max(1)),
         }
     }
 
-    fn ffn(&mut self, e: usize, shared: bool, acc: &mut DevF32, w: f32) {
-        // run expert e (or the shared expert) FFN on self.norm, scaled-add into acc
-        let ex = if shared { self.shared.as_ref().unwrap() } else { &self.experts[e] };
-        // borrow split: copy raw handles out to avoid double-borrow of self
+    fn ffn(&mut self, e: usize, acc: &mut DevF32, w: f32) {
+        // run routed expert e FFN on self.norm (inter-sized scratch), scaled-add into acc
+        let ex = &self.experts[e];
         let (g_ptr, u_ptr, d_ptr) = (ex.gate.handle, ex.up.handle, ex.down.handle);
         unsafe {
             qlinear_forward_dev(g_ptr, self.norm.ptr, self.g.ptr);
@@ -1386,6 +1393,19 @@ impl MoeBlock {
         silu_mul(&self.g, &self.u, &mut self.act);
         unsafe { qlinear_forward_dev(d_ptr, self.act.ptr, self.ey.ptr); }
         saxpy(acc, &self.ey, w);
+    }
+
+    fn run_shared(&mut self, acc: &mut DevF32) {
+        // shared expert uses its own (larger) scratch (shared_inter)
+        let ex = self.shared.as_ref().unwrap();
+        let (g_ptr, u_ptr, d_ptr) = (ex.gate.handle, ex.up.handle, ex.down.handle);
+        unsafe {
+            qlinear_forward_dev(g_ptr, self.norm.ptr, self.g_sh.ptr);
+            qlinear_forward_dev(u_ptr, self.norm.ptr, self.u_sh.ptr);
+        }
+        silu_mul(&self.g_sh, &self.u_sh, &mut self.act_sh);
+        unsafe { qlinear_forward_dev(d_ptr, self.act_sh.ptr, self.ey.ptr); }
+        saxpy(acc, &self.ey, 1.0);
     }
 
     /// `h` (hidden,) updated in place: `h += MoE(RMSNorm(h))`.
@@ -1405,8 +1425,8 @@ impl MoeBlock {
         let wsum: f32 = topk.iter().map(|&e| probs[e]).sum();
         let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
         let picks: Vec<(usize, f32)> = topk.iter().map(|&e| (e, probs[e] / wsum)).collect();
-        for (e, w) in picks { self.ffn(e, false, &mut acc, w); }
-        if self.shared.is_some() { self.ffn(0, true, &mut acc, 1.0); }
+        for (e, w) in picks { self.ffn(e, &mut acc, w); }
+        if self.shared.is_some() { self.run_shared(&mut acc); }
         residual_add(h, &acc);
     }
 }
@@ -1431,9 +1451,9 @@ impl MoeBlock {
         let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
         for e in 0..self.n_experts {
             let w = if topk.contains(&e) { probs[e] / wsum } else { 0.0 };
-            if w > 0.0 { self.ffn(e, false, &mut acc, w); }
+            if w > 0.0 { self.ffn(e, &mut acc, w); }
         }
-        if self.shared.is_some() { self.ffn(0, true, &mut acc, 1.0); }
+        if self.shared.is_some() { self.run_shared(&mut acc); }
         residual_add(h, &acc);
     }
 }
@@ -1464,7 +1484,7 @@ pub fn check_moe() -> f64 {
               packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
               packed(inter*(hidden/2),&mut r), cbk(K*hidden,&mut r));
     let shared = Some((sh.0.as_slice(),sh.1.as_slice(),sh.2.as_slice(),sh.3.as_slice(),sh.4.as_slice(),sh.5.as_slice()));
-    let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, &rw, experts, shared);
+    let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, &rw, experts, shared, inter);
     let h0: Vec<f32> = (0..hidden).map(|_| r()*0.3).collect();
     let mut ha = DevHalf::from_host(&h0); moe.forward(&mut ha); let a = ha.to_host();
     let mut hb = DevHalf::from_host(&h0); moe.forward_dense_ref(&mut hb); let b = hb.to_host();
@@ -1620,7 +1640,7 @@ pub fn check_moe_offload() -> (f64, usize, usize, usize) {
     let (nw, rw, hosts_r, sh_r) = gen_moe(hidden, inter, n_experts, seed);
     let exps_ref: Vec<_> = hosts_r.iter().map(|e| (e.gp.as_slice(),e.gc.as_slice(),e.up.as_slice(),e.uc.as_slice(),e.dp.as_slice(),e.dc.as_slice())).collect();
     let shref = (sh_r.gp.as_slice(),sh_r.gc.as_slice(),sh_r.up.as_slice(),sh_r.uc.as_slice(),sh_r.dp.as_slice(),sh_r.dc.as_slice());
-    let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, &rw, exps_ref, Some(shref));
+    let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, &rw, exps_ref, Some(shref), inter);
     // offloaded (identical weights via same seed)
     let (nw2, rw2, hosts_o, sh_o) = gen_moe(hidden, inter, n_experts, seed);
     let sho = (sh_o.gp.as_slice(),sh_o.gc.as_slice(),sh_o.up.as_slice(),sh_o.uc.as_slice(),sh_o.dp.as_slice(),sh_o.dc.as_slice());
@@ -1980,7 +2000,7 @@ impl DeepSeekModel {
                           rd_u8_vec(&mut r, si*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
                 let experts: Vec<_> = estore.iter().map(|e| (e.0.as_slice(),e.1.as_slice(),e.2.as_slice(),e.3.as_slice(),e.4.as_slice(),e.5.as_slice())).collect();
                 let shared = Some((sh.0.as_slice(),sh.1.as_slice(),sh.2.as_slice(),sh.3.as_slice(),sh.4.as_slice(),sh.5.as_slice()));
-                DsFfn::Moe(MoeBlock::new(hidden, moe_inter, n_routed, top_k, eps, &post_norm, &rw, experts, shared))
+                DsFfn::Moe(MoeBlock::new(hidden, moe_inter, n_routed, top_k, eps, &post_norm, &rw, experts, shared, si))
             };
             layers.push(DsLayer { attn_norm: DevF32::from_host(&attn_norm), attn, ffn });
             eprintln!("  loaded layer {}/{}", li+1, n_layers);
