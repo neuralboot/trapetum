@@ -21,3 +21,7 @@ paper/*.txt
 paper/*.tex
 __pycache__/
 *.pyc
+
+# compressed drafter/target model blobs (large)
+drafters/**/*.cbk
+drafters/**/*.bin
