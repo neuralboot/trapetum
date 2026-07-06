@@ -1472,6 +1472,41 @@ pub fn saxpy(acc: &mut DevF32, y: &DevF32, alpha: f32) {
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct Expert { gate: QuantLinear, up: QuantLinear, down: QuantLinear }
 
+/// DeepSeek-V3/R1 router scoring ("noaux_tc", `scoring_func="sigmoid"`, `topk_method=
+/// "noaux_tc"`): `s = sigmoid(logits)`; `sb = s + score_bias` (the learned per-expert
+/// correction, decoupled from the loss so it does NOT bias the combine weights); experts
+/// are split into `n_group` equal groups, each group's score is the sum of its top-2 `sb`
+/// values, and only the `topk_group` best groups stay eligible; the final `top_k` experts
+/// are the highest-`sb` experts among the eligible groups; combine weights are `s` (NOT
+/// `sb`) renormalized to sum to 1 over the selection, then scaled by `rscale`. Returns
+/// `(expert, weight)` pairs, `top_k` of them.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn moe_route_v3(logits: &[f32], score_bias: &[f32], n_experts: usize, n_group: usize,
+                 topk_group: usize, top_k: usize, rscale: f32) -> Vec<(usize, f32)> {
+    assert_eq!(logits.len(), n_experts);
+    assert_eq!(score_bias.len(), n_experts);
+    let s: Vec<f32> = logits.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
+    let sb: Vec<f32> = s.iter().zip(score_bias.iter()).map(|(a, b)| a + b).collect();
+    let group_size = n_experts / n_group;
+    let group_score = |g: usize| -> f32 {
+        let (start, end) = (g * group_size, (g + 1) * group_size);
+        let mut top2 = [f32::MIN, f32::MIN];
+        for &v in &sb[start..end] {
+            if v > top2[0] { top2[1] = top2[0]; top2[0] = v; } else if v > top2[1] { top2[1] = v; }
+        }
+        if group_size >= 2 { top2[0] + top2[1] } else { top2[0] }
+    };
+    let mut gidx: Vec<usize> = (0..n_group).collect();
+    let gscores: Vec<f32> = (0..n_group).map(group_score).collect();
+    gidx.sort_by(|&a, &b| gscores[b].partial_cmp(&gscores[a]).unwrap());
+    let eligible: std::collections::HashSet<usize> = gidx[..topk_group].iter().cloned().collect();
+    let mut idx: Vec<usize> = (0..n_experts).filter(|&e| eligible.contains(&(e / group_size))).collect();
+    idx.sort_by(|&a, &b| sb[b].partial_cmp(&sb[a]).unwrap());
+    idx.truncate(top_k);
+    let wsum: f32 = idx.iter().map(|&e| s[e]).sum();
+    idx.iter().map(|&e| (e, rscale * s[e] / wsum)).collect()
+}
+
 /// A Mixture-of-Experts decoder block (DeepSeek-V2/V3 style): RMSNorm, a router that
 /// scores `n_experts`, top-k selection, the k selected expert FFNs run and combined by
 /// their (renormalized) router weights, plus an always-on shared expert, then a residual.
@@ -1500,6 +1535,12 @@ pub struct MoeBlock {
     g_sh: DevF32,
     u_sh: DevF32,
     act_sh: DevHalf,
+    // V3 (DeepSeek-V3/R1) sigmoid+bias grouped router ("noaux_tc"); None/false reproduces
+    // the V2 plain-softmax top-k path exactly. See `moe_route_v3`.
+    score_bias: Option<Vec<f32>>,
+    n_group: usize,
+    topk_group: usize,
+    sigmoid: bool,
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -1529,6 +1570,40 @@ impl MoeBlock {
             act: DevHalf::zeros(inter), ey: DevF32::zeros(hidden),
             g_sh: DevF32::zeros(shared_inter.max(1)), u_sh: DevF32::zeros(shared_inter.max(1)),
             act_sh: DevHalf::zeros(shared_inter.max(1)),
+            score_bias: None, n_group: 0, topk_group: 0, sigmoid: false,
+        }
+    }
+
+    /// Switch this block's router to DeepSeek-V3's sigmoid+bias grouped top-k ("noaux_tc"):
+    /// `score_bias` is the learned `e_score_correction_bias` (length `n_experts`), experts
+    /// are split into `n_group` equal groups and only the `topk_group` best-scoring groups
+    /// are eligible. Leaves `top_k`/`rscale` (set at construction) unchanged.
+    pub fn set_v3_scoring(&mut self, score_bias: Vec<f32>, n_group: usize, topk_group: usize) {
+        assert_eq!(score_bias.len(), self.n_experts);
+        assert_eq!(self.n_experts % n_group, 0, "n_experts must be divisible by n_group");
+        self.score_bias = Some(score_bias);
+        self.n_group = n_group;
+        self.topk_group = topk_group;
+        self.sigmoid = true;
+    }
+
+    /// Router top-k selection: `(expert, weight)` pairs, `weight` already `rscale`-scaled and
+    /// normalized to sum to `rscale` over the selected experts. Shared between `forward` and
+    /// `forward_dense_ref` so both paths score identically.
+    fn route(&self, rl: &[f32]) -> Vec<(usize, f32)> {
+        if self.sigmoid {
+            let bias = self.score_bias.as_ref().expect("v3 scoring requires score_bias");
+            moe_route_v3(rl, bias, self.n_experts, self.n_group, self.topk_group, self.top_k, self.rscale)
+        } else {
+            let mx = rl.iter().cloned().fold(f32::MIN, f32::max);
+            let ex: Vec<f32> = rl.iter().map(|x| (x - mx).exp()).collect();
+            let sum: f32 = ex.iter().sum();
+            let probs: Vec<f32> = ex.iter().map(|x| x / sum).collect();
+            let mut idx: Vec<usize> = (0..self.n_experts).collect();
+            idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            let topk = &idx[..self.top_k];
+            let wsum: f32 = topk.iter().map(|&e| probs[e]).sum();
+            topk.iter().map(|&e| (e, self.rscale * probs[e] / wsum)).collect()
         }
     }
 
@@ -1563,18 +1638,8 @@ impl MoeBlock {
         rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
         self.router.forward_into(&self.norm, &mut self.rlogits);
         let rl = self.rlogits.to_host();
-        // softmax over all experts
-        let mx = rl.iter().cloned().fold(f32::MIN, f32::max);
-        let ex: Vec<f32> = rl.iter().map(|x| (x - mx).exp()).collect();
-        let sum: f32 = ex.iter().sum();
-        let probs: Vec<f32> = ex.iter().map(|x| x / sum).collect();
-        // top-k experts
-        let mut idx: Vec<usize> = (0..self.n_experts).collect();
-        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-        let topk = &idx[..self.top_k];
-        let wsum: f32 = topk.iter().map(|&e| probs[e]).sum();
+        let picks = self.route(&rl);
         let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
-        let picks: Vec<(usize, f32)> = topk.iter().map(|&e| (e, self.rscale * probs[e] / wsum)).collect();
         for (e, w) in picks { self.ffn(e, &mut acc, w); }
         if self.shared.is_some() { self.run_shared(&mut acc); }
         residual_add(h, &acc);
@@ -1590,17 +1655,11 @@ impl MoeBlock {
         rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
         self.router.forward_into(&self.norm, &mut self.rlogits);
         let rl = self.rlogits.to_host();
-        let mx = rl.iter().cloned().fold(f32::MIN, f32::max);
-        let ex: Vec<f32> = rl.iter().map(|x| (x - mx).exp()).collect();
-        let sum: f32 = ex.iter().sum();
-        let probs: Vec<f32> = ex.iter().map(|x| x / sum).collect();
-        let mut idx: Vec<usize> = (0..self.n_experts).collect();
-        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-        let topk: std::collections::HashSet<usize> = idx[..self.top_k].iter().cloned().collect();
-        let wsum: f32 = idx[..self.top_k].iter().map(|&e| probs[e]).sum();
+        let picks = self.route(&rl);
+        let weights: std::collections::HashMap<usize, f32> = picks.into_iter().collect();
         let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
         for e in 0..self.n_experts {
-            let w = if topk.contains(&e) { self.rscale * probs[e] / wsum } else { 0.0 };
+            let w = *weights.get(&e).unwrap_or(&0.0);
             if w > 0.0 { self.ffn(e, &mut acc, w); }
         }
         if self.shared.is_some() { self.run_shared(&mut acc); }
@@ -1676,6 +1735,12 @@ pub struct MoeBlockOffload {
     act: DevHalf,
     ey: DevF32,
     pub uploads: usize, // experts streamed to GPU (perf accounting)
+    rscale: f32,
+    // V3 (DeepSeek-V3/R1) sigmoid+bias grouped router; see `MoeBlock`/`moe_route_v3`.
+    score_bias: Option<Vec<f32>>,
+    n_group: usize,
+    topk_group: usize,
+    sigmoid: bool,
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -1699,6 +1764,38 @@ impl MoeBlockOffload {
             g: DevF32::zeros(inter), u: DevF32::zeros(inter),
             act: DevHalf::zeros(inter), ey: DevF32::zeros(hidden),
             uploads: 0,
+            rscale: 1.0,
+            score_bias: None, n_group: 0, topk_group: 0, sigmoid: false,
+        }
+    }
+
+    /// Set the `routed_scaling_factor` combine-weight multiplier (default 1.0).
+    pub fn set_rscale(&mut self, rscale: f32) { self.rscale = rscale; }
+
+    /// Switch to DeepSeek-V3's sigmoid+bias grouped top-k router. See `MoeBlock::set_v3_scoring`.
+    pub fn set_v3_scoring(&mut self, score_bias: Vec<f32>, n_group: usize, topk_group: usize) {
+        assert_eq!(score_bias.len(), self.n_experts);
+        assert_eq!(self.n_experts % n_group, 0, "n_experts must be divisible by n_group");
+        self.score_bias = Some(score_bias);
+        self.n_group = n_group;
+        self.topk_group = topk_group;
+        self.sigmoid = true;
+    }
+
+    fn route(&self, rl: &[f32]) -> Vec<(usize, f32)> {
+        if self.sigmoid {
+            let bias = self.score_bias.as_ref().expect("v3 scoring requires score_bias");
+            moe_route_v3(rl, bias, self.n_experts, self.n_group, self.topk_group, self.top_k, self.rscale)
+        } else {
+            let mx = rl.iter().cloned().fold(f32::MIN, f32::max);
+            let ex: Vec<f32> = rl.iter().map(|x| (x - mx).exp()).collect();
+            let sum: f32 = ex.iter().sum();
+            let probs: Vec<f32> = ex.iter().map(|x| x / sum).collect();
+            let mut idx: Vec<usize> = (0..self.n_experts).collect();
+            idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            let topk = &idx[..self.top_k];
+            let wsum: f32 = topk.iter().map(|&e| probs[e]).sum();
+            topk.iter().map(|&e| (e, self.rscale * probs[e] / wsum)).collect()
         }
     }
 
@@ -1741,14 +1838,7 @@ impl MoeBlockOffload {
         rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
         self.router.forward_into(&self.norm, &mut self.rlogits);
         let rl = self.rlogits.to_host();
-        let mx = rl.iter().cloned().fold(f32::MIN, f32::max);
-        let ex: Vec<f32> = rl.iter().map(|x| (x - mx).exp()).collect();
-        let sum: f32 = ex.iter().sum();
-        let probs: Vec<f32> = ex.iter().map(|x| x / sum).collect();
-        let mut idx: Vec<usize> = (0..self.n_experts).collect();
-        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-        let wsum: f32 = idx[..self.top_k].iter().map(|&e| probs[e]).sum();
-        let picks: Vec<(usize, f32)> = idx[..self.top_k].iter().map(|&e| (e, probs[e] / wsum)).collect();
+        let picks = self.route(&rl);
         let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
         for (e, w) in picks {
             let (g, u, d) = self.resident(e);
@@ -1845,11 +1935,17 @@ pub fn mla_attention(aq: &DevHalf, qr: &DevHalf, ckv: &DevHalf, kr: &DevHalf, ou
 /// validated `mla_attn` kernel with absorbed queries; the small projection matrices are
 /// dense fp16. Correctness-first: the per-head absorption (W_UK/W_UV) + rope + splits run
 /// on the host, the heavy projections + attention on the GPU. Solves the attention wall.
+///
+/// A second variant (`new_qlora`, DeepSeek-V3/R1) replaces the single dense `q_proj` with
+/// q_lora: `q_a_proj` (dense) -> RMSNorm -> `q_b_proj` (4-bit codebook, since q_lora_rank ->
+/// qdim is a much bigger matrix at 671B scale); `o_proj` can likewise be 4-bit (`o_quant`).
+/// Both variants share the same cache/attention/absorption code below `q_lora`/`o_quant`
+/// being `None` reproduces the V2-Lite dense path exactly.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct MlaAttn {
-    q_proj: DenseLinear,
+    q_proj: Option<DenseLinear>,
     kv_a: DenseLinear,
-    o_proj: DenseLinear,
+    o_proj: Option<DenseLinear>,
     kv_a_norm: Vec<f32>,          // [d_c]
     kv_b: Vec<f32>,               // [n_heads*(nope+v_head_dim)][d_c]  (W_UK ++ W_UV per head)
     inv_freq: Vec<f32>,           // [d_rope/2]
@@ -1861,6 +1957,19 @@ pub struct MlaAttn {
     ckv_h: DevHalf, kr_h: DevHalf,
     qf: DevF32, kvf: DevF32, attn_dev: DevHalf, o_out: DevF32,
     pub last_attn: Vec<f32>,      // pre-o_proj per-head values (for validation)
+    q_lora: Option<QLoraQ>,
+    o_quant: Option<QuantLinear>,
+}
+
+/// q_lora scratch + weights for `MlaAttn::new_qlora` (DeepSeek-V3/R1 q path):
+/// `h -> q_a (dense) -> RMSNorm(q_a_norm) -> q_b (4-bit codebook) -> qdim`.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+struct QLoraQ {
+    q_a: DenseLinear,       // hidden -> q_lora_rank
+    q_a_norm: Vec<f32>,     // [q_lora_rank], host RMSNorm weight
+    q_b: QuantLinear,       // q_lora_rank -> qdim
+    qa_dev: DevF32,         // [q_lora_rank] scratch (q_a output)
+    qa_normed: DevHalf,     // [q_lora_rank] scratch (normed, re-uploaded for q_b)
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -1871,9 +1980,9 @@ impl MlaAttn {
                o_w: &[f32], inv_freq: &[f32]) -> Self {
         let qdim = n_heads*(nope+d_rope);
         Self {
-            q_proj: DenseLinear::new(q_w, hidden, qdim),
+            q_proj: Some(DenseLinear::new(q_w, hidden, qdim)),
             kv_a: DenseLinear::new(kv_a_w, hidden, d_c + d_rope),
-            o_proj: DenseLinear::new(o_w, n_heads*v_head_dim, hidden),
+            o_proj: Some(DenseLinear::new(o_w, n_heads*v_head_dim, hidden)),
             kv_a_norm: kv_a_norm.to_vec(), kv_b: kv_b.to_vec(), inv_freq: inv_freq.to_vec(),
             cache_ckv: DevHalf::zeros(max_seq*d_c), cache_kr: DevHalf::zeros(max_seq*d_rope),
             n_heads, d_c, d_rope, nope, v_head_dim, hidden, eps, softmax_scale,
@@ -1883,6 +1992,40 @@ impl MlaAttn {
             qf: DevF32::zeros(qdim), kvf: DevF32::zeros(d_c + d_rope),
             attn_dev: DevHalf::zeros(n_heads*v_head_dim), o_out: DevF32::zeros(hidden),
             last_attn: vec![0f32; n_heads*v_head_dim],
+            q_lora: None, o_quant: None,
+        }
+    }
+
+    /// DeepSeek-V3/R1 q_lora + quantized-o_proj variant. `q_b` and `o` are `(packed, codebook)`
+    /// 4-bit codebook pairs (see `QuantLinear::new`); everything else matches `new`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_qlora(hidden: usize, n_heads: usize, d_c: usize, d_rope: usize, nope: usize, v_head_dim: usize,
+               max_seq: usize, eps: f32, softmax_scale: f32, q_lora_rank: usize,
+               q_a_w: &[f32], q_a_norm: &[f32], q_b: (&[u8], &[f32]),
+               kv_a_w: &[f32], kv_a_norm: &[f32], kv_b: &[f32],
+               o: (&[u8], &[f32]), inv_freq: &[f32]) -> Self {
+        let qdim = n_heads*(nope+d_rope);
+        Self {
+            q_proj: None,
+            kv_a: DenseLinear::new(kv_a_w, hidden, d_c + d_rope),
+            o_proj: None,
+            kv_a_norm: kv_a_norm.to_vec(), kv_b: kv_b.to_vec(), inv_freq: inv_freq.to_vec(),
+            cache_ckv: DevHalf::zeros(max_seq*d_c), cache_kr: DevHalf::zeros(max_seq*d_rope),
+            n_heads, d_c, d_rope, nope, v_head_dim, hidden, eps, softmax_scale,
+            aq_dev: DevHalf::zeros(n_heads*d_c), qr_dev: DevHalf::zeros(n_heads*d_rope),
+            outl_dev: DevHalf::zeros(n_heads*d_c),
+            ckv_h: DevHalf::zeros(d_c), kr_h: DevHalf::zeros(d_rope),
+            qf: DevF32::zeros(qdim), kvf: DevF32::zeros(d_c + d_rope),
+            attn_dev: DevHalf::zeros(n_heads*v_head_dim), o_out: DevF32::zeros(hidden),
+            last_attn: vec![0f32; n_heads*v_head_dim],
+            q_lora: Some(QLoraQ {
+                q_a: DenseLinear::new(q_a_w, hidden, q_lora_rank),
+                q_a_norm: q_a_norm.to_vec(),
+                q_b: QuantLinear::new(q_b.0, q_b.1, q_lora_rank, qdim),
+                qa_dev: DevF32::zeros(q_lora_rank),
+                qa_normed: DevHalf::zeros(q_lora_rank),
+            }),
+            o_quant: Some(QuantLinear::new(o.0, o.1, n_heads*v_head_dim, hidden)),
         }
     }
 
@@ -1901,7 +2044,18 @@ impl MlaAttn {
     /// `h_normed` = RMSNorm(h). Returns the attention output (hidden,), to be residual-added.
     pub fn forward(&mut self, h_normed: &DevHalf, pos: usize) -> &DevF32 {
         let (nh, dc, dr, nope, vhd) = (self.n_heads, self.d_c, self.d_rope, self.nope, self.v_head_dim);
-        self.q_proj.forward_into(h_normed, &mut self.qf);
+        if let Some(ql) = self.q_lora.as_mut() {
+            // q_lora path: h -> q_a (dense) -> host RMSNorm -> re-upload -> q_b (4-bit) -> self.qf
+            ql.q_a.forward_into(h_normed, &mut ql.qa_dev);
+            let qa = ql.qa_dev.to_host();
+            let ss: f32 = qa.iter().map(|x| x*x).sum::<f32>() / qa.len() as f32;
+            let sc = 1.0 / (ss + self.eps).sqrt();
+            let qa_normed: Vec<f32> = qa.iter().zip(ql.q_a_norm.iter()).map(|(x, w)| x * sc * w).collect();
+            ql.qa_normed.upload(&qa_normed);
+            ql.q_b.forward_into(&ql.qa_normed, &mut self.qf);
+        } else {
+            self.q_proj.as_ref().unwrap().forward_into(h_normed, &mut self.qf);
+        }
         self.kv_a.forward_into(h_normed, &mut self.kvf);
         let q = self.qf.to_host();
         let kv = self.kvf.to_host();
@@ -1951,9 +2105,203 @@ impl MlaAttn {
             }
         }
         self.attn_dev.upload(&self.last_attn);
-        self.o_proj.forward_into(&self.attn_dev, &mut self.o_out);
+        if let Some(oq) = self.o_quant.as_ref() {
+            oq.forward_into(&self.attn_dev, &mut self.o_out);
+        } else {
+            self.o_proj.as_ref().unwrap().forward_into(&self.attn_dev, &mut self.o_out);
+        }
         &self.o_out
     }
+}
+
+/// Host-side per-output-channel K-means quantizer (mirrors `model/export_runtime.py`'s
+/// `quantize()`, on the CPU, for tiny synthetic-check dims). `w` is `[oc][ic]` row-major
+/// (`nn.Linear.weight` layout). Returns `(packed, codebook, w_dq)`: `packed` is `ic*(oc/2)`
+/// bytes (low nibble first, per `QuantLinear::new`), `codebook` is `K*oc` f32, and `w_dq` is
+/// the dequantized `[oc][ic]` matrix — the effective weight `QuantLinear` computes with.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn quantize_host(w: &[f32], oc: usize, ic: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    assert_eq!(w.len(), oc * ic);
+    let mut cb = vec![0f32; K * oc];
+    let mut idx = vec![0u8; oc * ic]; // idx[o*ic+i]
+    for o in 0..oc {
+        let col: Vec<f32> = (0..ic).map(|i| w[o * ic + i]).collect();
+        let lo = col.iter().cloned().fold(f32::MAX, f32::min);
+        let hi = col.iter().cloned().fold(f32::MIN, f32::max);
+        let mut centroids: Vec<f32> = (0..K).map(|k| lo + (hi - lo) * (k as f32 / (K as f32 - 1.0))).collect();
+        let mut assign = vec![0usize; ic];
+        for _ in 0..12 {
+            for (i, &v) in col.iter().enumerate() {
+                let mut best = 0usize; let mut bd = f32::MAX;
+                for (k, &c) in centroids.iter().enumerate() { let d = (v - c).powi(2); if d < bd { bd = d; best = k; } }
+                assign[i] = best;
+            }
+            let mut sum = [0f32; K]; let mut cnt = [0f32; K];
+            for (i, &v) in col.iter().enumerate() { sum[assign[i]] += v; cnt[assign[i]] += 1.0; }
+            for k in 0..K { if cnt[k] > 0.0 { centroids[k] = sum[k] / cnt[k]; } }
+        }
+        for i in 0..ic { idx[o * ic + i] = assign[i] as u8; }
+        for k in 0..K { cb[k * oc + o] = centroids[k]; }
+    }
+    // packed[i][j] = idx[i][2j] | (idx[i][2j+1] << 4), matching export_runtime.py's quantize().
+    let mut packed = vec![0u8; ic * (oc / 2)];
+    for i in 0..ic {
+        for j in 0..oc / 2 {
+            let (lo, hi) = (idx[(2 * j) * ic + i], idx[(2 * j + 1) * ic + i]);
+            packed[i * (oc / 2) + j] = lo | (hi << 4);
+        }
+    }
+    let mut w_dq = vec![0f32; oc * ic];
+    for o in 0..oc { for i in 0..ic { w_dq[o * ic + i] = cb[(idx[o * ic + i] as usize) * oc + o]; } }
+    (packed, cb, w_dq)
+}
+
+/// Validate the DeepSeek-V3/R1 q_lora MLA path (`MlaAttn::new_qlora`): a tiny synthetic
+/// config with q_b/o 4-bit codebook-quantized (host k-means via `quantize_host`), compared
+/// against a CPU reference that uses the SAME dequantized q_b/o weights (so this isolates
+/// the q_lora wiring + RMSNorm + absorption from quantization noise, which `check_moe`/
+/// `check_mla_block` already cover elsewhere). Returns worst rel err over `o_proj` output.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn check_qlora_mla() -> f64 {
+    let (hidden, nh, dc, dr, nope, vhd, q_lora_rank) =
+        (512usize, 8usize, 128usize, 32usize, 64usize, 64usize, 128usize);
+    let qdim = nh * (nope + dr); // 8*(64+32) = 768, %256==0
+    assert_eq!(qdim % 256, 0); assert_eq!(hidden % 256, 0); assert_eq!(nh * vhd % 256, 0);
+    let eps = 1e-6f32; let max_seq = 24usize; let tpos = 6usize;
+    let mut s = 0x9101_ADEDu64;
+    // small magnitude (like check_mla_block): keeps fp16 rounding negligible on the dense parts.
+    let mut r = move || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; ((s >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * 0.03 };
+    let q_a_w: Vec<f32> = (0..q_lora_rank * hidden).map(|_| r()).collect();
+    let q_a_norm: Vec<f32> = (0..q_lora_rank).map(|_| r() * 0.1 + 1.0).collect();
+    let q_b_w: Vec<f32> = (0..qdim * q_lora_rank).map(|_| r()).collect(); // [qdim][q_lora_rank]
+    let kv_a_w: Vec<f32> = (0..(dc + dr) * hidden).map(|_| r()).collect();
+    let kv_a_norm: Vec<f32> = (0..dc).map(|_| r() * 0.1 + 1.0).collect();
+    let kv_b: Vec<f32> = (0..nh * (nope + vhd) * dc).map(|_| r()).collect();
+    let o_w: Vec<f32> = (0..hidden * (nh * vhd)).map(|_| r()).collect(); // [hidden][nh*vhd]
+    let inv_freq: Vec<f32> = (0..dr / 2).map(|d| 10000f32.powf(-2.0 * d as f32 / dr as f32)).collect();
+    let (qbp, qbc, qb_dq) = quantize_host(&q_b_w, qdim, q_lora_rank);
+    let (op, ocb, o_dq) = quantize_host(&o_w, hidden, nh * vhd);
+    let sms = 1.0f32 / ((nope + dr) as f32).sqrt();
+    let mut mla = MlaAttn::new_qlora(hidden, nh, dc, dr, nope, vhd, max_seq, eps, sms, q_lora_rank,
+        &q_a_w, &q_a_norm, (&qbp, &qbc), &kv_a_w, &kv_a_norm, &kv_b, (&op, &ocb), &inv_freq);
+    // host reference state (mirrors check_mla_block's cache-of-(ckv,krope))
+    let mut cache_ckv: Vec<Vec<f32>> = Vec::new();
+    let mut cache_kr: Vec<Vec<f32>> = Vec::new();
+    let rope = |v: &mut [f32], pos: usize| { // interleaved (DeepSeek), matches MlaAttn::rope
+        for d in 0..dr / 2 { let a = pos as f32 * inv_freq[d]; let (c, sn) = (a.cos(), a.sin());
+            let (x0, x1) = (v[2 * d], v[2 * d + 1]); v[2 * d] = x0 * c - x1 * sn; v[2 * d + 1] = x1 * c + x0 * sn; }
+    };
+    let mv = |w: &[f32], x: &[f32], ic: usize, oc: usize| -> Vec<f32> { // y[oc] = W[oc][ic] x
+        (0..oc).map(|o| (0..ic).map(|i| w[o * ic + i] * x[i]).sum()).collect()
+    };
+    let h16 = |v: f32| half::f16::from_f32(v).to_f32();
+    let mut worst = 0f64;
+    for pos in 0..tpos {
+        let hn: Vec<f32> = (0..hidden).map(|_| r()).collect();
+        let mut hd = DevHalf::from_host(&hn);
+        let got = mla.forward(&hd, pos).to_host();
+        let _ = &mut hd;
+        // reference: q_lora front-end using the DEQUANTIZED q_b, then the same absorbed
+        // attention as check_mla_block, then o_proj using the DEQUANTIZED o.
+        let qa = mv(&q_a_w, &hn, hidden, q_lora_rank);
+        let ss: f32 = qa.iter().map(|x| x * x).sum::<f32>() / q_lora_rank as f32;
+        let scn = 1.0 / (ss + eps).sqrt();
+        let qa_normed: Vec<f32> = qa.iter().zip(q_a_norm.iter()).map(|(x, w)| x * scn * w).collect();
+        let q = mv(&qb_dq, &qa_normed, q_lora_rank, qdim);
+        let kv = mv(&kv_a_w, &hn, hidden, dc + dr);
+        let mut ckv: Vec<f32> = kv[..dc].to_vec();
+        let ss2: f32 = ckv.iter().map(|x| x * x).sum::<f32>() / dc as f32; let sc2 = 1.0 / (ss2 + eps).sqrt();
+        for (i, x) in ckv.iter_mut().enumerate() { *x = h16(*x * sc2 * kv_a_norm[i]); }
+        let mut krope: Vec<f32> = kv[dc..dc + dr].to_vec(); rope(&mut krope, pos);
+        for x in krope.iter_mut() { *x = h16(*x); }
+        cache_ckv.push(ckv.clone()); cache_kr.push(krope.clone());
+        let seqlen = pos + 1; let scale = sms; let hdw = nope + dr;
+        let mut attn_vec = vec![0f32; nh * vhd];
+        for h in 0..nh {
+            let qn: Vec<f32> = (0..nope).map(|i| h16(q[h * hdw + i])).collect();
+            let mut qrope: Vec<f32> = (0..dr).map(|i| q[h * hdw + nope + i]).collect(); rope(&mut qrope, pos);
+            for x in qrope.iter_mut() { *x = h16(*x); }
+            let base = h * (nope + vhd);
+            let mut sc = vec![0f32; seqlen];
+            for t in 0..seqlen {
+                let mut s_nope = 0f32;
+                for i in 0..nope { let kni: f32 = (0..dc).map(|j| h16(kv_b[(base + i) * dc + j]) * cache_ckv[t][j]).sum(); s_nope += qn[i] * h16(kni); }
+                let s_rope: f32 = (0..dr).map(|i| qrope[i] * cache_kr[t][i]).sum();
+                sc[t] = (s_nope + s_rope) * scale;
+            }
+            let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+            let mut sum = 0f32; for x in sc.iter_mut() { *x = (*x - mx).exp(); sum += *x; } for x in sc.iter_mut() { *x /= sum; }
+            for v in 0..vhd {
+                let mut acc = 0f32;
+                for t in 0..seqlen { let vv: f32 = (0..dc).map(|j| h16(kv_b[(base + nope + v) * dc + j]) * cache_ckv[t][j]).sum(); acc += sc[t] * h16(vv); }
+                attn_vec[h * vhd + v] = acc;
+            }
+        }
+        let o_ref = mv(&o_dq, &attn_vec, nh * vhd, hidden);
+        for i in 0..hidden {
+            let den = (o_ref[i] as f64).abs().max(1e-2);
+            worst = worst.max(((got[i] - o_ref[i]) as f64).abs() / den);
+        }
+    }
+    worst
+}
+
+/// Validate the V3 (DeepSeek-V3/R1) sigmoid+bias grouped router (`moe_route_v3`) against an
+/// independent CPU implementation (selection-sort based, no shared code with `moe_route_v3`
+/// beyond the algorithm description). Returns true if both agree on the selected experts AND
+/// their combine weights, across several random logit/bias draws.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn check_moe_route_v3() -> bool {
+    fn route_v3_ref(logits: &[f32], bias: &[f32], n_experts: usize, n_group: usize,
+                     topk_group: usize, top_k: usize, rscale: f32) -> Vec<(usize, f32)> {
+        let group_size = n_experts / n_group;
+        let s: Vec<f32> = logits.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
+        let sb: Vec<f32> = s.iter().zip(bias.iter()).map(|(a, b)| a + b).collect();
+        let mut gscore = vec![0f32; n_group];
+        for g in 0..n_group {
+            let (mut best1, mut best2) = (f32::MIN, f32::MIN);
+            for &v in &sb[g * group_size..(g + 1) * group_size] {
+                if v > best1 { best2 = best1; best1 = v; } else if v > best2 { best2 = v; }
+            }
+            gscore[g] = best1 + best2;
+        }
+        let mut chosen = vec![false; n_group];
+        let mut gs = gscore.clone();
+        for _ in 0..topk_group {
+            let (mut bi, mut bv) = (0usize, f32::MIN);
+            for g in 0..n_group { if !chosen[g] && gs[g] > bv { bv = gs[g]; bi = g; } }
+            chosen[bi] = true; gs[bi] = f32::MIN;
+        }
+        let elig: Vec<usize> = (0..n_experts).filter(|&e| chosen[e / group_size]).collect();
+        let mut used = vec![false; elig.len()];
+        let mut picked: Vec<usize> = Vec::with_capacity(top_k);
+        for _ in 0..top_k {
+            let (mut bi, mut bv) = (0usize, f32::MIN);
+            for (ii, &e) in elig.iter().enumerate() { if !used[ii] && sb[e] > bv { bv = sb[e]; bi = ii; } }
+            used[bi] = true; picked.push(elig[bi]);
+        }
+        let wsum: f32 = picked.iter().map(|&e| s[e]).sum();
+        picked.iter().map(|&e| (e, rscale * s[e] / wsum)).collect()
+    }
+
+    let (n_experts, n_group, topk_group, top_k) = (32usize, 4usize, 2usize, 4usize);
+    let rscale = 2.5f32;
+    let mut s = 0x7047_A1E3u64;
+    let mut r = move || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; (s >> 40) as f32 / (1u64 << 24) as f32 * 4.0 - 2.0 };
+    let mut ok = true;
+    for _ in 0..8 {
+        let logits: Vec<f32> = (0..n_experts).map(|_| r()).collect();
+        let bias: Vec<f32> = (0..n_experts).map(|_| r() * 0.5).collect();
+        let mut a = moe_route_v3(&logits, &bias, n_experts, n_group, topk_group, top_k, rscale);
+        let mut b = route_v3_ref(&logits, &bias, n_experts, n_group, topk_group, top_k, rscale);
+        a.sort_by_key(|&(e, _)| e); b.sort_by_key(|&(e, _)| e);
+        if a.len() != b.len() { ok = false; break; }
+        for ((ea, wa), (eb, wb)) in a.iter().zip(b.iter()) {
+            if ea != eb || (wa - wb).abs() > 1e-5 { ok = false; break; }
+        }
+        if !ok { break; }
+    }
+    ok
 }
 
 /// Validate the full MLA attention block (absorbed kernel path) vs a full-reconstruction
@@ -2061,9 +2409,11 @@ impl DeepSeekLayer {
     }
 }
 
-/// The feed-forward of a DeepSeek layer: a dense MLP (first_k_dense layers) or MoE.
+/// The feed-forward of a DeepSeek layer: a dense MLP (first_k_dense layers), an
+/// all-resident MoE, or an OFFLOADED MoE (`MoeOffload`, required at 671B scale: routed
+/// experts stream from host RAM instead of all sitting on the GPU).
 #[cfg(any(feature = "cuda", feature = "metal"))]
-pub enum DsFfn { Dense(MlpBlock), Moe(MoeBlock) }
+pub enum DsFfn { Dense(MlpBlock), Moe(MoeBlock), MoeOffload(MoeBlockOffload) }
 
 /// A DeepSeek decoder layer at the model level (dense or MoE FFN).
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -2074,7 +2424,11 @@ impl DsLayer {
         let mut normed = DevHalf::zeros(h.n);
         rmsnorm(h, &self.attn_norm, &mut normed, self.attn.eps);
         { let o = self.attn.forward(&normed, pos); residual_add(h, o); }
-        match &mut self.ffn { DsFfn::Dense(m) => m.forward(h), DsFfn::Moe(m) => m.forward(h) }
+        match &mut self.ffn {
+            DsFfn::Dense(m) => m.forward(h),
+            DsFfn::Moe(m) => m.forward(h),
+            DsFfn::MoeOffload(m) => m.forward(h),
+        }
     }
 }
 
@@ -2108,11 +2462,14 @@ impl DeepSeekModel {
         self.logits.to_host()
     }
 
-    /// Load a DeepSeek `.cbk` (CBKD) exported by `model/export_deepseek.py`.
+    /// Load a DeepSeek `.cbk` exported by `model/export_deepseek.py`: `CBKD` (V2-Lite style,
+    /// plain dense q_proj, all-resident MoE) or `CBKR` (V3/R1, q_lora + sigmoid-router MoE,
+    /// offloaded experts — see `load_deepseek_qlora`).
     pub fn load_deepseek(path: &str, max_seq: usize) -> std::io::Result<DeepSeekModel> {
         let mut r = BufReader::new(File::open(path)?);
         let mut magic = [0u8; 4]; r.read_exact(&mut magic)?;
-        assert_eq!(&magic, b"CBKD", "not a DeepSeek .cbk");
+        if &magic == b"CBKR" { return Self::load_deepseek_qlora(r, max_seq); }
+        assert_eq!(&magic, b"CBKD", "not a DeepSeek .cbk (expected CBKD or CBKR)");
         let cfg: Vec<usize> = (0..14).map(|_| rd_i32(&mut r) as usize).collect();
         let (n_layers, hidden, n_heads, kv_lora, nope, rope, vhd, inter_dense, moe_inter,
              n_routed, n_shared, top_k, vocab, first_k_dense) =
@@ -2156,6 +2513,77 @@ impl DeepSeekModel {
             };
             layers.push(DsLayer { attn_norm: DevF32::from_host(&attn_norm), attn, ffn });
             eprintln!("  loaded layer {}/{}", li+1, n_layers);
+        }
+        let final_norm = rd_f32_vec(&mut r, hidden);
+        let (lp, lc) = (rd_u8_vec(&mut r, hidden*(vocab/2)), rd_f32_vec(&mut r, K*vocab));
+        Ok(DeepSeekModel {
+            embedding, layers,
+            final_norm: DevF32::from_host(&final_norm),
+            lm_head: QuantLinear::new(&lp, &lc, hidden, vocab),
+            h: DevHalf::zeros(hidden), normed: DevHalf::zeros(hidden), logits: DevF32::zeros(vocab),
+            hidden, vocab, eps,
+        })
+    }
+
+    /// Load the `CBKR` format (DeepSeek-V3/R1: q_lora MLA + V3 sigmoid/grouped router,
+    /// 671B-scale). Header: 18 i32 `[n_layers, hidden, n_heads, kv_lora, nope, rope, vhd,
+    /// inter_dense, moe_inter, n_routed, n_shared, top_k, vocab, first_k_dense, q_lora_rank,
+    /// n_group, topk_group, sigmoid_flag]`, then 3 f32 (eps, softmax_scale, rscale), inv_freq,
+    /// f16 embedding. Per layer: attn_norm, q_a/q_a_norm/q_b (q_lora), kv_a/kv_a_norm/kv_b,
+    /// o (4-bit), post_norm, then the dense-or-MoE FFN (MoE layers read `e_score_bias`
+    /// BEFORE the router). Routed experts are NOT uploaded to the GPU here — they stay in
+    /// host `ExpertHost`s and stream through `MoeBlockOffload` (the memory wall at 671B).
+    fn load_deepseek_qlora(mut r: BufReader<File>, max_seq: usize) -> std::io::Result<DeepSeekModel> {
+        let cfg: Vec<usize> = (0..18).map(|_| rd_i32(&mut r) as usize).collect();
+        let (n_layers, hidden, n_heads, kv_lora, nope, rope, vhd, inter_dense, moe_inter,
+             n_routed, n_shared, top_k, vocab, first_k_dense, q_lora_rank, n_group, topk_group, sigmoid_flag) =
+            (cfg[0],cfg[1],cfg[2],cfg[3],cfg[4],cfg[5],cfg[6],cfg[7],cfg[8],cfg[9],cfg[10],cfg[11],cfg[12],cfg[13],cfg[14],cfg[15],cfg[16],cfg[17]);
+        let eps = rd_f32(&mut r); let softmax_scale = rd_f32(&mut r); let rscale = rd_f32(&mut r);
+        let inv_freq = rd_f32_vec(&mut r, rope/2);
+        let embedding = rd_f16_vec(&mut r, vocab*hidden);
+        let qdim = n_heads*(nope+rope);
+        let mut layers = Vec::with_capacity(n_layers);
+        for li in 0..n_layers {
+            let attn_norm = rd_f32_vec(&mut r, hidden);
+            let q_a_w = rd_f16_vec(&mut r, q_lora_rank*hidden);
+            let q_a_norm = rd_f32_vec(&mut r, q_lora_rank);
+            let (qbp, qbc) = (rd_u8_vec(&mut r, q_lora_rank*(qdim/2)), rd_f32_vec(&mut r, K*qdim));
+            let kv_a_w = rd_f16_vec(&mut r, (kv_lora+rope)*hidden);
+            let kv_a_norm = rd_f32_vec(&mut r, kv_lora);
+            let kv_b = rd_f16_vec(&mut r, n_heads*(nope+vhd)*kv_lora);
+            let (op, oc) = (rd_u8_vec(&mut r, (n_heads*vhd)*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
+            let post_norm = rd_f32_vec(&mut r, hidden);
+            let attn = MlaAttn::new_qlora(hidden, n_heads, kv_lora, rope, nope, vhd, max_seq, eps, softmax_scale,
+                q_lora_rank, &q_a_w, &q_a_norm, (&qbp, &qbc), &kv_a_w, &kv_a_norm, &kv_b, (&op, &oc), &inv_freq);
+            let ffn = if li < first_k_dense {
+                let (gp,gc) = (rd_u8_vec(&mut r, hidden*(inter_dense/2)), rd_f32_vec(&mut r, K*inter_dense));
+                let (up,uc) = (rd_u8_vec(&mut r, hidden*(inter_dense/2)), rd_f32_vec(&mut r, K*inter_dense));
+                let (dp,dc) = (rd_u8_vec(&mut r, inter_dense*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
+                DsFfn::Dense(MlpBlock::new(hidden, inter_dense, &post_norm, &gp,&gc,&up,&uc,&dp,&dc, eps))
+            } else {
+                let score_bias = rd_f32_vec(&mut r, n_routed);
+                let rw = rd_f16_vec(&mut r, n_routed*hidden);
+                let mut hosts: Vec<ExpertHost> = Vec::with_capacity(n_routed);
+                for _ in 0..n_routed {
+                    hosts.push(ExpertHost {
+                        gp: rd_u8_vec(&mut r, hidden*(moe_inter/2)), gc: rd_f32_vec(&mut r, K*moe_inter),
+                        up: rd_u8_vec(&mut r, hidden*(moe_inter/2)), uc: rd_f32_vec(&mut r, K*moe_inter),
+                        dp: rd_u8_vec(&mut r, moe_inter*(hidden/2)), dc: rd_f32_vec(&mut r, K*hidden),
+                    });
+                }
+                let si = ((n_shared*moe_inter + 255)/256)*256; // shared expert inter, padded to %256
+                let sh = (rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
+                          rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
+                          rd_u8_vec(&mut r, si*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
+                let shared = (sh.0.as_slice(), sh.1.as_slice(), sh.2.as_slice(), sh.3.as_slice(), sh.4.as_slice(), sh.5.as_slice());
+                // cap = top_k: minimal GPU-resident expert cache, experts stream from host every token.
+                let mut off = MoeBlockOffload::new(hidden, moe_inter, n_routed, top_k, top_k, eps, &post_norm, &rw, hosts, shared);
+                off.set_rscale(rscale);
+                if sigmoid_flag != 0 { off.set_v3_scoring(score_bias, n_group, topk_group); }
+                DsFfn::MoeOffload(off)
+            };
+            layers.push(DsLayer { attn_norm: DevF32::from_host(&attn_norm), attn, ffn });
+            eprintln!("  loaded layer {}/{} (q_lora)", li+1, n_layers);
         }
         let final_norm = rd_f32_vec(&mut r, hidden);
         let (lp, lc) = (rd_u8_vec(&mut r, hidden*(vocab/2)), rd_f32_vec(&mut r, K*vocab));

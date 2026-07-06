@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 """
-Export a DeepSeek-V2/V3 (MLA + MoE) model to the Rust runtime's DeepSeek .cbk format
-("CBKD"). MLA projections (q_proj, kv_a_proj_with_mqa, kv_b_proj, o_proj) stay DENSE fp16
-(they are small and the absorption folds W_UK/W_UV into the query/output); the MoE experts,
-router, dense-MLP and LM head are 4-bit codebook-quantized (K=16). RMSNorm weights + the
-kv_a_layernorm stay dense. Reuses the codebook k-means from export_runtime.py.
+Export a DeepSeek-V2/V3 (MLA + MoE) model to the Rust runtime's DeepSeek .cbk format.
+Two variants, picked automatically from the model config:
 
-CUDA (24GB+) recommended; DeepSeek-V2-Lite (16B) is the tractable target.
+- "CBKD" (no q_lora, e.g. DeepSeek-V2-Lite): MLA projections (q_proj, kv_a_proj_with_mqa,
+  kv_b_proj, o_proj) stay DENSE fp16 (they are small and the absorption folds W_UK/W_UV into
+  the query/output); the MoE experts, router, dense-MLP and LM head are 4-bit
+  codebook-quantized (K=16). RMSNorm weights + the kv_a_layernorm stay dense.
+- "CBKR" (q_lora_rank set, e.g. DeepSeek-V3/R1, 671B): q_a_proj/kv_a_proj/kv_b_proj stay
+  dense fp16 (small), but q_b_proj and o_proj are 4-bit codebook-quantized (big at 671B
+  scale); the V3 sigmoid+bias grouped router's `e_score_correction_bias` is written before
+  the router weight.
+
+Reuses the codebook k-means from export_runtime.py.
+
+CUDA (24GB+) recommended; DeepSeek-V2-Lite (16B) is the tractable target for CBKD. CBKR
+(671B) needs a machine with enough host RAM/disk to hold the fp16 checkpoint plus the
+quantized output; the runtime streams routed experts from host RAM (see MoeBlockOffload).
   python export_deepseek.py --model deepseek-ai/DeepSeek-V2-Lite --out /workspace/ds \
       --prompt "The capital of France is" --gen 16
+  python export_deepseek.py --model deepseek-ai/DeepSeek-V3 --out /workspace/ds3
 """
 import argparse, os, struct
 import numpy as np
@@ -34,6 +45,23 @@ def qw(f, w):         # quantize a raw [out][in] weight tensor
 
 def qffn(f, gate, up, down, inter_pad):   # gate/up padded on output, down padded on input; zeros are lossless (silu(0)=0)
     qw(f, _pad_out(gate.weight, inter_pad)); qw(f, _pad_out(up.weight, inter_pad)); qw(f, _pad_in(down.weight, inter_pad))
+
+
+def _write_ffn(f, L, li, first_k_dense, inter_dense_pad, moe_inter_pad, shared_inter_pad, n_group, topk_group, sigmoid_flag):
+    # MLP: dense (first_k_dense layers) or MoE. Shared by CBKD and CBKR.
+    if li < first_k_dense:
+        M = L.mlp
+        qffn(f, M.gate_proj, M.up_proj, M.down_proj, inter_dense_pad)
+    else:
+        M = L.mlp
+        if sigmoid_flag:  # CBKR: V3 router bias comes BEFORE the router weight
+            w_f32(f, M.gate.e_score_correction_bias)         # [n_routed] f32
+        w_f16(f, M.gate.weight)                              # router [n_routed][hidden] DENSE fp16
+        for e in M.experts:
+            qffn(f, e.gate_proj, e.up_proj, e.down_proj, moe_inter_pad)
+        S = M.shared_experts
+        qffn(f, S.gate_proj, S.up_proj, S.down_proj, shared_inter_pad)
+    return 'dense' if li < first_k_dense else 'moe'
 
 
 @torch.no_grad()
@@ -73,48 +101,71 @@ def main():
     eps = c.rms_norm_eps
     rope_theta = float(getattr(c, "rope_theta", 10000.0))
     rscale = float(getattr(c, "routed_scaling_factor", 1.0))
+    q_lora_rank = getattr(c, "q_lora_rank", None) or 0
+    n_group = getattr(c, "n_group", 1) or 1
+    topk_group = getattr(c, "topk_group", 1) or 1
+    sigmoid_flag = 1 if getattr(c, "scoring_func", "softmax") == "sigmoid" else 0
     assert kv_lora % 256 == 0, f"kv_lora_rank {kv_lora} must be %256 (kv_b/absorption is dense so ok, but experts need it)"
     assert vocab % 256 == 0, f"vocab {vocab} must be %256 for the quantized LM head"
     print(f"cfg: L={n_layers} hidden={hidden} heads={n_heads} kv_lora={kv_lora} nope={nope} rope={rope} "
           f"vhd={vhd} inter={inter_dense} moe_inter={moe_inter} n_routed={n_routed} n_shared={n_shared} "
-          f"top_k={top_k} vocab={vocab} first_k_dense={first_k_dense}", flush=True)
+          f"top_k={top_k} vocab={vocab} first_k_dense={first_k_dense} q_lora_rank={q_lora_rank}", flush=True)
 
     inv_freq = 1.0 / (rope_theta ** (torch.arange(0, rope, 2).float() / rope))
     path = os.path.join(args.out, "model.cbk")
     f = open(path, "wb")
-    f.write(b"CBKD")
-    f.write(struct.pack("<14i", n_layers, hidden, n_heads, kv_lora, nope, rope, vhd,
-                        inter_dense_pad, moe_inter_pad, n_routed, n_shared, top_k, vocab, first_k_dense))
-    f.write(struct.pack("<3f", eps, rope_theta, rscale))
-    f.write(inv_freq.numpy().astype("<f4").tobytes())
-    w_f16(f, model.model.embed_tokens.weight)   # [vocab][hidden] fp16
 
-    for li in range(n_layers):
-        L = model.model.layers[li]
-        A = L.self_attn
-        w_f32(f, L.input_layernorm.weight)
-        # MLA projections: dense fp16
-        if hasattr(A, "q_proj"):
-            w_f16(f, A.q_proj.weight)                       # [n_heads*(nope+rope)][hidden]
-        else:  # q_lora variant (V2 full / V3): fold q_a->q_b at export? keep dense q_b only if no lora
-            raise SystemExit("q_lora_rank models: export q_a_proj/q_b_proj not yet supported (V2-Lite has plain q_proj)")
-        w_f16(f, A.kv_a_proj_with_mqa.weight)               # [kv_lora+rope][hidden]
-        w_f32(f, A.kv_a_layernorm.weight)                   # [kv_lora]
-        w_f16(f, A.kv_b_proj.weight)                        # [n_heads*(nope+vhd)][kv_lora]
-        w_f16(f, A.o_proj.weight)                           # [hidden][n_heads*vhd]
-        w_f32(f, L.post_attention_layernorm.weight)
-        # MLP: dense (first_k_dense layers) or MoE
-        if li < first_k_dense:
-            M = L.mlp
-            qffn(f, M.gate_proj, M.up_proj, M.down_proj, inter_dense_pad)
-        else:
-            M = L.mlp
-            w_f16(f, M.gate.weight)                          # router [n_routed][hidden] DENSE fp16
-            for e in M.experts:
-                qffn(f, e.gate_proj, e.up_proj, e.down_proj, moe_inter_pad)
-            S = M.shared_experts
-            qffn(f, S.gate_proj, S.up_proj, S.down_proj, shared_inter_pad)
-        print(f"  layer {li+1}/{n_layers} ({'dense' if li<first_k_dense else 'moe'}) written", flush=True)
+    if q_lora_rank:
+        # CBKR: DeepSeek-V3/R1 q_lora MLA + (optionally) V3 sigmoid/grouped router.
+        qdim = n_heads * (nope + rope)
+        assert qdim % 256 == 0, f"n_heads*(nope+rope)={qdim} must be %256 for the quantized q_b"
+        assert hidden % 256 == 0, f"hidden={hidden} must be %256 for the quantized o_proj"
+        f.write(b"CBKR")
+        f.write(struct.pack("<18i", n_layers, hidden, n_heads, kv_lora, nope, rope, vhd,
+                            inter_dense_pad, moe_inter_pad, n_routed, n_shared, top_k, vocab, first_k_dense,
+                            q_lora_rank, n_group, topk_group, sigmoid_flag))
+        f.write(struct.pack("<3f", eps, rope_theta, rscale))
+        f.write(inv_freq.numpy().astype("<f4").tobytes())
+        w_f16(f, model.model.embed_tokens.weight)   # [vocab][hidden] fp16
+
+        for li in range(n_layers):
+            L = model.model.layers[li]
+            A = L.self_attn
+            w_f32(f, L.input_layernorm.weight)
+            w_f16(f, A.q_a_proj.weight)                      # [q_lora_rank][hidden]
+            w_f32(f, A.q_a_layernorm.weight)                 # [q_lora_rank]
+            qw(f, A.q_b_proj.weight)                         # [qdim][q_lora_rank] 4-bit
+            w_f16(f, A.kv_a_proj_with_mqa.weight)             # [kv_lora+rope][hidden]
+            w_f32(f, A.kv_a_layernorm.weight)                 # [kv_lora]
+            w_f16(f, A.kv_b_proj.weight)                      # [n_heads*(nope+vhd)][kv_lora]
+            qw(f, A.o_proj.weight)                            # [hidden][n_heads*vhd] 4-bit
+            w_f32(f, L.post_attention_layernorm.weight)
+            kind = _write_ffn(f, L, li, first_k_dense, inter_dense_pad, moe_inter_pad, shared_inter_pad,
+                               n_group, topk_group, sigmoid_flag)
+            print(f"  layer {li+1}/{n_layers} ({kind}) written", flush=True)
+    else:
+        # CBKD: no q_lora (DeepSeek-V2-Lite style); MLA projections stay dense fp16.
+        f.write(b"CBKD")
+        f.write(struct.pack("<14i", n_layers, hidden, n_heads, kv_lora, nope, rope, vhd,
+                            inter_dense_pad, moe_inter_pad, n_routed, n_shared, top_k, vocab, first_k_dense))
+        f.write(struct.pack("<3f", eps, rope_theta, rscale))
+        f.write(inv_freq.numpy().astype("<f4").tobytes())
+        w_f16(f, model.model.embed_tokens.weight)   # [vocab][hidden] fp16
+
+        for li in range(n_layers):
+            L = model.model.layers[li]
+            A = L.self_attn
+            w_f32(f, L.input_layernorm.weight)
+            assert hasattr(A, "q_proj"), "expected plain q_proj (no q_lora_rank in config); use the CBKR branch otherwise"
+            w_f16(f, A.q_proj.weight)                        # [n_heads*(nope+rope)][hidden]
+            w_f16(f, A.kv_a_proj_with_mqa.weight)             # [kv_lora+rope][hidden]
+            w_f32(f, A.kv_a_layernorm.weight)                 # [kv_lora]
+            w_f16(f, A.kv_b_proj.weight)                      # [n_heads*(nope+vhd)][kv_lora]
+            w_f16(f, A.o_proj.weight)                         # [hidden][n_heads*vhd]
+            w_f32(f, L.post_attention_layernorm.weight)
+            kind = _write_ffn(f, L, li, first_k_dense, inter_dense_pad, moe_inter_pad, shared_inter_pad,
+                               n_group, topk_group, sigmoid_flag)
+            print(f"  layer {li+1}/{n_layers} ({kind}) written", flush=True)
 
     w_f32(f, model.model.norm.weight)
     qw(f, model.lm_head.weight)

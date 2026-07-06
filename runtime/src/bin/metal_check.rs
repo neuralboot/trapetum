@@ -48,7 +48,7 @@ fn check_attn(rng: &mut Rng, n_heads: usize, n_kv: usize, hd: usize, seqlen: usi
     let dck = DevHalf::from_host(&ck);
     let dcv = DevHalf::from_host(&cv);
     let mut dout = DevHalf::zeros(n_heads * hd);
-    attention(&dq, &dck, &dcv, &mut dout, n_heads, n_kv, hd, seqlen);
+    attention(&dq, &dck, &dcv, &mut dout, n_heads, n_kv, hd, seqlen, 0.0);
     sync();
     let o = dout.to_host();
     let e = rel_err(&o, &r);
