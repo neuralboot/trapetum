@@ -204,7 +204,9 @@ def main():
         wf32(f, W[P + "input_layernorm.weight"])
         for proj in ("q", "k", "v", "o"):
             qwrite(f, W[P + f"self_attn.{proj}_proj.weight"])
-            if has_bias:
+            # CBK3 stores biases for q/k/v ONLY (o_proj has none in Qwen and the loader
+            # reads none) — writing an o bias shifts every later byte and corrupts the model.
+            if has_bias and proj != "o":
                 b = W.get(P + f"self_attn.{proj}_proj.bias", np.zeros(W[P + f"self_attn.{proj}_proj.weight"].shape[0], np.float32))
                 wf32(f, b)
         wf32(f, W[P + "post_attention_layernorm.weight"])
