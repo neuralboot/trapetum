@@ -38,8 +38,8 @@ HOURLY_CAP = 20        # per-IP requests/hour (backstop)
 QUEUE_CAP = 5          # concurrent generations (semaphore)
 
 # ---- public compare-demo session gate (the page lock) ----
-SESSION_TTL = 60           # seconds, exact, from grant
-MAX_SESSIONS_PER_DAY = 10  # per client_id AND per IP, UTC calendar day
+SESSION_TTL = 300          # seconds (5 min), exact, from grant
+MAX_SESSIONS_PER_DAY = 12  # per client_id AND per IP, UTC calendar day
 MAX_WAITERS = 10           # FIFO waiting-line cap
 WAITER_TTL = 12            # drop a waiter that stops polling for this long (page polls ~2.5s)
 
