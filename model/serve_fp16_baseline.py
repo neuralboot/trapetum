@@ -189,6 +189,27 @@ async def session_release(req: Request):
     return {"released": True}
 
 
+_health_cache = {"t": 0.0, "a": False}
+
+
+@app.get("/health")
+async def health():
+    """Both-sides health for the nav gate: B is us (alive if answering), A is
+    pinged server-side (cached 30s) so the page never needs A's URL or its CORS."""
+    now = time.time()
+    if now - _health_cache["t"] > 30:
+        a_ok = False
+        try:
+            base = TRAPETUM_URL.rsplit("/v1/", 1)[0]
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(base + "/v1/models")
+                a_ok = r.status_code == 200
+        except Exception:
+            a_ok = False
+        _health_cache.update(t=now, a=a_ok)
+    return {"a": _health_cache["a"], "b": True}
+
+
 @app.get("/session/quota")
 def session_quota(client_id: str = ""):
     with _slock:
