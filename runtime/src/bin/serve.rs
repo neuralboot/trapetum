@@ -307,7 +307,13 @@ fn generate(cur: &mut Loaded, prompt: &str, max_new: usize, penalty: f32, temper
     if ids.len() > cap {
         ids = ids[ids.len() - cap..].to_vec();
     }
-    let mut seen: std::collections::HashSet<usize> = ids.iter().copied().collect();
+    // Repetition penalty over a SLIDING WINDOW, not the whole history: a cumulative
+    // set on long reasoning chains ends up penalizing every digit/word the answer
+    // needs, degrading the distribution until only junk survives (the "1 1 1" collapse).
+    const REP_WINDOW: usize = 128;
+    let mut recent: std::collections::VecDeque<usize> =
+        ids.iter().rev().take(REP_WINDOW).copied().collect();
+    let mut seen: std::collections::HashSet<usize> = recent.iter().copied().collect();
     let mut logits = Vec::new();
     for (pos, &t) in ids.iter().enumerate() {
         logits = cur.model.forward(t, pos);
@@ -321,7 +327,13 @@ fn generate(cur: &mut Loaded, prompt: &str, max_new: usize, penalty: f32, temper
             break;
         }
         out.push(next);
-        seen.insert(next as usize);
+        recent.push_back(next as usize);
+        if recent.len() > REP_WINDOW {
+            recent.pop_front();
+            seen = recent.iter().copied().collect();
+        } else {
+            seen.insert(next as usize);
+        }
         logits = cur.model.forward(next as usize, pos);
         pos += 1;
         rep_penalty(&mut logits, &seen, penalty);
@@ -1236,7 +1248,8 @@ fn main() {
             let c = cur.as_mut().unwrap();
             let cap = cfg().max_tokens_cap.max(1) as u64;
             let max_new = v.get("max_tokens").and_then(|x| x.as_u64()).unwrap_or(256).min(cap) as usize;
-            let penalty = v.get("repetition_penalty").and_then(|x| x.as_f64()).unwrap_or(1.3) as f32;
+            let pen_default = if c.template == "deepseek" { 1.1 } else { 1.3 };
+            let penalty = v.get("repetition_penalty").and_then(|x| x.as_f64()).unwrap_or(pen_default) as f32;
             // R1-family default: DeepSeek discourages greedy decode on reasoning models
             // (repetition collapse); other templates keep the historical greedy default.
             let temp_default = if c.template == "deepseek" { 0.6 } else { 0.0 };
