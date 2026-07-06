@@ -50,7 +50,7 @@ M=2 39.7 -> 8.2 ms (**1.11x of M=1**), M=3 59.7 -> 9.6 ms, M=4 77.4 -> 12.8 ms.
 | pair (target + drafter) | vocab | plain tok/s | K=1 | K=2 | K=3 | best |
 |---|---|---|---|---|---|---|
 | **Llama-2-7B + llama-160m** | 32k | 124.6 | 1.19x | **1.32x** | 1.24x | **K=2 WIN, 164 tok/s** |
-| Qwen2.5-7B + Qwen2.5-1.5B | 152k | 118.2 | 0.82x | 0.92x | 0.92x | near-parity |
+| R1-Distill-Qwen-7B + Qwen2.5-1.5B | 152k | 100.6 | 0.76x | 0.76x | 0.76x | near-parity |
 | Llama-3.1-8B + Llama-3.2-1B | 128k | 117.9 | 0.85x | 0.90x | 0.80x | near-parity |
 
 **Spec-dec now WINS in wall-clock where the projection said it should** (1.32x measured vs
@@ -59,7 +59,15 @@ measured reasons: (a) every drafter forward reads back the FULL logits (152k x 4
 and does a host argmax — at 130+ drafter forwards this dominates; (b) their smallest
 same-tokenizer drafters are 10x bigger than llama-160m (1.5B/1B; Qwen2.5-0.5B is blocked by
 the kernel's %256 shape rule). Next lever: device-side argmax + returning only the argmax id
-(kills the readback), then graph capture. Qwen bias note: the batched path now supports qkv
+(kills the readback), then graph capture.
+
+RETRACTION NOTE (July 6): the original Qwen2.5-7B+1.5B row (0.82/0.92/0.92 at alpha 1.000)
+was measured on a model CORRUPTED by the torch-free exporter's o-bias bug (both models
+flooded token 0, so "alpha=1" and "lossless" were trivially true on garbage). The row above
+is the re-measurement on the FIXED export (coherent text verified) on a community-cloud 4090:
+real alpha 0.85, 0.76x — the large-vocab parity conclusion stands, the exact numbers changed.
+
+Qwen bias note: the batched path now supports qkv
 bias (repeated-bias vadd) — validated lossless at 0.99+ acceptance. Raw logs:
 `bench/runpod_logs/wallclock_4090.log` (round 1), `wallclock_fixed_4090.log` +
 `profile_mtile_4090.log` (round 2).
