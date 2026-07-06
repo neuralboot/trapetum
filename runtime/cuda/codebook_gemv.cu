@@ -7,6 +7,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdlib>
+#include <cmath>
 
 #define K 16
 #define CPB 256
@@ -372,6 +373,55 @@ __global__ void resadd_h_k(__half* __restrict__ h, const __half* __restrict__ d,
     if (i < n) h[i] = __float2half(__half2float(h[i]) + __half2float(d[i]));
 }
 
+// Two-stage device argmax over the first n logits (greedy token selection). The
+// decode loop picks the next token WITHOUT copying the full vocab (up to ~152k f32)
+// to the host: only a single u32 comes back. Ties resolve to the SMALLEST index
+// (strict >), matching the host argmax. Twin of the Metal argmax_stage1/stage2.
+__global__ void argmax_stage1(const float* __restrict__ x, int n,
+                              float* __restrict__ out_val, unsigned* __restrict__ out_idx) {
+    __shared__ float sval[256];
+    __shared__ unsigned sidx[256];
+    int tid = threadIdx.x;
+    unsigned stride = blockDim.x * gridDim.x;
+    float bv = -INFINITY; unsigned bi = 0;
+    for (unsigned i = blockIdx.x*blockDim.x + tid; i < (unsigned)n; i += stride) {
+        float v = x[i];
+        if (v > bv) { bv = v; bi = i; }   // strict > keeps the smallest index on a tie
+    }
+    sval[tid] = bv; sidx[tid] = bi;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = sval[tid+s]; unsigned oi = sidx[tid+s];
+            if (ov > sval[tid] || (ov == sval[tid] && oi < sidx[tid])) { sval[tid] = ov; sidx[tid] = oi; }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) { out_val[blockIdx.x] = sval[0]; out_idx[blockIdx.x] = sidx[0]; }
+}
+
+__global__ void argmax_stage2(const float* __restrict__ in_val, const unsigned* __restrict__ in_idx,
+                              int np, unsigned* __restrict__ out) {
+    __shared__ float sval[256];
+    __shared__ unsigned sidx[256];
+    int tid = threadIdx.x;
+    float bv = -INFINITY; unsigned bi = 0xffffffffu;
+    for (int i = tid; i < np; i += blockDim.x) {
+        float v = in_val[i]; unsigned id = in_idx[i];
+        if (v > bv || (v == bv && id < bi)) { bv = v; bi = id; }
+    }
+    sval[tid] = bv; sidx[tid] = bi;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = sval[tid+s]; unsigned oi = sidx[tid+s];
+            if (ov > sval[tid] || (ov == sval[tid] && oi < sidx[tid])) { sval[tid] = ov; sidx[tid] = oi; }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out[0] = sidx[0];
+}
+
 // One dedicated stream for all device ops, so the decode chain can be CUDA-graph
 // captured (launches MUST be on the captured stream, else they are not recorded).
 static cudaStream_t g_stream = 0;
@@ -555,6 +605,33 @@ void op_resadd_h(void* h_half, const void* d_half, int n) {
 }
 
 void dev_sync() { cudaDeviceSynchronize(); }
+
+// Device argmax over the first n (real_vocab) logits. Returns the winning index.
+// Enqueued on g_stream so it runs after the logits GEMV already queued there, then
+// syncs and copies back a single u32. Scratch (partials + output) is allocated once
+// for the max partial count and reused every token, so the greedy path never mallocs.
+#define ARGMAX_NTG_MAX 1024
+static float*    g_am_val = 0;
+static unsigned* g_am_idx = 0;
+static unsigned* g_am_out = 0;
+unsigned dev_argmax(const void* d_logits, int n) {
+    ensure_stream();
+    const int tpb = 256;
+    int ntg = (n + tpb - 1) / tpb;
+    if (ntg > ARGMAX_NTG_MAX) ntg = ARGMAX_NTG_MAX;
+    if (ntg < 1) ntg = 1;
+    if (!g_am_val) {
+        cudaMalloc(&g_am_val, (size_t)ARGMAX_NTG_MAX*sizeof(float));
+        cudaMalloc(&g_am_idx, (size_t)ARGMAX_NTG_MAX*sizeof(unsigned));
+        cudaMalloc(&g_am_out, sizeof(unsigned));
+    }
+    argmax_stage1<<<ntg, tpb, 0, g_stream>>>((const float*)d_logits, n, g_am_val, g_am_idx);
+    argmax_stage2<<<1, tpb, 0, g_stream>>>(g_am_val, g_am_idx, ntg, g_am_out);
+    unsigned h_out = 0;
+    cudaMemcpyAsync(&h_out, g_am_out, sizeof(unsigned), cudaMemcpyDeviceToHost, g_stream);
+    cudaStreamSynchronize(g_stream);
+    return h_out;
+}
 
 // --- CUDA graph capture of the decode chain ---------------------------------------
 // graph_begin() starts capturing on g_stream; run the chain (forward/cast queue onto

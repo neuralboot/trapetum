@@ -29,6 +29,7 @@ mod backend {
         pub fn dev_cast_f32_to_half(d_half: *mut c_void, d_f32: *const c_void, n: i32);
         pub fn dev_download_f32(x: *mut f32, d_f32: *const c_void, n: i32);
         pub fn dev_download_half(x: *mut f32, d_half: *const c_void, n: i32);
+        pub fn dev_argmax(logits: *const c_void, n: i32) -> u32;
         pub fn dev_sync();
         pub fn graph_begin();
         pub fn graph_end() -> *mut c_void;
@@ -150,6 +151,13 @@ impl DevF32 {
         let mut y = vec![0f32; self.n];
         unsafe { dev_download_f32(y.as_mut_ptr(), self.ptr, self.n as i32) };
         y
+    }
+    /// Device-side argmax over the first `real_vocab` entries (greedy token). Avoids
+    /// copying the whole buffer to the host; only the winning index comes back. Ties
+    /// resolve to the smallest index, matching the host [`argmax`].
+    pub fn argmax_device(&self, real_vocab: usize) -> u32 {
+        debug_assert!(real_vocab <= self.n, "real_vocab must not exceed the buffer length");
+        unsafe { dev_argmax(self.ptr, real_vocab as i32) }
     }
     pub fn len(&self) -> usize {
         self.n
@@ -642,8 +650,10 @@ impl Model {
         }
     }
 
-    /// Process one token at position `pos`, returning the `vocab` next-token logits.
-    pub fn forward(&mut self, token: usize, pos: usize) -> Vec<f32> {
+    /// Run one token at position `pos`, leaving the next-token logits in `self.logits`
+    /// (on device). Shared body of [`forward`](Self::forward) and
+    /// [`forward_argmax`](Self::forward_argmax).
+    fn run_forward(&mut self, token: usize, pos: usize) {
         let row = &self.embedding[token * self.hidden..(token + 1) * self.hidden];
         self.h.upload(row);
         for l in &mut self.layers {
@@ -651,7 +661,21 @@ impl Model {
         }
         rmsnorm(&self.h, &self.final_norm, &mut self.normed, self.eps);
         self.lm_head.forward_into(&self.normed, &mut self.logits);
+    }
+
+    /// Process one token at position `pos`, returning the `vocab` next-token logits.
+    pub fn forward(&mut self, token: usize, pos: usize) -> Vec<f32> {
+        self.run_forward(token, pos);
         self.logits.to_host()
+    }
+
+    /// Greedy step: process one token at `pos` and return the argmax over the first
+    /// `real_vocab` logits, computed on device. No full-vocab host copy. Use this on
+    /// the greedy path (temperature 0); the sampling path needs the host logits and
+    /// must call [`forward`](Self::forward) instead.
+    pub fn forward_argmax(&mut self, token: usize, pos: usize, real_vocab: usize) -> u32 {
+        self.run_forward(token, pos);
+        self.logits.argmax_device(real_vocab)
     }
 
     pub fn vocab(&self) -> usize {

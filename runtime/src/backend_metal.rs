@@ -33,6 +33,7 @@ const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metall
 const KERNELS: &[&str] = &[
     "gemv4", "cast_f2h", "rmsnorm_k", "silu_mul_k", "resadd_k", "rope_k", "vadd_k", "attn_k",
     "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m", "attn_m", "rope_m", "mla_attn", "saxpy", "gelu_mul_k", "resadd_h_k",
+    "gemm_mtile_t1", "gemm_mtile_t2", "gemm_mtile_t3", "gemm_mtile_t4", "argmax_stage1", "argmax_stage2",
 ];
 
 struct Ctx {
@@ -45,6 +46,10 @@ struct Ctx {
     // SINGLE command buffer, the Metal equivalent of the CUDA-graph lesson that
     // turns a per-op kernel win into an end-to-end one.
     cur: Mutex<Option<CommandBuffer>>,
+    // Reusable device argmax scratch (partial max/idx arrays + 1 output u32), sized
+    // for the max partial count (ARGMAX_NTG_MAX). Allocated once, reused every token
+    // so the greedy path never mallocs per call.
+    argmax_scratch: Mutex<Option<(Buffer, Buffer, Buffer)>>,
 }
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
@@ -65,9 +70,12 @@ fn ctx() -> &'static Ctx {
                 .expect("pipeline creation failed");
             pl.insert(*name, p);
         }
-        Ctx { _device: device, queue, pl, cur: Mutex::new(None) }
+        Ctx { _device: device, queue, pl, cur: Mutex::new(None), argmax_scratch: Mutex::new(None) }
     })
 }
+
+// Max threadgroups for the argmax stage-1 reduction (also the partial-array length).
+const ARGMAX_NTG_MAX: u64 = 1024;
 
 /// The current open command buffer, created lazily. Ops append encoders to it
 /// and never commit; only drain() commits.
@@ -688,8 +696,17 @@ pub unsafe fn qlinear_forward_m(h: *mut c_void, d_x: *const c_void, d_y: *mut c_
     let blit = cb.new_blit_command_encoder();
     blit.fill_buffer(bufref(d_y), NSRange::new(0, (m as u64) * (q.oc as u64) * 4), 0);
     blit.end_encoding();
+    // M<=4 uses the compile-time-M kernel (acc[M][8] in registers, unrolled m-loops),
+    // the Metal twin of the CUDA gemm_mtile_t<M>; larger M falls back to runtime-M.
+    let kernel = match m {
+        1 => "gemm_mtile_t1",
+        2 => "gemm_mtile_t2",
+        3 => "gemm_mtile_t3",
+        4 => "gemm_mtile_t4",
+        _ => "gemm_mtile",
+    };
     let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&c.pl["gemm_mtile"]);
+    enc.set_compute_pipeline_state(&c.pl[kernel]);
     enc.set_buffer(0, Some(bufref(d_x)), 0);
     enc.set_buffer(1, Some(&q.packed), 0);
     enc.set_buffer(2, Some(&q.cb), 0);
@@ -702,6 +719,54 @@ pub unsafe fn qlinear_forward_m(h: *mut c_void, d_x: *const c_void, d_y: *mut c_
         MTLSize::new(32, TY as u64, 1),
     );
     enc.end_encoding();
+}
+
+// Device argmax over the first `n` (= real_vocab) logits. Encodes into the current
+// open command buffer, so it runs right after the logits GEMV already queued there
+// (no host round trip for the full vocab); only the single winning u32 is read back.
+pub unsafe fn dev_argmax(logits: *const c_void, n: i32) -> u32 {
+    let c = ctx();
+    let tpb = 256u64;
+    let mut ntg = ((n as u64 + tpb - 1) / tpb).max(1);
+    if ntg > ARGMAX_NTG_MAX { ntg = ARGMAX_NTG_MAX; }
+    // reusable scratch (allocated once): partial max/idx of ARGMAX_NTG_MAX, out u32.
+    let mut guard = c.argmax_scratch.lock().unwrap();
+    if guard.is_none() {
+        let val = c._device.new_buffer(ARGMAX_NTG_MAX * 4, MTLResourceOptions::StorageModeShared);
+        let idx = c._device.new_buffer(ARGMAX_NTG_MAX * 4, MTLResourceOptions::StorageModeShared);
+        let out = c._device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+        *guard = Some((val, idx, out));
+    }
+    let (val, idx, out) = guard.as_ref().unwrap();
+    let cb = cur_cb();
+    // stage 1: per-threadgroup (max, idx) over a grid-stride slice. Encoded into the
+    // current open command buffer so it chains after the logits GEMV already queued
+    // there (the decode loop drains that buffer once anyway).
+    let e1 = cb.new_compute_command_encoder();
+    e1.set_compute_pipeline_state(&c.pl["argmax_stage1"]);
+    e1.set_buffer(0, Some(bufref(logits)), 0);
+    e1.set_bytes(1, 4, &n as *const i32 as *const c_void);
+    e1.set_buffer(2, Some(val), 0);
+    e1.set_buffer(3, Some(idx), 0);
+    e1.set_threadgroup_memory_length(0, tg(tpb as usize * 4));
+    e1.set_threadgroup_memory_length(1, tg(tpb as usize * 4));
+    e1.dispatch_thread_groups(MTLSize::new(ntg, 1, 1), MTLSize::new(tpb, 1, 1));
+    e1.end_encoding();
+    // stage 2: reduce the ntg partials to the winning index
+    let e2 = cb.new_compute_command_encoder();
+    e2.set_compute_pipeline_state(&c.pl["argmax_stage2"]);
+    e2.set_buffer(0, Some(val), 0);
+    e2.set_buffer(1, Some(idx), 0);
+    let np = ntg as i32;
+    e2.set_bytes(2, 4, &np as *const i32 as *const c_void);
+    e2.set_buffer(3, Some(out), 0);
+    e2.set_threadgroup_memory_length(0, tg(tpb as usize * 4));
+    e2.set_threadgroup_memory_length(1, tg(tpb as usize * 4));
+    e2.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tpb, 1, 1));
+    e2.end_encoding();
+    let out_ptr = out.contents() as *const u32;
+    drain();
+    *out_ptr
 }
 
 /// Batched RMSNorm: x[M][n] fp16 -> out[M][n] fp16, one row per threadgroup.

@@ -72,14 +72,14 @@ fn main() {
     println!("logits rel err vs HF (worst over prompt): {worst:.2e}");
     println!("top-1 agreement with HF                 : {top1}/{}", prompt.len());
 
-    // reproduce HF greedy continuation + time it
+    // reproduce HF greedy continuation + time it. Device argmax: the next token is
+    // reduced on the GPU, so the full vocab is never copied to the host per step.
     let mut tok = argmax(&last_logits);
     let mut got = Vec::new();
     let t0 = Instant::now();
     for i in 0..cont.len() {
         got.push(tok);
-        let lg = model.forward(tok, prompt.len() + i);
-        tok = argmax(&lg);
+        tok = model.forward_argmax(tok, prompt.len() + i, vocab) as usize;
     }
     let ms = t0.elapsed().as_secs_f64() * 1e3 / cont.len() as f64;
     let matched = got.iter().zip(&cont).take_while(|(a, b)| a == b).count();
@@ -101,13 +101,13 @@ fn main() {
         let mut pos = prompt.len() + cont.len();
         let mut t = tok;
         for _ in 0..8 {
-            t = argmax(&model.forward(t, pos));
+            t = model.forward_argmax(t, pos, vocab) as usize;
             pos += 1;
         } // warmup
         println!("READY_DECODE");
         let t0 = Instant::now();
         for _ in 0..nb {
-            t = argmax(&model.forward(t, pos));
+            t = model.forward_argmax(t, pos, vocab) as usize;
             pos += 1;
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / nb as f64;

@@ -264,6 +264,72 @@ kernel void gemm_mtile(
             atomic_fetch_add_explicit(&Y[(ulong)m*OC + j0 + tx*8 + c], acc[c][m], memory_order_relaxed);
 }
 
+// Compile-time-M fused 4-bit decode GEMM: the twin of the CUDA gemm_mtile_t<M>.
+// M is a template parameter, so acc[M][8] stays in registers and the m-loops fully
+// unroll; the runtime-M gemm_mtile above sizes acc to MMAX=8 and keeps a runtime
+// m-loop, which spills for M>1 (exactly the CUDA note: runtime M defeats unrolling).
+// Same layout as gemv4: packed 4-bit indices, per-column codebook staged in s_cb,
+// fp32 accumulation, atomic float reduce across the grid.y IC split. The Metal
+// backend wires this for M<=4 via named entry points gemm_mtile_t1..t4.
+template<int M>
+static inline void gemm_mtile_t_impl(
+    device const half* X, device const uchar* packed, device const half* cb,
+    device atomic_float* Y, constant GemmParams& p,
+    threadgroup half* s_cb, uint3 tptg, uint3 tgpig, uint3 tgpg)
+{
+    const int IC = p.ic, OC = p.oc;
+    int tx = tptg.x, ty = tptg.y, tid = ty*32 + tx, nth = 32*TY;
+    int j0 = tgpig.x * CPB;
+    for (int t = tid; t < K*CPB/2; t += nth) {
+        int idx = t*2, k = idx/CPB, jj = j0 + (idx%CPB);
+        *reinterpret_cast<threadgroup half2*>(&s_cb[idx]) =
+            *reinterpret_cast<device const half2*>(&cb[(ulong)k*OC + jj]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int per = (IC + (int)tgpg.y - 1) / (int)tgpg.y;
+    int ic0 = tgpig.y * per, ic1 = min(IC, ic0 + per);
+    int jbase = j0 + tx*8; ulong OCp = (ulong)(OC/2);
+    float acc[M][8];
+    #pragma unroll
+    for (int m = 0; m < M; m++)
+        #pragma unroll(8)
+        for (int c = 0; c < 8; c++) acc[m][c] = 0;
+    for (int ic = ic0 + ty; ic < ic1; ic += TY) {
+        uint f = *reinterpret_cast<device const uint*>(&packed[(ulong)ic*OCp + (ulong)(jbase/2)]);
+        float w[8];
+        #pragma unroll(8)
+        for (int c = 0; c < 8; c++) { uchar id = (f >> (4*c)) & 0xF; w[c] = (float)s_cb[id*CPB + tx*8 + c]; }
+        #pragma unroll
+        for (int m = 0; m < M; m++) {
+            float xx = (float)X[(ulong)m*IC + ic];
+            #pragma unroll(8)
+            for (int c = 0; c < 8; c++) acc[m][c] += xx * w[c];
+        }
+    }
+    #pragma unroll
+    for (int m = 0; m < M; m++)
+        #pragma unroll(8)
+        for (int c = 0; c < 8; c++)
+            atomic_fetch_add_explicit(&Y[(ulong)m*OC + j0 + tx*8 + c], acc[m][c], memory_order_relaxed);
+}
+
+#define GEMM_MTILE_T(NAME, MM)                                                          \
+kernel void NAME(                                                                       \
+    device const half*  X       [[buffer(0)]],                                          \
+    device const uchar* packed  [[buffer(1)]],                                          \
+    device const half*  cb      [[buffer(2)]],                                          \
+    device atomic_float* Y      [[buffer(3)]],                                          \
+    constant GemmParams& p      [[buffer(4)]],                                          \
+    threadgroup half*  s_cb     [[threadgroup(0)]],                                     \
+    uint3 tptg [[thread_position_in_threadgroup]],                                      \
+    uint3 tgpig [[threadgroup_position_in_grid]],                                       \
+    uint3 tgpg [[threadgroups_per_grid]])                                               \
+{ gemm_mtile_t_impl<MM>(X, packed, cb, Y, p, s_cb, tptg, tgpig, tgpg); }
+GEMM_MTILE_T(gemm_mtile_t1, 1)
+GEMM_MTILE_T(gemm_mtile_t2, 2)
+GEMM_MTILE_T(gemm_mtile_t3, 3)
+GEMM_MTILE_T(gemm_mtile_t4, 4)
+
 // gemm_mtile2: optimized small-M fused decode GEMM. Fixes the naive version's
 // two leaks past M=2: (a) light registers (2 output channels/thread, acc[2][M]
 // not [8][8]) so nothing spills; (b) NO atomics — each output tile is owned by
@@ -481,4 +547,69 @@ kernel void gelu_mul_k(
 kernel void resadd_h_k(device half* h [[buffer(0)]], device const half* d [[buffer(1)]],
                        constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i < n) h[i] = (half)((float)h[i] + (float)d[i]);
+}
+
+// ============================================================================
+// Two-stage device argmax over the first n logits (greedy token selection). Lets
+// the decode loop pick the next token WITHOUT copying the full vocab (up to ~152k
+// f32) to the host: only a single u32 comes back. Stage 1: each threadgroup reduces
+// a grid-stride slice to one (max, idx) pair. Stage 2: one threadgroup reduces the
+// per-group pairs to the winning index. Ties resolve to the SMALLEST index (strict
+// >), matching the host argmax exactly. n = real_vocab, so padded logits past the
+// real vocabulary are never considered.
+// ============================================================================
+kernel void argmax_stage1(
+    device const float* x   [[buffer(0)]],
+    constant int& n         [[buffer(1)]],
+    device float* out_val   [[buffer(2)]],
+    device uint*  out_idx   [[buffer(3)]],
+    threadgroup float* sval [[threadgroup(0)]],
+    threadgroup uint*  sidx [[threadgroup(1)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tpg  [[threads_per_threadgroup]],
+    uint ntg  [[threadgroups_per_grid]])
+{
+    float bv = -INFINITY; uint bi = 0;
+    for (uint i = tgid*tpg + tid; i < (uint)n; i += tpg*ntg) {
+        float v = x[i];
+        if (v > bv) { bv = v; bi = i; }   // strict > keeps the smallest index on a tie
+    }
+    sval[tid] = bv; sidx[tid] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = sval[tid+s]; uint oi = sidx[tid+s];
+            if (ov > sval[tid] || (ov == sval[tid] && oi < sidx[tid])) { sval[tid] = ov; sidx[tid] = oi; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) { out_val[tgid] = sval[0]; out_idx[tgid] = sidx[0]; }
+}
+
+kernel void argmax_stage2(
+    device const float* in_val [[buffer(0)]],
+    device const uint*  in_idx [[buffer(1)]],
+    constant int& np           [[buffer(2)]],
+    device uint* out           [[buffer(3)]],
+    threadgroup float* sval    [[threadgroup(0)]],
+    threadgroup uint*  sidx    [[threadgroup(1)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]])
+{
+    float bv = -INFINITY; uint bi = 0xffffffffu;
+    for (uint i = tid; i < (uint)np; i += tpg) {
+        float v = in_val[i]; uint id = in_idx[i];
+        if (v > bv || (v == bv && id < bi)) { bv = v; bi = id; }
+    }
+    sval[tid] = bv; sidx[tid] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = sval[tid+s]; uint oi = sidx[tid+s];
+            if (ov > sval[tid] || (ov == sval[tid] && oi < sidx[tid])) { sval[tid] = ov; sidx[tid] = oi; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) out[0] = sidx[0];
 }

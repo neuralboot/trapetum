@@ -18,18 +18,6 @@ pub struct Session {
     vocab: usize,
 }
 
-fn argmax(x: &[f32]) -> usize {
-    let mut bi = 0usize;
-    let mut bv = f32::MIN;
-    for (i, &v) in x.iter().enumerate() {
-        if v > bv {
-            bv = v;
-            bi = i;
-        }
-    }
-    bi
-}
-
 /// Load a model directory (must contain `model.cbk` and `tokenizer.json`).
 /// Returns an opaque session pointer, or null on failure.
 ///
@@ -87,11 +75,17 @@ pub unsafe extern "C" fn trapetum_generate(
         return 0;
     }
     let v = sess.vocab;
-    // prefill
-    let mut logits = Vec::new();
+    // prefill: only the last token's logits are needed, and greedily as an argmax on
+    // device (no full-vocab host copy). Earlier tokens just prime the KV cache.
     let mut pos = 0usize;
-    for &t in ids {
-        logits = sess.model.forward(t as usize, pos);
+    let mut next = 0u32;
+    let last = ids.len() - 1;
+    for (i, &t) in ids.iter().enumerate() {
+        if i == last {
+            next = sess.model.forward_argmax(t as usize, pos, v);
+        } else {
+            sess.model.run_forward(t as usize, pos);
+        }
         pos += 1;
     }
     // greedy decode, decoding each token to a text piece and streaming it
@@ -99,7 +93,6 @@ pub unsafe extern "C" fn trapetum_generate(
     let mut prev_text = String::new();
     let mut n = 0i32;
     while n < max_tokens {
-        let next = argmax(&logits[..v]) as u32;
         produced.push(next);
         // incremental detokenization: decode the whole sequence, emit the delta
         let text = sess.tok.decode(&produced, true).unwrap_or_default();
@@ -113,7 +106,7 @@ pub unsafe extern "C" fn trapetum_generate(
                 }
             }
         }
-        logits = sess.model.forward(next as usize, pos);
+        next = sess.model.forward_argmax(next as usize, pos, v);
         pos += 1;
     }
     n
