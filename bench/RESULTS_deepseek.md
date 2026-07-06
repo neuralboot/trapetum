@@ -58,8 +58,16 @@ Measured numbers (raw logs in `runpod_logs/r1_671b_export.log` and
   (`PackedBytes::Mmap`), while the f32 codebooks stay in RAM. Before the mmap path the
   same load needed 326 GB and died at layer 44 under the pod's 250 GB cgroup cap.
 - **Speed**: 0.2 tok/s on the first pass (5.9 s/token), entirely first-touch disk paging
-  on network-attached storage. Steady-state throughput after page-cache warm-up is not
-  yet measured; local NVMe should be substantially faster.
+  on network-attached storage. Steady-state measured July 6 on local NVMe (64 tokens,
+  per-token timing, immediate warm rerun): **~0.1 tok/s** (10.2 s/token), warm rerun
+  identical. Verdict: with ~100 GB RAM against a 350 GB artifact the per-token expert
+  working set (top-8 x 58 MoE layers) never fits in page cache, so decode stays
+  disk-bandwidth-bound; the lever is RAM (or expert prefetch), not cache warm-up.
+- **Quality**: the 64-token continuation is fully coherent: "Paris. Paris is located in
+  northern France and is known for its iconic landmarks such as the Eiffel Tower,
+  Notre-Dame Cathedral, and the Louvre Museum. It is also a global center for art,
+  fashion, gastronomy, and culture..." (raw per-token logs in
+  `runpod_logs/r1_671b_steady.log` and `r1_671b_warm.log`).
 
 ## What this establishes
 The largest open-source model runs end to end in a from-scratch Rust runtime with no
