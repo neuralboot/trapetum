@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 The 'PC B' of the public compare demo AND the demo GATEKEEPER: the SAME model,
-UNCOMPRESSED (fp16), served the way a home user would run it — stock transformers,
+UNCOMPRESSED (fp16), served the way a home user would run it, stock transformers,
 batch-1, one GPU. OpenAI-compatible subset (/v1/models, /v1/chat/completions with
 stream) so the demo page uses one client for both sides.
 
@@ -11,12 +11,12 @@ This process ALSO gates the whole public compare demo (both PC A and PC B):
     session TTL, 10 tests/day per client_id AND per IP, and a small FIFO line;
   * every generation call REQUIRES a valid X-Demo-Token;
   * a server-side proxy (/proxy/trapetum/...) streams to PC A (pure-Rust runtime)
-    so side A is enforced too — the page never talks to PC A directly.
+    so side A is enforced too, the page never talks to PC A directly.
 
   pip install fastapi uvicorn transformers torch accelerate sse-starlette httpx
   MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B python3 serve_fp16_baseline.py
 
-  # gate-only (no GPU / model load) — session endpoints + proxy only, for a CPU pod
+  # gate-only (no GPU / model load), session endpoints + proxy only, for a CPU pod
   # or for local testing of the gatekeeper:
   DEMO_GATE_ONLY=1 python3 serve_fp16_baseline.py
 """
@@ -43,7 +43,34 @@ MAX_SESSIONS_PER_DAY = 12  # per client_id AND per IP, UTC calendar day
 MAX_WAITERS = 10           # FIFO waiting-line cap
 WAITER_TTL = 12            # drop a waiter that stops polling for this long (page polls ~2.5s)
 
-# PC A — Trapetum 4-bit, pure-Rust OpenAI-compatible server (no auth of its own)
+# ---- public tester counter (shown on the compare page) ----
+TESTER_BASE = 1234                                   # display seed
+TESTER_FILE = os.environ.get("TESTER_FILE", "/root/testers.json")
+
+
+def _load_testers() -> set:
+    try:
+        with open(TESTER_FILE) as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+testers = _load_testers()
+
+
+def _record_tester(cid: str) -> None:
+    """Count each browser (client_id) once, forever, across process restarts."""
+    if cid in testers:
+        return
+    testers.add(cid)
+    try:
+        with open(TESTER_FILE, "w") as f:
+            json.dump(sorted(testers), f)
+    except Exception:
+        pass
+
+# PC A, Trapetum 4-bit, pure-Rust OpenAI-compatible server (no auth of its own)
 TRAPETUM_URL = os.environ.get(
     "TRAPETUM_URL", "https://tbyk48o84q2sob-8000.proxy.runpod.net/v1/chat/completions")
 
@@ -128,7 +155,7 @@ async def session_claim(req: Request):
                     "active": True, "sessions_used_today": day_client[cid],
                     "sessions_limit": MAX_SESSIONS_PER_DAY}
 
-        # daily caps — whichever hits first (per client_id AND per IP)
+        # daily caps, whichever hits first (per client_id AND per IP)
         if day_client[cid] >= MAX_SESSIONS_PER_DAY or day_ip[ip] >= MAX_SESSIONS_PER_DAY:
             waiters[:] = [w for w in waiters if w["client_id"] != cid]
             return JSONResponse(
@@ -145,6 +172,7 @@ async def session_claim(req: Request):
                            "granted_at": now, "expires_at": now + SESSION_TTL}
             day_client[cid] += 1
             day_ip[ip] += 1
+            _record_tester(cid)
             return {"token": token, "expires_in": SESSION_TTL, "active": True,
                     "sessions_used_today": day_client[cid],
                     "sessions_limit": MAX_SESSIONS_PER_DAY}
@@ -207,7 +235,7 @@ async def health():
         except Exception:
             a_ok = False
         _health_cache.update(t=now, a=a_ok)
-    return {"a": _health_cache["a"], "b": True}
+    return {"a": _health_cache["a"], "b": True, "testers": TESTER_BASE + len(testers)}
 
 
 @app.get("/session/quota")
@@ -251,7 +279,7 @@ def models():
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
     if not _valid_token(req):
-        return JSONResponse({"error": {"message": "no active session — claim one first"}},
+        return JSONResponse({"error": {"message": "no active session, claim one first"}},
                             status_code=401)
     if DEMO_GATE_ONLY:
         return JSONResponse({"error": {"message": "generation disabled (gate-only mode)"}},
@@ -314,7 +342,7 @@ async def proxy_trapetum(req: Request):
     """Server-side stream to PC A so side A is token-enforced too (the page never
     hits PC A directly). Relays PC A's raw SSE bytes back to the browser."""
     if not _valid_token(req):
-        return JSONResponse({"error": {"message": "no active session — claim one first"}},
+        return JSONResponse({"error": {"message": "no active session, claim one first"}},
                             status_code=401)
     body = await req.json()
     payload = _sanitize_for_upstream(body)
@@ -337,7 +365,7 @@ async def proxy_trapetum(req: Request):
                         yield chunk
         except Exception as e:
             yield ("data: " + json.dumps(
-                {"error": {"message": "PC A offline — the demo pods may be restarting"}}) + "\n\n").encode()
+                {"error": {"message": "PC A offline, the demo pods may be restarting"}}) + "\n\n").encode()
             yield b"data: [DONE]\n\n"
 
     return StreamingResponse(relay(), media_type="text/event-stream")
