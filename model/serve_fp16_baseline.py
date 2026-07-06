@@ -217,24 +217,34 @@ async def session_release(req: Request):
     return {"released": True}
 
 
-_health_cache = {"t": 0.0, "a": False}
+_health_cache = {"t": 0.0, "a": False, "refreshing": False}
+
+
+async def _refresh_a():
+    a_ok = False
+    try:
+        base = TRAPETUM_URL.rsplit("/v1/", 1)[0]
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(base + "/v1/models")
+            a_ok = r.status_code == 200
+    except Exception:
+        a_ok = False
+    _health_cache.update(t=time.time(), a=a_ok, refreshing=False)
 
 
 @app.get("/health")
 async def health():
     """Both-sides health for the nav gate: B is us (alive if answering), A is
-    pinged server-side (cached 30s) so the page never needs A's URL or its CORS."""
+    pinged server-side. Stale-while-revalidate: the response is INSTANT (cached
+    value), a background task refreshes the A ping when older than 30s, so the
+    page's 4s nav budget is never at risk."""
+    import asyncio
     now = time.time()
-    if now - _health_cache["t"] > 30:
-        a_ok = False
-        try:
-            base = TRAPETUM_URL.rsplit("/v1/", 1)[0]
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                r = await client.get(base + "/v1/models")
-                a_ok = r.status_code == 200
-        except Exception:
-            a_ok = False
-        _health_cache.update(t=now, a=a_ok)
+    if _health_cache["t"] == 0.0:
+        await _refresh_a()                      # first call after boot: fill once
+    elif now - _health_cache["t"] > 30 and not _health_cache["refreshing"]:
+        _health_cache["refreshing"] = True
+        asyncio.get_event_loop().create_task(_refresh_a())
     return {"a": _health_cache["a"], "b": True, "testers": TESTER_BASE + len(testers)}
 
 
