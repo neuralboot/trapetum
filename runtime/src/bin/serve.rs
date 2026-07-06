@@ -34,12 +34,41 @@ fn argmax(x: &[f32]) -> usize {
     bi
 }
 
-// mask the padded vocab slots (kernel rounds the output up to a multiple of 256) then argmax
-fn next_tok(logits: &mut [f32], real_vocab: usize) -> u32 {
+// mask the padded vocab slots (kernel rounds the output up to a multiple of 256), then
+// pick: greedy argmax when temperature <= 0, else temperature + top-p nucleus sampling.
+// Reasoning models (DeepSeek-R1 family) officially discourage greedy decode (repetition
+// collapse); 4-bit quantization error compounds over long chains and makes it worse.
+fn next_tok(logits: &mut [f32], real_vocab: usize, temperature: f32, top_p: f32, rng: &mut u64) -> u32 {
     for i in real_vocab.min(logits.len())..logits.len() {
         logits[i] = f32::NEG_INFINITY;
     }
-    argmax(logits) as u32
+    if temperature <= 0.0 {
+        return argmax(logits) as u32;
+    }
+    // softmax over logits/T on the top candidates only (sort a pruned set for speed)
+    let mut idx: Vec<u32> = (0..real_vocab.min(logits.len()) as u32).collect();
+    idx.sort_unstable_by(|&a, &b| logits[b as usize].partial_cmp(&logits[a as usize]).unwrap());
+    idx.truncate(256); // top-p never needs more in practice
+    let mx = logits[idx[0] as usize];
+    let mut probs: Vec<f32> = idx.iter().map(|&i| ((logits[i as usize] - mx) / temperature).exp()).collect();
+    let sum: f32 = probs.iter().sum();
+    for p in probs.iter_mut() { *p /= sum; }
+    // nucleus: keep the smallest prefix with cumulative prob >= top_p
+    let mut cum = 0.0f32;
+    let mut keep = probs.len();
+    for (k, &p) in probs.iter().enumerate() {
+        cum += p;
+        if cum >= top_p { keep = k + 1; break; }
+    }
+    // xorshift64* draw in [0, cum-of-kept)
+    *rng ^= *rng << 13; *rng ^= *rng >> 7; *rng ^= *rng << 17;
+    let kept_sum: f32 = probs[..keep].iter().sum();
+    let mut r = (*rng >> 11) as f32 / (1u64 << 53) as f32 * kept_sum;
+    for k in 0..keep {
+        if r < probs[k] { return idx[k]; }
+        r -= probs[k];
+    }
+    idx[0]
 }
 
 struct Loaded {
@@ -74,7 +103,7 @@ fn read_stops(dir: &str, tok: &Tokenizer) -> Vec<u32> {
             }
         }
     }
-    for s in ["<|im_end|>", "<|eot_id|>", "</s>", "<|endoftext|>", "<|EOT|>"] {
+    for s in ["<|im_end|>", "<|eot_id|>", "</s>", "<|endoftext|>", "<|EOT|>", "<|end\u{2581}of\u{2581}sentence|>"] {
         if let Some(id) = tok.token_to_id(s) {
             stops.push(id);
         }
@@ -120,7 +149,14 @@ fn load_model(root: &str, name: &str) -> Result<Loaded, String> {
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v.get("template").and_then(|x| x.as_str()).map(String::from))
         .unwrap_or_else(|| {
-            if tok.token_to_id("<|eot_id|>").is_some() {
+            // DeepSeek first: R1-distills sit on Qwen/Llama vocabs (which also carry
+            // <|im_start|>/<|eot_id|>), but were fine-tuned on the DeepSeek template
+            // with <think> priming — ChatML on them skips reasoning and never stops.
+            if tok.token_to_id("<|User|>").is_some()
+                && tok.token_to_id("<|Assistant|>").is_some()
+            {
+                "deepseek".into()
+            } else if tok.token_to_id("<|eot_id|>").is_some() {
                 "llama3".into()
             } else if tok.token_to_id("<|im_start|>").is_some() {
                 "chatml".into()
@@ -160,6 +196,25 @@ fn build_prompt(messages: &[(String, String)], template: &str) -> String {
                 s.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", role, content));
             }
             s.push_str("<|im_start|>assistant\n");
+        }
+        "deepseek" => {
+            // DeepSeek-V2/V3/R1 template: BOS, optional bare system text, then
+            // <|User|>/<|Assistant|> turns; assistant turns close with EOS. The
+            // final <think> primes R1-style reasoning (the model only emits the
+            // CLOSING </think> itself).
+            s.push_str("<|begin\u{2581}of\u{2581}sentence|>");
+            if let Some((_, sy)) = messages.iter().find(|(r, _)| r == "system") {
+                s.push_str(sy);
+            }
+            for (role, content) in messages {
+                match role.as_str() {
+                    "user" => s.push_str(&format!("<|User|>{}", content)),
+                    "assistant" => s.push_str(&format!(
+                        "<|Assistant|>{}<|end\u{2581}of\u{2581}sentence|>", content)),
+                    _ => {}
+                }
+            }
+            s.push_str("<|Assistant|><think>\n");
         }
         "llama2" => {
             let sys = messages.iter().find(|(r, _)| r == "system").map(|(_, c)| c.clone());
@@ -236,7 +291,10 @@ fn rep_penalty(logits: &mut [f32], seen: &std::collections::HashSet<usize>, pena
     }
 }
 
-fn generate(cur: &mut Loaded, prompt: &str, max_new: usize, penalty: f32) -> (String, usize) {
+fn generate(cur: &mut Loaded, prompt: &str, max_new: usize, penalty: f32, temperature: f32, top_p: f32) -> (String, usize) {
+    let mut rng: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x9E3779B97F4A7C15)
+        | 1;
     let enc = match cur.tok.encode(prompt, false) {
         Ok(e) => e,
         Err(_) => return ("(tokenizer encode error)".into(), 0),
@@ -257,7 +315,7 @@ fn generate(cur: &mut Loaded, prompt: &str, max_new: usize, penalty: f32) -> (St
     let mut out: Vec<u32> = Vec::new();
     let mut pos = ids.len();
     rep_penalty(&mut logits, &seen, penalty);
-    let mut next = next_tok(&mut logits, cur.real_vocab);
+    let mut next = next_tok(&mut logits, cur.real_vocab, temperature, top_p, &mut rng);
     for _ in 0..max_new {
         if cur.stops.contains(&next) || pos >= cap {
             break;
@@ -267,7 +325,7 @@ fn generate(cur: &mut Loaded, prompt: &str, max_new: usize, penalty: f32) -> (St
         logits = cur.model.forward(next as usize, pos);
         pos += 1;
         rep_penalty(&mut logits, &seen, penalty);
-        next = next_tok(&mut logits, cur.real_vocab);
+        next = next_tok(&mut logits, cur.real_vocab, temperature, top_p, &mut rng);
     }
     let n = out.len();
     (cur.tok.decode(&out, true).unwrap_or_default(), n)
@@ -1179,6 +1237,11 @@ fn main() {
             let cap = cfg().max_tokens_cap.max(1) as u64;
             let max_new = v.get("max_tokens").and_then(|x| x.as_u64()).unwrap_or(256).min(cap) as usize;
             let penalty = v.get("repetition_penalty").and_then(|x| x.as_f64()).unwrap_or(1.3) as f32;
+            // R1-family default: DeepSeek discourages greedy decode on reasoning models
+            // (repetition collapse); other templates keep the historical greedy default.
+            let temp_default = if c.template == "deepseek" { 0.6 } else { 0.0 };
+            let temperature = v.get("temperature").and_then(|x| x.as_f64()).unwrap_or(temp_default) as f32;
+            let top_p = v.get("top_p").and_then(|x| x.as_f64()).unwrap_or(0.95) as f32;
             let mut messages: Vec<(String, String)> = Vec::new();
             if let Some(arr) = v.get("messages").and_then(|x| x.as_array()) {
                 for m in arr {
@@ -1192,7 +1255,7 @@ fn main() {
                 eprintln!("[{}] {}", c.name, prompt.replace('\n', " ").chars().take(140).collect::<String>());
             }
             let t0 = Instant::now();
-            let (text, ntok) = generate(c, &prompt, max_new, penalty);
+            let (text, ntok) = generate(c, &prompt, max_new, penalty, temperature, top_p);
             record_usage(&root, &want, ntok);
             let tps = ntok as f64 / t0.elapsed().as_secs_f64().max(1e-6);
             let resp = serde_json::json!({

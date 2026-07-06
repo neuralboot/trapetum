@@ -254,7 +254,10 @@ async def chat(req: Request):
     def run():
         with gen_lock:
             with torch.no_grad():
-                model.generate(ids, max_new_tokens=max_new, do_sample=False,
+                # Same decode settings as PC A for a fair race: DeepSeek-R1 official
+                # recommendation (greedy causes repetition collapse on reasoning models).
+                model.generate(ids, max_new_tokens=max_new, do_sample=True,
+                               temperature=0.6, top_p=0.95,
                                streamer=streamer, pad_token_id=tok.eos_token_id)
 
     t = threading.Thread(target=run, daemon=True); t.start()
