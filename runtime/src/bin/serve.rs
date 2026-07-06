@@ -5,7 +5,7 @@
 //! Usage: serve <models_root> [port]
 //!   <models_root> holds one sub-dir per model, each with: model.cbk, tokenizer.json,
 //!   config.json, and an optional meta.json {"template": "...", "label": "..."}.
-use std::io::Read;
+use std::io::Write;
 use std::time::Instant;
 use tiny_http::{Header, Method, Request, Response, Server};
 use tokenizers::Tokenizer;
@@ -238,7 +238,9 @@ fn build_prompt(messages: &[(String, String)], template: &str) -> String {
                 }
             }
         }
-        "deepseek" => {
+        "dscoder" => {
+            // DeepSeek-Coder instruct template (### Instruction/### Response). Distinct
+            // from the chat "deepseek" arm above; select it via meta.json template only.
             let sys = messages
                 .iter()
                 .find(|(r, _)| r == "system")
@@ -291,17 +293,32 @@ fn rep_penalty(logits: &mut [f32], seen: &std::collections::HashSet<usize>, pena
     }
 }
 
-fn generate(cur: &mut Loaded, prompt: &str, max_new: usize, penalty: f32, temperature: f32, top_p: f32) -> (String, usize) {
+// Same decode loop as `generate` (sliding-window rep penalty, DeepSeek/other template
+// already applied upstream in `prompt`, same stop tokens), but calls `on_piece` with
+// each incremental piece of text as it's produced instead of returning one blob at
+// the end. `generate` is now a thin wrapper that collects the pieces.
+fn generate_stream(
+    cur: &mut Loaded,
+    prompt: &str,
+    max_new: usize,
+    penalty: f32,
+    temperature: f32,
+    top_p: f32,
+    on_piece: &mut dyn FnMut(&str),
+) -> usize {
     let mut rng: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x9E3779B97F4A7C15)
         | 1;
     let enc = match cur.tok.encode(prompt, false) {
         Ok(e) => e,
-        Err(_) => return ("(tokenizer encode error)".into(), 0),
+        Err(_) => {
+            on_piece("(tokenizer encode error)");
+            return 0;
+        }
     };
     let mut ids: Vec<usize> = enc.get_ids().iter().map(|&i| i as usize).collect();
     if ids.is_empty() {
-        return (String::new(), 0);
+        return 0;
     }
     let cap = 1020usize;
     if ids.len() > cap {
@@ -322,6 +339,10 @@ fn generate(cur: &mut Loaded, prompt: &str, max_new: usize, penalty: f32, temper
     let mut pos = ids.len();
     rep_penalty(&mut logits, &seen, penalty);
     let mut next = next_tok(&mut logits, cur.real_vocab, temperature, top_p, &mut rng);
+    // Diff each new full decode against the previous one instead of decoding each
+    // token in isolation: a tokenizer can split one UTF-8 character across tokens,
+    // and decoding token-by-token would emit invalid partial bytes mid-character.
+    let mut prev_text = String::new();
     for _ in 0..max_new {
         if cur.stops.contains(&next) || pos >= cap {
             break;
@@ -334,13 +355,27 @@ fn generate(cur: &mut Loaded, prompt: &str, max_new: usize, penalty: f32, temper
         } else {
             seen.insert(next as usize);
         }
+        if let Ok(new_text) = cur.tok.decode(&out, true) {
+            if new_text.starts_with(&prev_text) {
+                let piece = &new_text[prev_text.len()..];
+                if !piece.is_empty() {
+                    on_piece(piece);
+                }
+                prev_text = new_text;
+            }
+        }
         logits = cur.model.forward(next as usize, pos);
         pos += 1;
         rep_penalty(&mut logits, &seen, penalty);
         next = next_tok(&mut logits, cur.real_vocab, temperature, top_p, &mut rng);
     }
-    let n = out.len();
-    (cur.tok.decode(&out, true).unwrap_or_default(), n)
+    out.len()
+}
+
+fn generate(cur: &mut Loaded, prompt: &str, max_new: usize, penalty: f32, temperature: f32, top_p: f32) -> (String, usize) {
+    let mut text = String::new();
+    let n = generate_stream(cur, prompt, max_new, penalty, temperature, top_p, &mut |piece| text.push_str(piece));
+    (text, n)
 }
 
 // ---------------- model catalog + energy/CO2 metrics ----------------
@@ -1268,6 +1303,36 @@ fn main() {
                 eprintln!("[{}] {}", c.name, prompt.replace('\n', " ").chars().take(140).collect::<String>());
             }
             let t0 = Instant::now();
+            let want_stream = v.get("stream").and_then(|x| x.as_bool()).unwrap_or(false);
+            if want_stream {
+                let mut origin = cfg().cors_origins;
+                if origin.is_empty() { origin = "*".into(); }
+                // tiny_http has no chunked-streaming Response helper, so we take the raw
+                // connection and write the SSE response by hand (same CORS header the
+                // json_resp() path applies); Connection: close marks the stream's end.
+                let mut w = req.into_writer();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Headers: *\r\n\r\n"
+                );
+                if w.write_all(head.as_bytes()).is_err() {
+                    continue;
+                }
+                let ntok = generate_stream(c, &prompt, max_new, penalty, temperature, top_p, &mut |piece| {
+                    let chunk = serde_json::json!({"choices": [{"delta": {"content": piece}}]});
+                    let _ = write!(w, "data: {chunk}\n\n");
+                    let _ = w.flush();
+                });
+                record_usage(&root, &want, ntok);
+                let tps = ntok as f64 / t0.elapsed().as_secs_f64().max(1e-6);
+                let done = serde_json::json!({
+                    "choices": [{"delta": {}, "finish_reason": "stop"}],
+                    "usage": {"completion_tokens": ntok, "tok_per_s": (tps * 10.0).round() / 10.0}
+                });
+                let _ = write!(w, "data: {done}\n\n");
+                let _ = write!(w, "data: [DONE]\n\n");
+                let _ = w.flush();
+                continue;
+            }
             let (text, ntok) = generate(c, &prompt, max_new, penalty, temperature, top_p);
             record_usage(&root, &want, ntok);
             let tps = ntok as f64 / t0.elapsed().as_secs_f64().max(1e-6);
