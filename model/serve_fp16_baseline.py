@@ -298,8 +298,11 @@ async def proxy_trapetum(req: Request):
     async def relay():
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=15.0)) as client:
+                # identity: the RunPod proxy gzips otherwise and aiter_raw would relay
+                # compressed bytes without the Content-Encoding header (binary garbage).
                 async with client.stream("POST", TRAPETUM_URL, json=payload,
-                                         headers={"content-type": "application/json"}) as r:
+                                         headers={"content-type": "application/json",
+                                                  "accept-encoding": "identity"}) as r:
                     if r.status_code != 200:
                         txt = (await r.aread()).decode("utf-8", "replace")[:200]
                         yield ("data: " + json.dumps(
