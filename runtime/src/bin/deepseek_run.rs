@@ -11,11 +11,26 @@ fn main() {
     println!("loaded in {:.1}s, vocab={}, prompt={} tokens {:?}", t0.elapsed().as_secs_f64(), m.vocab(), prompt.len(), prompt);
     let mut last = vec![];
     for (t, &tok) in prompt.iter().enumerate() { last = m.forward(tok, t); }
-    let n = 24usize;
+    // TRAPETUM_NTOK overrides the generation length (default 24); per-token
+    // times expose the cold-to-warm transition when experts page in from disk.
+    let n: usize = env::var("TRAPETUM_NTOK").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
     let mut tok = argmax(&last); let mut got = Vec::new();
+    let mut per_tok = Vec::with_capacity(n);
     let t0 = Instant::now();
-    for i in 0..n { got.push(tok); let lg = m.forward(tok, prompt.len()+i); tok = argmax(&lg); }
+    for i in 0..n {
+        got.push(tok);
+        let ti = Instant::now();
+        let lg = m.forward(tok, prompt.len()+i);
+        per_tok.push(ti.elapsed().as_secs_f64()*1e3);
+        tok = argmax(&lg);
+        println!("tok {:>3}: {:>9.1} ms", i, per_tok[i]);
+    }
     let ms = t0.elapsed().as_secs_f64()*1e3/n as f64;
     println!("continuation ids: {:?}", got);
     println!("decode: {ms:.1} ms/token ({:.1} tok/s), pure Rust MLA+MoE, no Python", 1e3/ms);
+    if n >= 16 {
+        let tail = &per_tok[n/2..];
+        let tail_ms = tail.iter().sum::<f64>()/tail.len() as f64;
+        println!("steady-state (last {} tokens): {:.1} ms/token ({:.2} tok/s)", tail.len(), tail_ms, 1e3/tail_ms);
+    }
 }
