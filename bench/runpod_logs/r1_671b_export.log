@@ -1,0 +1,71 @@
+MILESTONE 0: env
+NVIDIA A100-SXM4-80GB, 81920 MiB
+RAM_GB 2003
+overlay         2.0T   16M  2.0T   1% /
+[notice] To update, run: python -m pip install --upgrade pip
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'SCHILY.fflags'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.FinderInfo'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+MILESTONE 1: download 1.34TB BF16 (163 shards)
+/usr/local/lib/python3.10/dist-packages/huggingface_hub/constants.py:298: FutureWarning: The `HF_HUB_ENABLE_HF_TRANSFER` environment variable is deprecated as 'hf_transfer' is not used anymore. Please use `HF_XET_HIGH_PERFORMANCE` instead to enable high performance transfer with Xet. Visit https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfxethighperformance for more details.
+  warnings.warn(
+Fetching 169 files:   0%|          | 0/169 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 169 files:   1%|          | 1/169 [00:00<00:22,  7.31it/s]Fetching 169 files:   2%|▏         | 3/169 [01:04<1:06:14, 23.95s/it]Fetching 169 files:   4%|▎         | 6/169 [01:17<32:31, 11.97s/it]  Fetching 169 files:  10%|█         | 17/169 [01:20<07:39,  3.02s/it]Fetching 169 files:  11%|█         | 19/169 [01:22<06:44,  2.70s/it]Fetching 169 files:  12%|█▏        | 20/169 [01:29<07:52,  3.17s/it]Fetching 169 files:  12%|█▏        | 21/169 [01:46<12:01,  4.88s/it]Fetching 169 files:  13%|█▎        | 22/169 [01:48<11:08,  4.55s/it]Fetching 169 files:  14%|█▍        | 24/169 [01:49<07:45,  3.21s/it]Fetching 169 files:  15%|█▍        | 25/169 [01:51<07:22,  3.07s/it]Fetching 169 files:  17%|█▋        | 28/169 [02:03<07:59,  3.40s/it]Fetching 169 files:  17%|█▋        | 29/169 [02:17<12:23,  5.31s/it]Fetching 169 files:  18%|█▊        | 30/169 [02:22<12:08,  5.24s/it]Fetching 169 files:  18%|█▊        | 31/169 [02:27<11:45,  5.11s/it]Fetching 169 files:  20%|█▉        | 33/169 [02:30<08:22,  3.69s/it]Fetching 169 files:  22%|██▏       | 37/169 [03:06<14:25,  6.56s/it]Fetching 169 files:  23%|██▎       | 39/169 [03:07<10:37,  4.91s/it]Fetching 169 files:  24%|██▍       | 41/169 [03:23<12:11,  5.71s/it]Fetching 169 files:  27%|██▋       | 45/169 [03:33<08:50,  4.28s/it]Fetching 169 files:  27%|██▋       | 46/169 [03:37<08:46,  4.28s/it]Fetching 169 files:  28%|██▊       | 47/169 [03:39<07:46,  3.82s/it]Fetching 169 files:  30%|██▉       | 50/169 [03:41<05:03,  2.55s/it]Fetching 169 files:  31%|███       | 52/169 [04:01<09:03,  4.65s/it]Fetching 169 files:  31%|███▏      | 53/169 [04:22<14:22,  7.44s/it]Fetching 169 files:  32%|███▏      | 54/169 [04:32<15:07,  7.89s/it]Fetching 169 files:  36%|███▌      | 60/169 [04:32<05:25,  2.98s/it]Fetching 169 files:  36%|███▌      | 60/169 [04:49<05:25,  2.98s/it]Fetching 169 files:  36%|███▌      | 61/169 [04:49<08:44,  4.86s/it]Fetching 169 files:  37%|███▋      | 63/169 [04:58<08:16,  4.69s/it]Fetching 169 files:  38%|███▊      | 65/169 [04:58<05:53,  3.40s/it]Fetching 169 files:  38%|███▊      | 65/169 [05:09<05:53,  3.40s/it]Fetching 169 files:  40%|███▉      | 67/169 [05:10<07:02,  4.14s/it]Fetching 169 files:  41%|████      | 69/169 [05:21<07:31,  4.52s/it]Fetching 169 files:  41%|████▏     | 70/169 [05:25<07:17,  4.42s/it]Fetching 169 files:  42%|████▏     | 71/169 [05:28<06:43,  4.11s/it]Fetching 169 files:  44%|████▍     | 75/169 [05:34<04:16,  2.73s/it]Fetching 169 files:  45%|████▍     | 76/169 [05:44<05:58,  3.85s/it]Fetching 169 files:  46%|████▌     | 77/169 [05:51<06:48,  4.44s/it]Fetching 169 files:  46%|████▌     | 78/169 [05:54<06:27,  4.26s/it]Fetching 169 files:  47%|████▋     | 79/169 [05:56<05:31,  3.68s/it]Fetching 169 files:  48%|████▊     | 81/169 [06:02<05:02,  3.44s/it]Fetching 169 files:  49%|████▉     | 83/169 [06:06<04:15,  2.97s/it]Fetching 169 files:  50%|████▉     | 84/169 [06:08<03:54,  2.76s/it]Fetching 169 files:  50%|█████     | 85/169 [06:10<03:35,  2.57s/it]Fetching 169 files:  51%|█████     | 86/169 [06:55<17:51, 12.90s/it]Fetching 169 files:  56%|█████▌    | 95/169 [06:56<03:55,  3.18s/it]Fetching 169 files:  57%|█████▋    | 96/169 [07:09<05:10,  4.25s/it]Fetching 169 files:  57%|█████▋    | 97/169 [07:11<04:50,  4.03s/it]Fetching 169 files:  58%|█████▊    | 98/169 [07:17<05:06,  4.32s/it]Fetching 169 files:  60%|█████▉    | 101/169 [07:25<04:03,  3.58s/it]Fetching 169 files:  61%|██████    | 103/169 [07:28<03:21,  3.05s/it]Fetching 169 files:  62%|██████▏   | 104/169 [07:39<04:38,  4.29s/it]Fetching 169 files:  62%|██████▏   | 105/169 [07:43<04:39,  4.36s/it]Fetching 169 files:  63%|██████▎   | 106/169 [07:44<03:50,  3.65s/it]Fetching 169 files:  63%|██████▎   | 107/169 [07:47<03:33,  3.44s/it]Fetching 169 files:  64%|██████▍   | 108/169 [08:03<06:44,  6.63s/it]Fetching 169 files:  66%|██████▋   | 112/169 [08:05<02:48,  2.96s/it]Fetching 169 files:  67%|██████▋   | 113/169 [08:14<03:42,  3.96s/it]Fetching 169 files:  69%|██████▉   | 117/169 [08:22<02:37,  3.04s/it]Fetching 169 files:  70%|██████▉   | 118/169 [08:24<02:25,  2.85s/it]Fetching 169 files:  70%|███████   | 119/169 [08:28<02:31,  3.02s/it]Fetching 169 files:  71%|███████   | 120/169 [08:36<03:24,  4.18s/it]Fetching 169 files:  72%|███████▏  | 121/169 [08:53<05:31,  6.90s/it]Fetching 169 files:  75%|███████▍  | 126/169 [08:53<01:54,  2.67s/it]Fetching 169 files:  75%|███████▌  | 127/169 [08:55<01:50,  2.63s/it]Fetching 169 files:  76%|███████▌  | 128/169 [08:56<01:34,  2.32s/it]Fetching 169 files:  76%|███████▋  | 129/169 [09:14<03:40,  5.51s/it]Fetching 169 files:  77%|███████▋  | 130/169 [09:16<03:02,  4.67s/it]Fetching 169 files:  78%|███████▊  | 132/169 [09:28<03:11,  5.16s/it]Fetching 169 files:  79%|███████▊  | 133/169 [09:31<02:48,  4.67s/it]Fetching 169 files:  80%|███████▉  | 135/169 [09:33<01:52,  3.30s/it]Fetching 169 files:  81%|████████  | 137/169 [09:43<02:02,  3.81s/it]Fetching 169 files:  82%|████████▏ | 138/169 [09:47<02:02,  3.95s/it]Fetching 169 files:  83%|████████▎ | 140/169 [09:53<01:43,  3.57s/it]Fetching 169 files:  83%|████████▎ | 141/169 [09:54<01:25,  3.04s/it]Fetching 169 files:  84%|████████▍ | 142/169 [09:54<01:05,  2.44s/it]Fetching 169 files:  85%|████████▌ | 144/169 [09:59<01:00,  2.42s/it]Fetching 169 files:  86%|████████▌ | 145/169 [10:09<01:39,  4.15s/it]Fetching 169 files:  86%|████████▋ | 146/169 [10:15<01:44,  4.56s/it]Fetching 169 files:  88%|████████▊ | 148/169 [10:16<01:01,  2.92s/it]Fetching 169 files:  88%|████████▊ | 149/169 [10:25<01:22,  4.12s/it]Fetching 169 files:  90%|████████▉ | 152/169 [10:30<00:50,  2.99s/it]Fetching 169 files:  91%|█████████ | 153/169 [10:35<00:53,  3.36s/it]Fetching 169 files:  91%|█████████ | 154/169 [10:47<01:19,  5.28s/it]Fetching 169 files:  92%|█████████▏| 156/169 [10:53<00:57,  4.39s/it]Fetching 169 files:  93%|█████████▎| 158/169 [10:56<00:36,  3.29s/it]Fetching 169 files:  94%|█████████▍| 159/169 [11:00<00:34,  3.45s/it]Fetching 169 files:  95%|█████████▍| 160/169 [11:09<00:43,  4.84s/it]Fetching 169 files:  95%|█████████▌| 161/169 [11:13<00:36,  4.56s/it]Fetching 169 files:  96%|█████████▌| 162/169 [11:20<00:36,  5.26s/it]Fetching 169 files: 100%|██████████| 169/169 [11:20<00:00,  4.03s/it]
+SNAP=/root/.cache/huggingface/hub/models--unsloth--DeepSeek-R1-BF16/snapshots/7d1258fb7f49406f05eba49394f79e76308ab9ce
+16K	/root/.cache/huggingface/hub/models--unsloth--DeepSeek-R1-BF16/snapshots/7d1258fb7f49406f05eba49394f79e76308ab9ce
+MILESTONE 2: download done
+MILESTONE 3: streaming export (resumable loop)
+export attempt 1 
+-rw-r--r-- 1 root root 350873098456 Jul  6 15:28 /root/r1/model.cbk
+MILESTONE 4: export done
+MILESTONE 5: build runtime (cuda)
+    Finished `release` profile [optimized] target(s) in 41.01s
+MILESTONE 6: tokenize + RUN R1-671B in pure Rust
+IDS=0 671 6102 294 8760 344
+
+thread 'main' (6245) panicked at src/lib.rs:2602:49:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+CONTINUATION: PARSE_FAIL
+MILESTONE 7: ALLDONE
