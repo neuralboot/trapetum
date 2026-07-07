@@ -104,3 +104,11 @@ Speculative decode remains a strong lever once weights are memory-resident
 (compute-bound regime). The better disk-bound lever is asynchronous expert
 prefetch: a layer's 8 experts are known before its FFN runs, and today's reads
 are serial page faults.
+
+## Expert prefetch (madvise WILLNEED): no effect on network-volume storage
+A/B/A on one A100 reading the artifact from the RunPod network volume
+(24 tokens each): baseline 22.6 s/token, prefetch 23.9, baseline-again 24.9.
+The prefetch lands inside the storage drift: madvise readahead appears to be
+a no-op on the network mount. The relevant verdict, on LOCAL NVMe where kernel
+readahead actually queues reads, is still open. Code stays in the runtime
+behind TRAPETUM_PREFETCH=1.
