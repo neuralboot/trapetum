@@ -103,7 +103,7 @@ fn read_stops(dir: &str, tok: &Tokenizer) -> Vec<u32> {
             }
         }
     }
-    for s in ["<|im_end|>", "<|eot_id|>", "</s>", "<|endoftext|>", "<|EOT|>", "<|end\u{2581}of\u{2581}sentence|>"] {
+    for s in ["<|im_end|>", "<|eot_id|>", "</s>", "<|endoftext|>", "<|EOT|>", "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>"] {
         if let Some(id) = tok.token_to_id(s) {
             stops.push(id);
         }
@@ -152,8 +152,8 @@ fn load_model(root: &str, name: &str) -> Result<Loaded, String> {
             // DeepSeek first: R1-distills sit on Qwen/Llama vocabs (which also carry
             // <|im_start|>/<|eot_id|>), but were fine-tuned on the DeepSeek template
             // with <think> priming — ChatML on them skips reasoning and never stops.
-            if tok.token_to_id("<|User|>").is_some()
-                && tok.token_to_id("<|Assistant|>").is_some()
+            if tok.token_to_id("<\u{FF5C}User\u{FF5C}>").is_some()
+                && tok.token_to_id("<\u{FF5C}Assistant\u{FF5C}>").is_some()
             {
                 "deepseek".into()
             } else if tok.token_to_id("<|eot_id|>").is_some() {
@@ -202,19 +202,19 @@ fn build_prompt(messages: &[(String, String)], template: &str) -> String {
             // <|User|>/<|Assistant|> turns; assistant turns close with EOS. The
             // final <think> primes R1-style reasoning (the model only emits the
             // CLOSING </think> itself).
-            s.push_str("<|begin\u{2581}of\u{2581}sentence|>");
+            s.push_str("<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>");
             if let Some((_, sy)) = messages.iter().find(|(r, _)| r == "system") {
                 s.push_str(sy);
             }
             for (role, content) in messages {
                 match role.as_str() {
-                    "user" => s.push_str(&format!("<|User|>{}", content)),
+                    "user" => s.push_str(&format!("<\u{FF5C}User\u{FF5C}>{}", content)),
                     "assistant" => s.push_str(&format!(
-                        "<|Assistant|>{}<|end\u{2581}of\u{2581}sentence|>", content)),
+                        "<\u{FF5C}Assistant\u{FF5C}>{}<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>", content)),
                     _ => {}
                 }
             }
-            s.push_str("<|Assistant|><think>\n");
+            s.push_str("<\u{FF5C}Assistant\u{FF5C}><think>\n");
         }
         "llama2" => {
             let sys = messages.iter().find(|(r, _)| r == "system").map(|(_, c)| c.clone());
