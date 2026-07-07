@@ -34,8 +34,10 @@ Y[m, j]     = sum_i  X[m, i] * W_deq[i, j]
   Nine architectures run end-to-end in pure Rust, including Gemma-2-9B, Phi-4 and
   DeepSeek-V2-Lite (MLA + MoE); see [`bench/RESULTS_models.md`](bench/RESULTS_models.md).
   Scale probe: **DeepSeek-R1 671B** (full V3 architecture) loads in 43 s and decodes
-  coherently on a single node, 1.34 TB bf16 compressed to a 326 GB 4-bit artifact,
-  routed experts streamed from disk via mmap inside a **73 GB peak RAM** footprint;
+  coherently on a single node, 1.34 TB bf16 compressed to a 326 GiB 4-bit artifact,
+  routed experts streamed from disk via mmap inside a **73 GB peak RAM** footprint.
+  Measured on a **single consumer RTX 4090**: 20.9 GB peak VRAM, 0.24 tok/s steady
+  state (disk-bound), fully coherent output;
   see [`bench/RESULTS_deepseek.md`](bench/RESULTS_deepseek.md).
 - [`bench/`](bench/): a fair single-harness speed vs accuracy vs memory benchmark of
   fp16, AWQ and AQLM (the `pareto`/`mem70` figures and `results*.json`).

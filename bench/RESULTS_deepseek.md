@@ -69,6 +69,22 @@ Measured numbers (raw logs in `runpod_logs/r1_671b_export.log` and
   fashion, gastronomy, and culture..." (raw per-token logs in
   `runpod_logs/r1_671b_steady.log` and `r1_671b_warm.log`).
 
+## The consumer money shot (July 7, 2026)
+The same 350 GB artifact then ran on a **single RTX 4090** (consumer card, 24 GB), on a
+host with 48 GB RAM and local NVMe:
+
+- **20.9 GB peak VRAM** (dense MLA projections + codebooks on GPU): it fits, with margin.
+- **0.24 tok/s steady state** (4.18 s/token over 64 tokens, warm rerun identical), faster
+  than the A100 host thanks to a quicker NVMe: confirming decode is disk-bound, not
+  GPU-bound, at this RAM size.
+- Host RAM in use: 9 GB anonymous plus page cache; the experts stay mmap-backed on disk.
+- Same fully coherent 64-token continuation (Paris, Eiffel Tower, Louvre...). Raw logs:
+  `runpod_logs/r1_671b_4090.log` and `r1_671b_4090_warm.log`.
+
+Headline: **DeepSeek-R1 671B, the largest open-source model, decodes coherently on one
+consumer RTX 4090** in a from-scratch pure-Rust runtime. Throughput is disk-bound
+(~0.24 tok/s): a proof of reach, not a serving speed; RAM or expert prefetch is the lever.
+
 ## What this establishes
 The largest open-source model runs end to end in a from-scratch Rust runtime with no
 Python, no PyTorch, and no GPU requirement for the expert weights: one box, 73 GB of
