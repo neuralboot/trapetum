@@ -1903,6 +1903,16 @@ impl MoeBlockOffload {
         self.router.forward_into(&self.norm, &mut self.rlogits);
         let rl = self.rlogits.to_host();
         let picks = self.route(&rl);
+        // TRAPETUM_LOG_EXPERTS=<path>: append one line of routed expert ids per MoE
+        // call (call order = token-major, layer-minor), to measure the adjacent-token
+        // expert overlap that bounds speculative-decode byte amortization.
+        if let Ok(path) = std::env::var("TRAPETUM_LOG_EXPERTS") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let ids: Vec<String> = picks.iter().map(|(e, _)| e.to_string()).collect();
+                let _ = writeln!(f, "{}", ids.join(","));
+            }
+        }
         let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
         for (e, w) in picks {
             let (g, u, d) = self.resident(e);
