@@ -92,3 +92,15 @@ RAM, and 326 GB of disk. The V3-specific machinery validated on the way: q_lora 
 noaux_tc sigmoid routing with e_score_correction_bias and group top-k (n_group 8,
 topk_group 4, routed_scaling 2.5, raw-sigmoid weight renormalization), first 3 layers
 dense, 2048-dim expert FFNs.
+
+## Speculative-decode ceiling: measured, and it is a no-go for the disk-bound case
+Routed expert ids logged for 38 tokens x 58 MoE layers (raw:
+`runpod_logs/r1_671b_expert_routing.csv`, greedy, "The capital of France is").
+Adjacent tokens share only **2.22 of 8 experts (28%)**: the aux-loss-free router
+actively decorrelates neighbors. Byte-amortization ceiling for a batched verify:
+x1.16 (K=1), x1.28 (K=2), x1.37 (K=3), BEFORE acceptance and drafter cost. Net
+expectation ~x1.1-1.25: not worth the machinery while decode is disk-bound.
+Speculative decode remains a strong lever once weights are memory-resident
+(compute-bound regime). The better disk-bound lever is asynchronous expert
+prefetch: a layer's 8 experts are known before its FFN runs, and today's reads
+are serial page faults.
