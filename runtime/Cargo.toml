@@ -22,6 +22,8 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 getrandom = "0.2"
+memmap2 = "0.9"  # mmap the routed experts (CBKR/671B): OS pages them in from disk on demand
+                 # instead of copying ~300GB into host RAM (see ExpertHost::PackedBytes)
 
 [lib]
 name = "trapetum"

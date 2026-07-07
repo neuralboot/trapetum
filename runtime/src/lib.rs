@@ -6,8 +6,9 @@
 //! [`DevHalf::copy_cast_from`] converts it to half for the next layer. No Python.
 use half::f16;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::os::raw::c_void;
+use std::sync::Arc;
 
 // ---- GPU backend seam -------------------------------------------------------
 // The entire runtime talks to the GPU through these 24 C-ABI entry points and
@@ -975,6 +976,17 @@ fn rd_u8_vec(r: &mut impl Read, n: usize) -> Vec<u8> {
     b
 }
 
+/// Record the next `len` bytes as a byte range into `mmap` (its absolute offset = the
+/// reader's current stream position, since `mmap` covers the same file from byte 0) and seek
+/// `r` past them WITHOUT reading -- avoids ever copying a routed expert's packed indices into
+/// RAM. See `PackedBytes`/`ExpertHost`/`load_deepseek_qlora`.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn mmap_skip(r: &mut BufReader<File>, mmap: &Arc<memmap2::Mmap>, len: usize) -> std::io::Result<PackedBytes> {
+    let off = r.stream_position()? as usize;
+    r.seek(SeekFrom::Current(len as i64))?;
+    Ok(PackedBytes::Mmap(mmap.clone(), off, len))
+}
+
 /// Block until all queued GPU work completes (call before stopping a timer).
 pub fn sync() {
     unsafe { dev_sync() };
@@ -1702,9 +1714,37 @@ pub fn check_moe() -> f64 {
     worst
 }
 
-/// Host-resident expert weights (not on the GPU until streamed in).
+/// A packed (4-bit indices) tensor, either owned in RAM or a zero-copy byte range into a
+/// shared file `Mmap` -- the OS pages mmap-backed bytes in from disk on first touch (and can
+/// evict them under memory pressure), which is exactly the "stream experts from storage"
+/// behavior `MoeBlockOffload` wants at 671B scale, without ever copying the whole tensor set
+/// into the process's RSS. `Owned` is used by `gen_moe`'s synthetic check models (and would
+/// be used by any small in-RAM export); `Mmap` is what `load_deepseek_qlora` uses for the
+/// routed experts' packed indices (the bulk of a 671B CBKR file).
 #[cfg(any(feature = "cuda", feature = "metal"))]
-pub struct ExpertHost { gp: Vec<u8>, gc: Vec<f32>, up: Vec<u8>, uc: Vec<f32>, dp: Vec<u8>, dc: Vec<f32> }
+enum PackedBytes {
+    Owned(Vec<u8>),
+    Mmap(Arc<memmap2::Mmap>, usize, usize), // (mmap, byte offset, byte length)
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl PackedBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            PackedBytes::Owned(v) => v.as_slice(),
+            PackedBytes::Mmap(m, off, len) => &m[*off..*off + *len],
+        }
+    }
+}
+
+/// Host-resident (or mmap-backed, see `PackedBytes`) expert weights, not on the GPU until
+/// streamed in. The packed 4-bit indices (`gp`/`up`/`dp`, the bulk of an expert's bytes) may
+/// be `PackedBytes::Mmap`; the tiny per-output-channel codebooks (`gc`/`uc`/`dc`, a few KB to
+/// a few hundred KB each) always stay owned `Vec<f32>` -- a mmap byte offset is not
+/// guaranteed 4-byte aligned, so casting a raw mmap `&[u8]` to `&[f32]` would be unsound, and
+/// copying something this small at load time costs nothing.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct ExpertHost { gp: PackedBytes, gc: Vec<f32>, up: PackedBytes, uc: Vec<f32>, dp: PackedBytes, dc: Vec<f32> }
 
 /// MoE block with EXPERT OFFLOADING (solves the memory wall). Only the router and the
 /// shared expert stay GPU-resident; the routed experts live in host memory and the
@@ -1812,9 +1852,9 @@ impl MoeBlockOffload {
             }
             let h = &self.hosts[e];
             let ex = Expert {
-                gate: QuantLinear::new(&h.gp, &h.gc, self.hidden, self.inter),
-                up:   QuantLinear::new(&h.up, &h.uc, self.hidden, self.inter),
-                down: QuantLinear::new(&h.dp, &h.dc, self.inter, self.hidden),
+                gate: QuantLinear::new(h.gp.as_slice(), &h.gc, self.hidden, self.inter),
+                up:   QuantLinear::new(h.up.as_slice(), &h.uc, self.hidden, self.inter),
+                down: QuantLinear::new(h.dp.as_slice(), &h.dc, self.inter, self.hidden),
             };
             self.cache.insert(e, ex);
             self.lru.push(e);
@@ -1861,9 +1901,9 @@ fn gen_moe(hidden: usize, inter: usize, n_experts: usize, seed: u64)
     let nw: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
     let rw: Vec<f32> = (0..n_experts*hidden).map(|_| r()*0.05).collect();
     let mkh = |r: &mut dyn FnMut()->f32| ExpertHost {
-        gp: pk(hidden*(inter/2), r), gc: cb(K*inter, r),
-        up: pk(hidden*(inter/2), r), uc: cb(K*inter, r),
-        dp: pk(inter*(hidden/2), r), dc: cb(K*hidden, r) };
+        gp: PackedBytes::Owned(pk(hidden*(inter/2), r)), gc: cb(K*inter, r),
+        up: PackedBytes::Owned(pk(hidden*(inter/2), r)), uc: cb(K*inter, r),
+        dp: PackedBytes::Owned(pk(inter*(hidden/2), r)), dc: cb(K*hidden, r) };
     let hosts: Vec<ExpertHost> = (0..n_experts).map(|_| mkh(&mut r)).collect();
     let shared = mkh(&mut r);
     (nw, rw, hosts, shared)
@@ -2468,7 +2508,7 @@ impl DeepSeekModel {
     pub fn load_deepseek(path: &str, max_seq: usize) -> std::io::Result<DeepSeekModel> {
         let mut r = BufReader::new(File::open(path)?);
         let mut magic = [0u8; 4]; r.read_exact(&mut magic)?;
-        if &magic == b"CBKR" { return Self::load_deepseek_qlora(r, max_seq); }
+        if &magic == b"CBKR" { return Self::load_deepseek_qlora(path, r, max_seq); }
         assert_eq!(&magic, b"CBKD", "not a DeepSeek .cbk (expected CBKD or CBKR)");
         let cfg: Vec<usize> = (0..14).map(|_| rd_i32(&mut r) as usize).collect();
         let (n_layers, hidden, n_heads, kv_lora, nope, rope, vhd, inter_dense, moe_inter,
@@ -2533,7 +2573,13 @@ impl DeepSeekModel {
     /// o (4-bit), post_norm, then the dense-or-MoE FFN (MoE layers read `e_score_bias`
     /// BEFORE the router). Routed experts are NOT uploaded to the GPU here — they stay in
     /// host `ExpertHost`s and stream through `MoeBlockOffload` (the memory wall at 671B).
-    fn load_deepseek_qlora(mut r: BufReader<File>, max_seq: usize) -> std::io::Result<DeepSeekModel> {
+    fn load_deepseek_qlora(path: &str, mut r: BufReader<File>, max_seq: usize) -> std::io::Result<DeepSeekModel> {
+        // mmap the whole file once: the routed experts' packed indices (the ~300GB bulk at
+        // 671B) are handed to ExpertHost as zero-copy byte ranges into this, instead of being
+        // read into owned Vecs -- the OS pages them in from disk on demand (and can evict
+        // under memory pressure), which is the actual "stream experts from storage" behavior.
+        // Safety: the file is a static export artifact, not mutated while the model is loaded.
+        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&File::open(path)?)? });
         let cfg: Vec<usize> = (0..18).map(|_| rd_i32(&mut r) as usize).collect();
         let (n_layers, hidden, n_heads, kv_lora, nope, rope, vhd, inter_dense, moe_inter,
              n_routed, n_shared, top_k, vocab, first_k_dense, q_lora_rank, n_group, topk_group, sigmoid_flag) =
@@ -2565,11 +2611,15 @@ impl DeepSeekModel {
                 let rw = rd_f16_vec(&mut r, n_routed*hidden);
                 let mut hosts: Vec<ExpertHost> = Vec::with_capacity(n_routed);
                 for _ in 0..n_routed {
-                    hosts.push(ExpertHost {
-                        gp: rd_u8_vec(&mut r, hidden*(moe_inter/2)), gc: rd_f32_vec(&mut r, K*moe_inter),
-                        up: rd_u8_vec(&mut r, hidden*(moe_inter/2)), uc: rd_f32_vec(&mut r, K*moe_inter),
-                        dp: rd_u8_vec(&mut r, moe_inter*(hidden/2)), dc: rd_f32_vec(&mut r, K*hidden),
-                    });
+                    // packed indices: SKIP (seek past, don't read) and record the byte range
+                    // into the mmap; codebooks are tiny, read into RAM as before.
+                    let gp = mmap_skip(&mut r, &mmap, hidden * (moe_inter / 2))?;
+                    let gc = rd_f32_vec(&mut r, K * moe_inter);
+                    let up = mmap_skip(&mut r, &mmap, hidden * (moe_inter / 2))?;
+                    let uc = rd_f32_vec(&mut r, K * moe_inter);
+                    let dp = mmap_skip(&mut r, &mmap, moe_inter * (hidden / 2))?;
+                    let dc = rd_f32_vec(&mut r, K * hidden);
+                    hosts.push(ExpertHost { gp, gc, up, uc, dp, dc });
                 }
                 let si = ((n_shared*moe_inter + 255)/256)*256; // shared expert inter, padded to %256
                 let sh = (rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
