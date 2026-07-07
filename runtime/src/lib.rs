@@ -1759,6 +1759,17 @@ impl PackedBytes {
             PackedBytes::Mmap(m, off, len) => &m[*off..*off + *len],
         }
     }
+
+    /// Hint the kernel to read this mmap range in the background (madvise WILLNEED).
+    /// Turns the serial page faults of expert streaming into parallel queued disk
+    /// reads: issue it for every routed expert as soon as the router has picked
+    /// them, before any expert is touched. No-op for owned buffers.
+    fn prefetch(&self) {
+        #[cfg(unix)]
+        if let PackedBytes::Mmap(m, off, len) = self {
+            let _ = m.advise_range(memmap2::Advice::WillNeed, *off, *len);
+        }
+    }
 }
 
 /// Host-resident (or mmap-backed, see `PackedBytes`) expert weights, not on the GPU until
@@ -1911,6 +1922,23 @@ impl MoeBlockOffload {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
                 let ids: Vec<String> = picks.iter().map(|(e, _)| e.to_string()).collect();
                 let _ = writeln!(f, "{}", ids.join(","));
+            }
+        }
+        // TRAPETUM_PREFETCH=1: kick off background reads for ALL picked experts not
+        // yet GPU-resident before computing the first one, so the disk works on
+        // experts 2..k while expert 1 streams and computes.
+        static PREFETCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let pf = *PREFETCH.get_or_init(|| {
+            std::env::var("TRAPETUM_PREFETCH").map(|v| v != "0").unwrap_or(false)
+        });
+        if pf {
+            for (e, _) in &picks {
+                if !self.cache.contains_key(e) {
+                    let h = &self.hosts[*e];
+                    h.gp.prefetch();
+                    h.up.prefetch();
+                    h.dp.prefetch();
+                }
             }
         }
         let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
