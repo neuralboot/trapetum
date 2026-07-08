@@ -22,10 +22,106 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from export_safetensors import qwrite, wf16, wf32  # noqa: E402  (shared 4-bit packing + k-means)
+from cbka_format import AVQ_D, AVQ_K, write_cbka_record  # noqa: E402  (shared CBKA byte layout)
 
 
 def pad256(n):
     return ((n + 255) // 256) * 256
+
+
+# ---------------------------------------------------------------------------
+# Additive (residual) VQ encoder for MoE routed experts. Same beam-search + LSQ
+# quantizer as model/probe_avq2bit_moe.py (which validated the PPL), but it returns
+# the CODES + codebooks + per-row scale (to write a CBKA record) instead of a
+# dequantized tensor. Torch + a CUDA GPU are required only when --experts-avq is set;
+# the rest of the exporter stays numpy/CPU. M in {2,3}: M*8/D bits per weight.
+# ---------------------------------------------------------------------------
+def _avq_encode(W_np, M, beam, rounds, device):
+    import torch
+
+    K, D = AVQ_K, AVQ_D
+
+    @torch.no_grad()
+    def kmeans(P, iters=5, chunk=200_000):
+        N = P.shape[0]
+        C = P[torch.randperm(N, device=P.device)[:K]].clone()
+        asg = torch.zeros(N, dtype=torch.long, device=P.device)
+        for _ in range(iters):
+            Cn2 = (C * C).sum(1)
+            for s in range(0, N, chunk):
+                p = P[s:s + chunk]
+                asg[s:s + chunk] = ((p * p).sum(1, keepdim=True) - 2 * (p @ C.t()) + Cn2).argmin(1)
+            Cnew = torch.zeros_like(C)
+            cnt = torch.zeros(K, device=P.device)
+            Cnew.index_add_(0, asg, P)
+            cnt.index_add_(0, asg, torch.ones(N, device=P.device))
+            C = Cnew / cnt.clamp(min=1).unsqueeze(1)
+        return C
+
+    @torch.no_grad()
+    def beam_search(W, C, B, chunk=8000):
+        N, d = W.shape
+        Mc = C.shape[0]
+        codes = torch.empty(N, Mc, dtype=torch.long, device=W.device)
+        for s in range(0, N, chunk):
+            w = W[s:s + chunk]
+            n = w.shape[0]
+            d0 = ((w[:, None, :] - C[0][None, :, :]) ** 2).sum(-1)
+            _, idx = d0.topk(B, dim=1, largest=False)
+            bc = idx.unsqueeze(-1)
+            br = C[0][idx]
+            for m in range(1, Mc):
+                cand = br[:, :, None, :] + C[m][None, None, :, :]
+                sc = ((w[:, None, None, :] - cand) ** 2).sum(-1).reshape(n, B * K)
+                _, flat = sc.topk(B, dim=1, largest=False)
+                bsel = flat // K
+                ksel = flat % K
+                bc = torch.cat([torch.gather(bc, 1, bsel.unsqueeze(-1).expand(-1, -1, m)),
+                                ksel.unsqueeze(-1)], -1)
+                br = torch.gather(br, 1, bsel.unsqueeze(-1).expand(-1, -1, d)) + C[m][ksel]
+            codes[s:s + chunk] = bc[:, 0, :]
+        return codes
+
+    @torch.no_grad()
+    def lsq_update(W, codes, Mc, reg=1e-2):
+        N, d = W.shape
+        P = Mc * K
+        feat = codes + (torch.arange(Mc, device=W.device) * K)[None, :]
+        AtW = torch.zeros(P, d, device=W.device)
+        for m in range(Mc):
+            AtW.index_add_(0, feat[:, m], W)
+        AtA = torch.zeros(P, P, device=W.device)
+        ones = torch.ones(N, device=W.device)
+        for m in range(Mc):
+            for mp in range(Mc):
+                AtA.view(-1).index_add_(0, feat[:, m] * P + feat[:, mp], ones)
+        AtA += reg * torch.eye(P, device=W.device)
+        return torch.linalg.solve(AtA, AtW).reshape(Mc, K, d)
+
+    with torch.no_grad():
+        W = torch.from_numpy(np.ascontiguousarray(W_np, np.float32)).to(device)
+        OC, IC = W.shape
+        assert IC % D == 0, f"in-features {IC} must be divisible by group size {D}"
+        assert OC % 4 == 0, f"out-features {OC} must be a multiple of 4"
+        ng = IC // D
+        s = W.abs().amax(1, keepdim=True).clamp(min=1e-8)               # per-row absmax scale
+        P = (W / s).reshape(OC, ng, D).reshape(-1, D).contiguous()      # rows are (o*ng + g)
+        R = P.clone()
+        cb = []
+        for _ in range(M):                                             # greedy residual init
+            cm = kmeans(R)
+            codes_m = beam_search(R, cm.unsqueeze(0), B=beam)[:, 0]
+            R = R - cm[codes_m]
+            cb.append(cm)
+        C = torch.stack(cb)
+        for _ in range(rounds):                                       # beam + LSQ refit
+            codes = beam_search(P, C, B=beam)
+            C = lsq_update(P, codes, M)
+        codes = beam_search(P, C, B=beam)                             # final assignment
+        codes_ogm = codes.reshape(OC, ng, M).to("cpu").numpy().astype(np.uint16)
+        C_np = C.to("cpu").numpy().astype(np.float32)                 # [M, K, D]
+        scale_np = s.reshape(OC).to("cpu").numpy().astype(np.float32) # [OC]
+    return codes_ogm, C_np, scale_np
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +301,9 @@ def build_cfg_from_json(c):
 # for the real streaming export and the --selftest in-memory synthetic model (the
 # whole point: no layout drift between the two).
 # ---------------------------------------------------------------------------
-def write_cbkr(out_path, cfg, get, resume=False, progress_path=None):
+def write_cbkr(out_path, cfg, get, resume=False, progress_path=None,
+               experts_avq=0, avq_beam=1, avq_rounds=2, avq_device="cuda"):
+    assert experts_avq in (0, 2, 3), "experts_avq must be 0 (4-bit scalar), 2 or 3 (additive CBKA)"
     progress_path = progress_path or (out_path + ".progress.json")
     hidden, n_heads = cfg["hidden"], cfg["n_heads"]
     kv_lora, nope, rope, vhd = cfg["kv_lora"], cfg["nope"], cfg["rope"], cfg["vhd"]
@@ -239,10 +337,19 @@ def write_cbkr(out_path, cfg, get, resume=False, progress_path=None):
             raise SystemExit(f"{out_path} already exists -- pass --resume to continue an "
                               f"interrupted export, or remove it to start fresh")
         f = open(out_path, "wb")
-        f.write(b"CBKR")
-        f.write(struct.pack("<18i", n_layers, hidden, n_heads, kv_lora, nope, rope, vhd,
-                             inter_dense_pad, moe_inter_pad, n_routed, n_shared, top_k, vocab,
-                             first_k_dense, q_lora_rank, n_group, topk_group, sigmoid))
+        base_fields = [n_layers, hidden, n_heads, kv_lora, nope, rope, vhd,
+                       inter_dense_pad, moe_inter_pad, n_routed, n_shared, top_k, vocab,
+                       first_k_dense, q_lora_rank, n_group, topk_group, sigmoid]
+        if experts_avq:
+            # CBKV: 19-i32 header, trailing field = experts_avq (2 or 3). Additive CBKA routed
+            # experts; attention, dense FFN, shared expert, router and lm_head stay 4-bit scalar.
+            f.write(b"CBKV")
+            f.write(struct.pack("<19i", *base_fields, experts_avq))
+        else:
+            # CBKR: original 18-i32 header, byte-identical to the committed scalar exporter, so
+            # existing 4-bit artifacts keep loading unchanged.
+            f.write(b"CBKR")
+            f.write(struct.pack("<18i", *base_fields))
         f.write(struct.pack("<3f", eps, softmax_scale, rscale))
         wf32(f, inv_freq)
         wf16(f, get("model.embed_tokens.weight"))
@@ -265,6 +372,14 @@ def write_cbkr(out_path, cfg, get, resume=False, progress_path=None):
         qwrite(f, _pad_out(get(f"{prefix}.up_proj.weight"), inter_pad))
         qwrite(f, _pad_in(get(f"{prefix}.down_proj.weight"), inter_pad))
 
+    def avqwrite_ffn(prefix, inter_pad):
+        # additive CBKA routed expert: same padding as qwrite_ffn (zeros are lossless), each
+        # projection encoded to M codebooks + per-row scale + u8 codes and written as a record.
+        for name, pad in (("gate_proj", _pad_out), ("up_proj", _pad_out), ("down_proj", _pad_in)):
+            w = pad(get(f"{prefix}.{name}.weight"), inter_pad)
+            codes, C, scale = _avq_encode(w, experts_avq, avq_beam, avq_rounds, avq_device)
+            write_cbka_record(f, codes, C, scale, experts_avq)
+
     t0 = time.time()
     for li in range(layers_done, n_layers):
         tl0 = time.time()
@@ -284,10 +399,20 @@ def write_cbkr(out_path, cfg, get, resume=False, progress_path=None):
         else:
             wf32(f, get(f"{P}.mlp.gate.e_score_correction_bias"))     # [n_routed] BEFORE the router
             wf16(f, get(f"{P}.mlp.gate.weight"))                      # router [n_routed][hidden]
+            te0 = time.time()
             for ei in range(n_routed):
-                qwrite_ffn(f"{P}.mlp.experts.{ei}", moe_inter_pad)
+                if experts_avq:
+                    avqwrite_ffn(f"{P}.mlp.experts.{ei}", moe_inter_pad)
+                    if (ei + 1) % 16 == 0 or ei + 1 == n_routed:
+                        per_e = (time.time() - te0) / (ei + 1)
+                        eta_layer = per_e * (n_routed - (ei + 1)) / 60
+                        print(f"    expert {ei+1}/{n_routed} avq (M={experts_avq}) "
+                              f"{per_e:.2f}s/expert  layer-ETA={eta_layer:.1f}min", flush=True)
+                else:
+                    qwrite_ffn(f"{P}.mlp.experts.{ei}", moe_inter_pad)
+            # shared expert stays 4-bit scalar regardless of experts_avq
             qwrite_ffn(f"{P}.mlp.shared_experts", shared_inter_pad)
-            kind = "moe"
+            kind = f"moe/avq{experts_avq}" if experts_avq else "moe"
         f.flush()
         file_offset = f.tell()
         json.dump({"layers_done": li + 1, "file_offset": file_offset}, open(progress_path, "w"))
@@ -372,6 +497,14 @@ def main():
     ap.add_argument("--out", default="/workspace/ds3")
     ap.add_argument("--resume", action="store_true", help="continue an interrupted export")
     ap.add_argument("--selftest", action="store_true", help="tiny synthetic model, no download")
+    ap.add_argument("--experts-avq", type=int, default=0, choices=[0, 2, 3],
+                    help="routed experts as additive CBKA at this M (2 or 3 bit); 0 = 4-bit scalar")
+    ap.add_argument("--avq-beam", type=int, default=1,
+                    help="beam width for additive code assignment (1 = fast greedy, tractable at 671B)")
+    ap.add_argument("--avq-rounds", type=int, default=2,
+                    help="LSQ codebook refit rounds after residual init")
+    ap.add_argument("--avq-device", default="cuda",
+                    help="torch device for the AVQ encoder (cuda; cpu only for tiny --selftest)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -384,7 +517,9 @@ def main():
         prog_path = out_path + ".progress.json"
         if os.path.exists(prog_path):
             os.remove(prog_path)
-        write_cbkr(out_path, cfg, W.__getitem__, resume=False, progress_path=prog_path)
+        write_cbkr(out_path, cfg, W.__getitem__, resume=False, progress_path=prog_path,
+                   experts_avq=args.experts_avq, avq_beam=args.avq_beam,
+                   avq_rounds=args.avq_rounds, avq_device=args.avq_device)
         print(f"\nselftest export OK: {out_path}")
         return
 
@@ -398,7 +533,12 @@ def main():
           f"first_k_dense={cfg['first_k_dense']} vocab={cfg['vocab']}", flush=True)
     idx = LazySafetensors(args.dir)
     out_path = os.path.join(args.out, "model.cbk")
-    write_cbkr(out_path, cfg, idx.get, resume=args.resume, progress_path=out_path + ".progress.json")
+    if args.experts_avq:
+        print(f"routed experts: additive CBKA M={args.experts_avq} "
+              f"(beam={args.avq_beam}, rounds={args.avq_rounds}, {args.experts_avq} bits/weight)", flush=True)
+    write_cbkr(out_path, cfg, idx.get, resume=args.resume, progress_path=out_path + ".progress.json",
+               experts_avq=args.experts_avq, avq_beam=args.avq_beam,
+               avq_rounds=args.avq_rounds, avq_device=args.avq_device)
 
 
 if __name__ == "__main__":

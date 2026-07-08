@@ -427,6 +427,71 @@ __global__ void argmax_stage2(const float* __restrict__ in_val, const unsigned* 
 static cudaStream_t g_stream = 0;
 static void ensure_stream() { if (!g_stream) cudaStreamCreate(&g_stream); }
 
+// ============================================================================
+// Additive vector-quantization (AQLM-style) decode GEMV for MoE routed experts.
+// A group of AVQ_D consecutive input weights for output o is reconstructed as
+//   W[o, g*AVQ_D + e] = scale[o] * sum_m C_m[ code_m[o,g] ][e]     (C_m is [AVQ_K, AVQ_D]).
+// The dot <x_g, C_m[k]> is output-independent, so we build LUT[m][gt][k] once per
+// group tile in shared, then  y[o] = scale[o] * sum_g sum_m LUT[m][gt][ code_m[o,g] ].
+// The kernel reads CODES (1 byte each) not the dense weight: at M=2 that is 2 bits
+// per weight, the whole point. Ported from kernels/avq_gemv3.cu (uint32-vectorized:
+// each thread owns 4 consecutive outputs, reads their 4 codes as one uint32); M is a
+// COMPILE-TIME template parameter (2 -> 2 bit, 3 -> 3 bit at AVQ_K=256, AVQ_D=8) so the
+// accumulators and shared arrays stay register/statically sized. The per-output scale
+// is applied to each block's PARTIAL before the atomicAdd, which is exact because
+// scale[o]*(a+b) == scale[o]*a + scale[o]*b across the grid.y group-split.
+//
+// On-disk / device memory layout (shared law with model/cbka_format.py and the CBKA
+// reader in lib.rs; rows = OC output channels, cols = IC input channels, ng = cols/AVQ_D):
+//   codebooks CB : [M][AVQ_K][AVQ_D] f16, flat (m*AVQ_K + k)*AVQ_D + e
+//   scales       : [rows] f16, one per output channel
+//   indices      : [M][ng][rows] u8, flat (m*ng + g)*rows + o   (contiguous in o for the uint32 read)
+#define AVQ_K   256
+#define AVQ_D   8
+#define AVQ_CPB 256
+#define AVQ_GT  8      // groups per block (group tile); grid.y = ceil(ng / AVQ_GT)
+
+template<int M>
+__global__ void avq_gemv_t(const __half* __restrict__ X, const unsigned char* __restrict__ codes,
+                           const __half* __restrict__ CB, const __half* __restrict__ scale,
+                           float* __restrict__ Y, int IC, int OC) {
+    int ng = IC / AVQ_D;
+    int o = (blockIdx.x * AVQ_CPB + threadIdx.x) * 4;   // 4 outputs per thread
+    int g0 = blockIdx.y * AVQ_GT;
+    __shared__ __half s_CB[M*AVQ_K*AVQ_D];
+    __shared__ float  s_LUT[M*AVQ_GT*AVQ_K];
+    __shared__ __half s_x[AVQ_GT*AVQ_D];
+    for (int t = threadIdx.x; t < M*AVQ_K*AVQ_D; t += AVQ_CPB) s_CB[t] = CB[t];
+    for (int t = threadIdx.x; t < AVQ_GT*AVQ_D; t += AVQ_CPB) { int gg = g0 + t/AVQ_D; s_x[t] = (gg<ng) ? X[gg*AVQ_D + t%AVQ_D] : __float2half(0.f); }
+    __syncthreads();
+    for (int t = threadIdx.x; t < M*AVQ_GT*AVQ_K; t += AVQ_CPB) {   // LUT[m][gt][k] = <x_{g0+gt}, C_m[k]>
+        int m = t/(AVQ_GT*AVQ_K), r = t%(AVQ_GT*AVQ_K), gt = r/AVQ_K, k = r%AVQ_K; float dd = 0;
+        #pragma unroll
+        for (int e = 0; e < AVQ_D; e++) dd += __half2float(s_x[gt*AVQ_D+e]) * __half2float(s_CB[(m*AVQ_K+k)*AVQ_D+e]);
+        s_LUT[t] = dd;
+    }
+    __syncthreads();
+    if (o < OC) {                                        // OC%4==0 (rows are %256), so o+3 < OC
+        float a0=0,a1=0,a2=0,a3=0;
+        #pragma unroll
+        for (int gt = 0; gt < AVQ_GT; gt++) {
+            int g = g0 + gt; if (g >= ng) break;
+            #pragma unroll
+            for (int m = 0; m < M; m++) {
+                unsigned cc = *reinterpret_cast<const unsigned*>(&codes[((size_t)m*ng + g)*OC + o]); // 4 codes
+                const float* L = &s_LUT[(m*AVQ_GT + gt)*AVQ_K];
+                a0 += L[cc & 0xFF]; a1 += L[(cc>>8)&0xFF]; a2 += L[(cc>>16)&0xFF]; a3 += L[(cc>>24)&0xFF];
+            }
+        }
+        atomicAdd(&Y[o],   __half2float(scale[o])   * a0);
+        atomicAdd(&Y[o+1], __half2float(scale[o+1]) * a1);
+        atomicAdd(&Y[o+2], __half2float(scale[o+2]) * a2);
+        atomicAdd(&Y[o+3], __half2float(scale[o+3]) * a3);
+    }
+}
+
+struct AvqLin { unsigned char* d_codes; __half* d_cb; __half* d_scale; int M, IC, OC; };
+
 struct QLinear { unsigned char* d_packed; __half* d_cb; int IC, OC; };
 
 extern "C" {
@@ -460,6 +525,53 @@ void qlinear_forward_dev(void* handle, const void* d_x, void* d_y) {
 void qlinear_free(void* handle) {
     QLinear* q = (QLinear*)handle;
     cudaFree(q->d_packed); cudaFree(q->d_cb); free(q);
+}
+
+// --- AVQ (additive-codebook) linear, MoE routed experts --------------------------
+// codes: [M][cols/AVQ_D][rows] u8; cb_f32: [M][AVQ_K][AVQ_D]; scale_f32: [rows]. Host
+// speaks f32 for the codebook/scale (converted to half on the way in, like qlinear_create);
+// the packed u8 indices are uploaded as-is. rows = OC, cols = IC.
+void* avq_create(const unsigned char* codes, const float* cb_f32, const float* scale_f32,
+                 int M, int rows, int cols) {
+    AvqLin* q = (AvqLin*)malloc(sizeof(AvqLin));
+    q->M = M; q->IC = cols; q->OC = rows;
+    int ng = cols / AVQ_D;
+    size_t nidx = (size_t)M * ng * rows;
+    cudaMalloc(&q->d_codes, nidx);
+    cudaMemcpy(q->d_codes, codes, nidx, cudaMemcpyHostToDevice);
+    size_t ncb = (size_t)M * AVQ_K * AVQ_D;
+    __half* cbh = (__half*)malloc(ncb * sizeof(__half));
+    for (size_t i = 0; i < ncb; i++) cbh[i] = __float2half(cb_f32[i]);
+    cudaMalloc(&q->d_cb, ncb * sizeof(__half));
+    cudaMemcpy(q->d_cb, cbh, ncb * sizeof(__half), cudaMemcpyHostToDevice);
+    free(cbh);
+    __half* sh = (__half*)malloc((size_t)rows * sizeof(__half));
+    for (int i = 0; i < rows; i++) sh[i] = __float2half(scale_f32[i]);
+    cudaMalloc(&q->d_scale, (size_t)rows * sizeof(__half));
+    cudaMemcpy(q->d_scale, sh, (size_t)rows * sizeof(__half), cudaMemcpyHostToDevice);
+    free(sh);
+    return q;
+}
+
+// d_x: device half (IC,), d_y: device f32 (OC,). Fully on-device, on g_stream.
+void avq_forward_dev(void* handle, const void* d_x, void* d_y) {
+    AvqLin* q = (AvqLin*)handle;
+    ensure_stream();
+    cudaMemsetAsync(d_y, 0, (size_t)q->OC * sizeof(float), g_stream);
+    int ng = q->IC / AVQ_D;
+    dim3 grid((q->OC + AVQ_CPB*4 - 1) / (AVQ_CPB*4), (ng + AVQ_GT - 1) / AVQ_GT);
+    dim3 block(AVQ_CPB);
+    const __half* X = (const __half*)d_x; float* Y = (float*)d_y;
+    switch (q->M) {
+        case 2: avq_gemv_t<2><<<grid, block, 0, g_stream>>>(X, q->d_codes, q->d_cb, q->d_scale, Y, q->IC, q->OC); break;
+        case 3: avq_gemv_t<3><<<grid, block, 0, g_stream>>>(X, q->d_codes, q->d_cb, q->d_scale, Y, q->IC, q->OC); break;
+        default: break; // only M in {2,3} instantiated; loader asserts this
+    }
+}
+
+void avq_free(void* handle) {
+    AvqLin* q = (AvqLin*)handle;
+    cudaFree(q->d_codes); cudaFree(q->d_cb); cudaFree(q->d_scale); free(q);
 }
 
 // device buffer helpers

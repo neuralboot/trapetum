@@ -186,6 +186,21 @@ pub unsafe fn qlinear_free(h: *mut c_void) {
     drop(Box::from_raw(h as *mut QLin));
 }
 
+// ---- AvqLinear (additive-codebook MoE experts) -------------------------------
+// The Metal AVQ decode kernel is the next work package (twin of avq_gemv_t in the CUDA
+// wrapper). The seam is present so the crate builds and links on Apple platforms; calling
+// it panics with a clear message rather than silently producing wrong numbers.
+pub unsafe fn avq_create(_codes: *const u8, _cb: *const f32, _scale: *const f32,
+                         _m: i32, _rows: i32, _cols: i32) -> *mut c_void {
+    unimplemented!("AVQ (additive-codebook) decode is not yet implemented on the Metal backend");
+}
+pub unsafe fn avq_forward_dev(_h: *mut c_void, _d_x: *const c_void, _d_y: *mut c_void) {
+    unimplemented!("AVQ (additive-codebook) decode is not yet implemented on the Metal backend");
+}
+pub unsafe fn avq_free(_h: *mut c_void) {
+    unimplemented!("AVQ (additive-codebook) decode is not yet implemented on the Metal backend");
+}
+
 // ---- device buffers ----------------------------------------------------------
 pub unsafe fn dev_alloc_half(n: i32) -> *mut c_void { alloc_bytes(n as usize * 2) }
 pub unsafe fn dev_alloc_f32(n: i32) -> *mut c_void { alloc_bytes(n as usize * 4) }

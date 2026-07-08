@@ -22,6 +22,10 @@ mod backend {
         pub fn qlinear_create(packed: *const u8, cb: *const f32, ic: i32, oc: i32) -> *mut c_void;
         pub fn qlinear_forward_dev(h: *mut c_void, d_x: *const c_void, d_y: *mut c_void);
         pub fn qlinear_free(h: *mut c_void);
+        // AVQ (additive-codebook) linear for MoE routed experts (M in {2,3}); see AvqLinear.
+        pub fn avq_create(codes: *const u8, cb: *const f32, scale: *const f32, m: i32, rows: i32, cols: i32) -> *mut c_void;
+        pub fn avq_forward_dev(h: *mut c_void, d_x: *const c_void, d_y: *mut c_void);
+        pub fn avq_free(h: *mut c_void);
         pub fn dev_alloc_half(n: i32) -> *mut c_void;
         pub fn dev_alloc_f32(n: i32) -> *mut c_void;
         pub fn dev_free(p: *mut c_void);
@@ -208,6 +212,102 @@ impl Drop for QuantLinear {
         unsafe { qlinear_free(self.handle) };
     }
 }
+
+/// Number of entries per additive codebook (8-bit AVQ indices).
+pub const AVQ_K: usize = 256;
+/// Group size for additive VQ (weights per code).
+pub const AVQ_D: usize = 8;
+
+/// An additive-codebook (AQLM-style) quantized linear whose weights live on the GPU,
+/// used for MoE routed experts. A group of [`AVQ_D`] input weights for output channel `o`
+/// is reconstructed as `scale[o] * sum_m C_m[code_m[o,g]]`, with `M` additive codebooks of
+/// [`AVQ_K`] vectors (`M=2` -> 2 bit/weight, `M=3` -> 3 bit). Same decode as the CBKA
+/// container and `kernels/avq_gemv3.cu`; see the CBKA reader in `load_deepseek_qlora`.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct AvqLinear {
+    handle: *mut c_void,
+    ic: usize,
+    oc: usize,
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl AvqLinear {
+    /// - `codes`: `M*(cols/AVQ_D)*rows` bytes, layout `[M][ng][rows]` (`ng = cols/AVQ_D`).
+    /// - `cb`: `M*AVQ_K*AVQ_D` f32, layout `[M][AVQ_K][AVQ_D]`.
+    /// - `scale`: `rows` f32, one per output channel. `rows = oc`, `cols = ic`.
+    pub fn new(codes: &[u8], cb: &[f32], scale: &[f32], m: usize, rows: usize, cols: usize) -> Self {
+        assert!(m == 2 || m == 3, "AVQ M must be 2 or 3 (only those kernels are instantiated)");
+        assert_eq!(cols % AVQ_D, 0, "cols (ic) must be a multiple of AVQ_D={AVQ_D}");
+        assert_eq!(rows % 4, 0, "rows (oc) must be a multiple of 4 (uint32 code read)");
+        assert_eq!(codes.len(), m * (cols / AVQ_D) * rows, "codes must be M*(cols/AVQ_D)*rows bytes");
+        assert_eq!(cb.len(), m * AVQ_K * AVQ_D, "cb must be M*AVQ_K*AVQ_D floats");
+        assert_eq!(scale.len(), rows, "scale must be rows floats");
+        let handle = unsafe {
+            avq_create(codes.as_ptr(), cb.as_ptr(), scale.as_ptr(), m as i32, rows as i32, cols as i32)
+        };
+        assert!(!handle.is_null(), "avq_create returned null (CUDA error?)");
+        Self { handle, ic: cols, oc: rows }
+    }
+
+    /// `y` (device f32) = `x` (device fp16) W^T, decoding the additive codebook. On-device.
+    pub fn forward_into(&self, x: &DevHalf, y: &mut DevF32) {
+        assert_eq!(x.n, self.ic, "x must have length ic");
+        assert_eq!(y.n, self.oc, "y must have length oc");
+        unsafe { avq_forward_dev(self.handle, x.ptr, y.ptr) };
+    }
+
+    pub fn shape(&self) -> (usize, usize) {
+        (self.ic, self.oc)
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl Drop for AvqLinear {
+    fn drop(&mut self) {
+        unsafe { avq_free(self.handle) };
+    }
+}
+
+/// One projection of a streamed MoE expert: either a 4-bit scalar-codebook [`QuantLinear`]
+/// (today's CBKR path) or an additive-codebook [`AvqLinear`] (the CBKA 2/3-bit path). Both
+/// map a device fp16 activation to a device f32 output; `MoeBlockOffload::run_ffn` dispatches
+/// on the variant through the [`ProjRef`] Copy handle so the streaming/LRU logic is unchanged.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+enum Proj { Scalar(QuantLinear), Avq(AvqLinear) }
+
+/// A Copy, backend-tagged raw handle to a [`Proj`], so `resident()` can hand the three
+/// projections to `run_ffn` without holding a borrow of the expert cache (mirrors the old
+/// raw-pointer pattern that let `run_ffn(&mut self, ..)` also touch the scratch buffers).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+#[derive(Clone, Copy)]
+enum ProjRef { Scalar(*mut c_void), Avq(*mut c_void) }
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl Proj {
+    fn as_ref(&self) -> ProjRef {
+        match self {
+            Proj::Scalar(q) => ProjRef::Scalar(q.handle),
+            Proj::Avq(a) => ProjRef::Avq(a.handle),
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl ProjRef {
+    /// Decode-GEMV forward on device pointers: `y (f32) = x (half) W^T`.
+    unsafe fn forward(self, d_x: *const c_void, d_y: *mut c_void) {
+        match self {
+            ProjRef::Scalar(h) => qlinear_forward_dev(h, d_x, d_y),
+            ProjRef::Avq(h) => avq_forward_dev(h, d_x, d_y),
+        }
+    }
+}
+
+/// A streamed MoE expert as a Llama-style gated FFN whose three projections may each be
+/// scalar-4bit or additive-codebook (see [`Proj`]). Used by [`MoeBlockOffload`] for both the
+/// routed experts (streamed) and the always-resident shared expert.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+struct OffExpert { gate: Proj, up: Proj, down: Proj }
 
 /// RMSNorm: `out = x / sqrt(mean(x^2) + eps) * w`, on-device.
 pub fn rmsnorm(x: &DevHalf, w: &DevF32, out: &mut DevHalf, eps: f32) {
@@ -1746,7 +1846,7 @@ pub fn check_moe() -> f64 {
 /// be used by any small in-RAM export); `Mmap` is what `load_deepseek_qlora` uses for the
 /// routed experts' packed indices (the bulk of a 671B CBKR file).
 #[cfg(any(feature = "cuda", feature = "metal"))]
-enum PackedBytes {
+pub enum PackedBytes {
     Owned(Vec<u8>),
     Mmap(Arc<memmap2::Mmap>, usize, usize), // (mmap, byte offset, byte length)
 }
@@ -1779,7 +1879,93 @@ impl PackedBytes {
 /// guaranteed 4-byte aligned, so casting a raw mmap `&[u8]` to `&[f32]` would be unsound, and
 /// copying something this small at load time costs nothing.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-pub struct ExpertHost { gp: PackedBytes, gc: Vec<f32>, up: PackedBytes, uc: Vec<f32>, dp: PackedBytes, dc: Vec<f32> }
+pub enum ExpertHost {
+    /// 4-bit scalar-codebook expert (today's CBKR path): packed nibble indices + per-output
+    /// codebook for gate/up/down.
+    Scalar { gp: PackedBytes, gc: Vec<f32>, up: PackedBytes, uc: Vec<f32>, dp: PackedBytes, dc: Vec<f32> },
+    /// Additive-codebook expert (CBKA, 2/3-bit): each projection is an [`AvqProjHost`].
+    Avq { gate: AvqProjHost, up: AvqProjHost, down: AvqProjHost },
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl ExpertHost {
+    /// Background-read (madvise WILLNEED) the mmap-backed index bytes of all three projections
+    /// so expert streaming issues parallel disk reads instead of serial page faults.
+    fn prefetch(&self) {
+        match self {
+            ExpertHost::Scalar { gp, up, dp, .. } => { gp.prefetch(); up.prefetch(); dp.prefetch(); }
+            ExpertHost::Avq { gate, up, down } => { gate.idx.prefetch(); up.idx.prefetch(); down.idx.prefetch(); }
+        }
+    }
+
+    /// Borrow the six scalar-expert slices (packed indices + codebook, for gate/up/down).
+    /// Panics on an AVQ host -- used only by the all-resident-vs-offload check, which is
+    /// built from `gen_moe` (always `Scalar`).
+    #[allow(clippy::type_complexity)]
+    fn scalar_slices(&self) -> (&[u8], &[f32], &[u8], &[f32], &[u8], &[f32]) {
+        match self {
+            ExpertHost::Scalar { gp, gc, up, uc, dp, dc } =>
+                (gp.as_slice(), gc.as_slice(), up.as_slice(), uc.as_slice(), dp.as_slice(), dc.as_slice()),
+            ExpertHost::Avq { .. } => panic!("scalar_slices called on an AVQ ExpertHost"),
+        }
+    }
+}
+
+/// One additive-codebook (CBKA) projection of a MoE expert, host-resident until streamed to
+/// the GPU. The packed `M*(cols/AVQ_D)*rows` u8 indices (`idx`, the bulk) may be
+/// `PackedBytes::Mmap` (paged from disk on demand); the tiny codebooks (`cb`, `M*AVQ_K*AVQ_D`
+/// f32) and per-output-channel scales (`scale`, `rows` f32) always stay owned -- a mmap byte
+/// offset is not guaranteed f32/f16 aligned, and both are only a few KB.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct AvqProjHost { idx: PackedBytes, cb: Vec<f32>, scale: Vec<f32>, m: usize, rows: usize, cols: usize }
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl AvqProjHost {
+    fn to_linear(&self) -> AvqLinear {
+        AvqLinear::new(self.idx.as_slice(), &self.cb, &self.scale, self.m, self.rows, self.cols)
+    }
+}
+
+// ============================================================================
+// CBKA -- additive-codebook expert record (2/3-bit AQLM-style), the on-disk format
+// emitted by model/export_deepseek_stream.py --experts-avq {2,3} and decoded by
+// `kernels/avq_gemv3.cu` / `AvqLinear`. Only MoE ROUTED experts use it; attention,
+// dense FFN, shared expert, router and lm_head stay on the 4-bit scalar CBKR path.
+// One record per weight matrix (a routed expert = 3 records: gate, up, down):
+//   magic  "CBKA"                 (4 bytes)
+//   M      i32                    (2 or 3 additive codebooks)
+//   D      i32                    (AVQ_D = 8, group size)
+//   K      i32                    (AVQ_K = 256, entries per codebook)
+//   rows   i32                    (OC, output channels; rows % 4 == 0)
+//   cols   i32                    (IC, input channels; cols % D == 0)
+//   codebooks   M*K*D    f16      layout [M][K][D], flat (m*K + k)*D + e
+//   scales      rows     f16      per output channel
+//   indices     M*ng*rows u8      ng = cols/D, layout [M][ng][rows], flat (m*ng + g)*rows + o
+// The indices (the bulk) are recorded as an mmap byte range (never copied to RAM); the
+// codebooks/scales are read owned. Reconstruction: W[o, g*D+e] = scale[o]*sum_m CB[m][code][e].
+// ============================================================================
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn read_cbka(r: &mut BufReader<File>, mmap: &Arc<memmap2::Mmap>,
+             exp_m: usize, exp_rows: usize, exp_cols: usize) -> std::io::Result<AvqProjHost> {
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic)?;
+    assert_eq!(&magic, b"CBKA", "expected a CBKA additive-codebook expert record");
+    let m = rd_i32(r) as usize;
+    let d = rd_i32(r) as usize;
+    let k = rd_i32(r) as usize;
+    let rows = rd_i32(r) as usize;
+    let cols = rd_i32(r) as usize;
+    assert_eq!(m, exp_m, "CBKA M mismatch (header experts_avq={exp_m})");
+    assert_eq!(d, AVQ_D, "CBKA D must be {AVQ_D}");
+    assert_eq!(k, AVQ_K, "CBKA K must be {AVQ_K}");
+    assert_eq!(rows, exp_rows, "CBKA rows mismatch");
+    assert_eq!(cols, exp_cols, "CBKA cols mismatch");
+    let cb = rd_f16_vec(r, m * k * d);   // codebooks f16 -> f32
+    let scale = rd_f16_vec(r, rows);     // per-output scales f16 -> f32
+    let ng = cols / d;
+    let idx = mmap_skip(r, mmap, m * ng * rows)?; // u8 indices, mmap-backed (the bulk)
+    Ok(AvqProjHost { idx, cb, scale, m, rows, cols })
+}
 
 /// MoE block with EXPERT OFFLOADING (solves the memory wall). Only the router and the
 /// shared expert stay GPU-resident; the routed experts live in host memory and the
@@ -1794,8 +1980,8 @@ pub struct MoeBlockOffload {
     norm_w: DevF32,
     router: DenseLinear,
     hosts: Vec<ExpertHost>,
-    shared: Expert,
-    cache: std::collections::HashMap<usize, Expert>,
+    shared: OffExpert,
+    cache: std::collections::HashMap<usize, OffExpert>,
     lru: Vec<usize>,
     cap: usize,
     top_k: usize,
@@ -1830,9 +2016,9 @@ impl MoeBlockOffload {
             norm_w: DevF32::from_host(norm_w),
             router: DenseLinear::new(router_w, hidden, n_experts),
             hosts,
-            shared: Expert { gate: QuantLinear::new(shared.0,shared.1,hidden,inter),
-                             up: QuantLinear::new(shared.2,shared.3,hidden,inter),
-                             down: QuantLinear::new(shared.4,shared.5,inter,hidden) },
+            shared: OffExpert { gate: Proj::Scalar(QuantLinear::new(shared.0,shared.1,hidden,inter)),
+                             up: Proj::Scalar(QuantLinear::new(shared.2,shared.3,hidden,inter)),
+                             down: Proj::Scalar(QuantLinear::new(shared.4,shared.5,inter,hidden)) },
             cache: std::collections::HashMap::new(), lru: Vec::new(), cap,
             top_k, hidden, inter, n_experts, eps,
             norm: DevHalf::zeros(hidden), rlogits: DevF32::zeros(n_experts),
@@ -1874,8 +2060,9 @@ impl MoeBlockOffload {
         }
     }
 
-    /// Ensure expert `e` is resident (stream from host + LRU-evict if needed); return handles.
-    fn resident(&mut self, e: usize) -> (*mut c_void, *mut c_void, *mut c_void) {
+    /// Ensure expert `e` is resident (stream from host + LRU-evict if needed); return the three
+    /// projection handles (Copy [`ProjRef`], so `run_ffn(&mut self, ..)` can also touch scratch).
+    fn resident(&mut self, e: usize) -> (ProjRef, ProjRef, ProjRef) {
         if self.cache.contains_key(&e) {
             let pos = self.lru.iter().position(|&x| x == e).unwrap();
             self.lru.remove(pos);
@@ -1885,27 +2072,33 @@ impl MoeBlockOffload {
                 let victim = self.lru.remove(0);
                 self.cache.remove(&victim); // Drop frees the GPU buffers
             }
-            let h = &self.hosts[e];
-            let ex = Expert {
-                gate: QuantLinear::new(h.gp.as_slice(), &h.gc, self.hidden, self.inter),
-                up:   QuantLinear::new(h.up.as_slice(), &h.uc, self.hidden, self.inter),
-                down: QuantLinear::new(h.dp.as_slice(), &h.dc, self.inter, self.hidden),
+            let ex = match &self.hosts[e] {
+                ExpertHost::Scalar { gp, gc, up, uc, dp, dc } => OffExpert {
+                    gate: Proj::Scalar(QuantLinear::new(gp.as_slice(), gc, self.hidden, self.inter)),
+                    up:   Proj::Scalar(QuantLinear::new(up.as_slice(), uc, self.hidden, self.inter)),
+                    down: Proj::Scalar(QuantLinear::new(dp.as_slice(), dc, self.inter, self.hidden)),
+                },
+                ExpertHost::Avq { gate, up, down } => OffExpert {
+                    gate: Proj::Avq(gate.to_linear()),
+                    up:   Proj::Avq(up.to_linear()),
+                    down: Proj::Avq(down.to_linear()),
+                },
             };
             self.cache.insert(e, ex);
             self.lru.push(e);
             self.uploads += 1;
         }
         let ex = self.cache.get(&e).unwrap();
-        (ex.gate.handle, ex.up.handle, ex.down.handle)
+        (ex.gate.as_ref(), ex.up.as_ref(), ex.down.as_ref())
     }
 
-    fn run_ffn(&mut self, g: *mut c_void, u: *mut c_void, d: *mut c_void, acc: &mut DevF32, w: f32) {
+    fn run_ffn(&mut self, g: ProjRef, u: ProjRef, d: ProjRef, acc: &mut DevF32, w: f32) {
         unsafe {
-            qlinear_forward_dev(g, self.norm.ptr, self.g.ptr);
-            qlinear_forward_dev(u, self.norm.ptr, self.u.ptr);
+            g.forward(self.norm.ptr, self.g.ptr);
+            u.forward(self.norm.ptr, self.u.ptr);
         }
         silu_mul(&self.g, &self.u, &mut self.act);
-        unsafe { qlinear_forward_dev(d, self.act.ptr, self.ey.ptr); }
+        unsafe { d.forward(self.act.ptr, self.ey.ptr); }
         saxpy(acc, &self.ey, w);
     }
 
@@ -1934,10 +2127,7 @@ impl MoeBlockOffload {
         if pf {
             for (e, _) in &picks {
                 if !self.cache.contains_key(e) {
-                    let h = &self.hosts[*e];
-                    h.gp.prefetch();
-                    h.up.prefetch();
-                    h.dp.prefetch();
+                    self.hosts[*e].prefetch();
                 }
             }
         }
@@ -1946,7 +2136,7 @@ impl MoeBlockOffload {
             let (g, u, d) = self.resident(e);
             self.run_ffn(g, u, d, &mut acc, w);
         }
-        let (sg, su, sd) = (self.shared.gate.handle, self.shared.up.handle, self.shared.down.handle);
+        let (sg, su, sd) = (self.shared.gate.as_ref(), self.shared.up.as_ref(), self.shared.down.as_ref());
         self.run_ffn(sg, su, sd, &mut acc, 1.0);
         residual_add(h, &acc);
     }
@@ -1962,7 +2152,7 @@ fn gen_moe(hidden: usize, inter: usize, n_experts: usize, seed: u64)
     let cb = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<f32> { (0..n).map(|_| r()*0.05).collect() };
     let nw: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
     let rw: Vec<f32> = (0..n_experts*hidden).map(|_| r()*0.05).collect();
-    let mkh = |r: &mut dyn FnMut()->f32| ExpertHost {
+    let mkh = |r: &mut dyn FnMut()->f32| ExpertHost::Scalar {
         gp: PackedBytes::Owned(pk(hidden*(inter/2), r)), gc: cb(K*inter, r),
         up: PackedBytes::Owned(pk(hidden*(inter/2), r)), uc: cb(K*inter, r),
         dp: PackedBytes::Owned(pk(inter*(hidden/2), r)), dc: cb(K*hidden, r) };
@@ -1980,12 +2170,12 @@ pub fn check_moe_offload() -> (f64, usize, usize, usize) {
     let eps = 1e-5f32; let seed = 0x0FF10AD5u64;
     // all-resident reference
     let (nw, rw, hosts_r, sh_r) = gen_moe(hidden, inter, n_experts, seed);
-    let exps_ref: Vec<_> = hosts_r.iter().map(|e| (e.gp.as_slice(),e.gc.as_slice(),e.up.as_slice(),e.uc.as_slice(),e.dp.as_slice(),e.dc.as_slice())).collect();
-    let shref = (sh_r.gp.as_slice(),sh_r.gc.as_slice(),sh_r.up.as_slice(),sh_r.uc.as_slice(),sh_r.dp.as_slice(),sh_r.dc.as_slice());
+    let exps_ref: Vec<_> = hosts_r.iter().map(|e| e.scalar_slices()).collect();
+    let shref = sh_r.scalar_slices();
     let mut moe = MoeBlock::new(hidden, inter, n_experts, top_k, eps, &nw, &rw, exps_ref, Some(shref), inter, 1.0);
     // offloaded (identical weights via same seed)
     let (nw2, rw2, hosts_o, sh_o) = gen_moe(hidden, inter, n_experts, seed);
-    let sho = (sh_o.gp.as_slice(),sh_o.gc.as_slice(),sh_o.up.as_slice(),sh_o.uc.as_slice(),sh_o.dp.as_slice(),sh_o.dc.as_slice());
+    let sho = sh_o.scalar_slices();
     let mut off = MoeBlockOffload::new(hidden, inter, n_experts, top_k, cap, eps, &nw2, &rw2, hosts_o, sho);
     // run several distinct tokens through both, compare
     let mut worst = 0f64;
@@ -2570,8 +2760,13 @@ impl DeepSeekModel {
     pub fn load_deepseek(path: &str, max_seq: usize) -> std::io::Result<DeepSeekModel> {
         let mut r = BufReader::new(File::open(path)?);
         let mut magic = [0u8; 4]; r.read_exact(&mut magic)?;
-        if &magic == b"CBKR" { return Self::load_deepseek_qlora(path, r, max_seq); }
-        assert_eq!(&magic, b"CBKD", "not a DeepSeek .cbk (expected CBKD or CBKR)");
+        // CBKR = original 18-i32 header, routed experts 4-bit scalar (byte-identical to old
+        // artifacts). CBKV = 19-i32 header with a trailing `experts_avq` field (0/2/3) for
+        // additive-codebook routed experts. Old scalar files keep the CBKR magic and load
+        // unchanged; only avq exports use CBKV.
+        if &magic == b"CBKR" { return Self::load_deepseek_qlora(path, r, max_seq, false); }
+        if &magic == b"CBKV" { return Self::load_deepseek_qlora(path, r, max_seq, true); }
+        assert_eq!(&magic, b"CBKD", "not a DeepSeek .cbk (expected CBKD, CBKR or CBKV)");
         let cfg: Vec<usize> = (0..14).map(|_| rd_i32(&mut r) as usize).collect();
         let (n_layers, hidden, n_heads, kv_lora, nope, rope, vhd, inter_dense, moe_inter,
              n_routed, n_shared, top_k, vocab, first_k_dense) =
@@ -2635,17 +2830,24 @@ impl DeepSeekModel {
     /// o (4-bit), post_norm, then the dense-or-MoE FFN (MoE layers read `e_score_bias`
     /// BEFORE the router). Routed experts are NOT uploaded to the GPU here — they stay in
     /// host `ExpertHost`s and stream through `MoeBlockOffload` (the memory wall at 671B).
-    fn load_deepseek_qlora(path: &str, mut r: BufReader<File>, max_seq: usize) -> std::io::Result<DeepSeekModel> {
+    fn load_deepseek_qlora(path: &str, mut r: BufReader<File>, max_seq: usize, avq_header: bool) -> std::io::Result<DeepSeekModel> {
         // mmap the whole file once: the routed experts' packed indices (the ~300GB bulk at
         // 671B) are handed to ExpertHost as zero-copy byte ranges into this, instead of being
         // read into owned Vecs -- the OS pages them in from disk on demand (and can evict
         // under memory pressure), which is the actual "stream experts from storage" behavior.
         // Safety: the file is a static export artifact, not mutated while the model is loaded.
         let mmap = Arc::new(unsafe { memmap2::Mmap::map(&File::open(path)?)? });
-        let cfg: Vec<usize> = (0..18).map(|_| rd_i32(&mut r) as usize).collect();
+        // Header is 18 i32 for CBKR (byte-identical to the original scalar format) or 19 i32 for
+        // CBKV, where the trailing field is `experts_avq` (2 or 3 = additive CBKA routed experts
+        // at that M). Everything else (attention, dense FFN, shared expert, router, lm_head) stays
+        // on the 4-bit scalar path regardless of `experts_avq`.
+        let n_fields = if avq_header { 19 } else { 18 };
+        let cfg: Vec<usize> = (0..n_fields).map(|_| rd_i32(&mut r) as usize).collect();
         let (n_layers, hidden, n_heads, kv_lora, nope, rope, vhd, inter_dense, moe_inter,
              n_routed, n_shared, top_k, vocab, first_k_dense, q_lora_rank, n_group, topk_group, sigmoid_flag) =
             (cfg[0],cfg[1],cfg[2],cfg[3],cfg[4],cfg[5],cfg[6],cfg[7],cfg[8],cfg[9],cfg[10],cfg[11],cfg[12],cfg[13],cfg[14],cfg[15],cfg[16],cfg[17]);
+        let experts_avq = if avq_header { cfg[18] } else { 0 };
+        assert!(experts_avq == 0 || experts_avq == 2 || experts_avq == 3, "experts_avq must be 0, 2 or 3");
         let eps = rd_f32(&mut r); let softmax_scale = rd_f32(&mut r); let rscale = rd_f32(&mut r);
         let inv_freq = rd_f32_vec(&mut r, rope/2);
         let embedding = rd_f16_vec(&mut r, vocab*hidden);
@@ -2673,15 +2875,24 @@ impl DeepSeekModel {
                 let rw = rd_f16_vec(&mut r, n_routed*hidden);
                 let mut hosts: Vec<ExpertHost> = Vec::with_capacity(n_routed);
                 for _ in 0..n_routed {
-                    // packed indices: SKIP (seek past, don't read) and record the byte range
-                    // into the mmap; codebooks are tiny, read into RAM as before.
-                    let gp = mmap_skip(&mut r, &mmap, hidden * (moe_inter / 2))?;
-                    let gc = rd_f32_vec(&mut r, K * moe_inter);
-                    let up = mmap_skip(&mut r, &mmap, hidden * (moe_inter / 2))?;
-                    let uc = rd_f32_vec(&mut r, K * moe_inter);
-                    let dp = mmap_skip(&mut r, &mmap, moe_inter * (hidden / 2))?;
-                    let dc = rd_f32_vec(&mut r, K * hidden);
-                    hosts.push(ExpertHost { gp, gc, up, uc, dp, dc });
+                    if experts_avq == 0 {
+                        // 4-bit scalar: packed indices SKIP (seek past, record the mmap byte
+                        // range); the tiny codebooks are read into RAM as before.
+                        let gp = mmap_skip(&mut r, &mmap, hidden * (moe_inter / 2))?;
+                        let gc = rd_f32_vec(&mut r, K * moe_inter);
+                        let up = mmap_skip(&mut r, &mmap, hidden * (moe_inter / 2))?;
+                        let uc = rd_f32_vec(&mut r, K * moe_inter);
+                        let dp = mmap_skip(&mut r, &mmap, moe_inter * (hidden / 2))?;
+                        let dc = rd_f32_vec(&mut r, K * hidden);
+                        hosts.push(ExpertHost::Scalar { gp, gc, up, uc, dp, dc });
+                    } else {
+                        // additive CBKA: gate/up are [moe_inter][hidden], down is [hidden][moe_inter].
+                        // Indices are mmap-backed inside read_cbka; codebooks/scales read owned.
+                        let gate = read_cbka(&mut r, &mmap, experts_avq, moe_inter, hidden)?;
+                        let up   = read_cbka(&mut r, &mmap, experts_avq, moe_inter, hidden)?;
+                        let down = read_cbka(&mut r, &mmap, experts_avq, hidden, moe_inter)?;
+                        hosts.push(ExpertHost::Avq { gate, up, down });
+                    }
                 }
                 let si = ((n_shared*moe_inter + 255)/256)*256; // shared expert inter, padded to %256
                 let sh = (rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
