@@ -112,3 +112,18 @@ The prefetch lands inside the storage drift: madvise readahead appears to be
 a no-op on the network mount. The relevant verdict, on LOCAL NVMe where kernel
 readahead actually queues reads, is still open. Code stays in the runtime
 behind TRAPETUM_PREFETCH=1.
+
+## 2-bit additive experts: quality measured (the x100 gate), V2-Lite proxy
+Probe: model/probe_avq2bit_moe.py (in-place dequantized simulation, wikitext-2,
+61k tokens, baseline bf16 PPL 6.8243). Routed experts to 2-bit additive (2x8,
+group 8), everything else untouched:
+- fast quantizer (beam 1):        PPL 8.6954  (+27.4%)
+- paper quantizer (beam 4, LSQ3): PPL 8.2608  (+21.1%)
+- dynamic mix (first 2 MoE layers spared, beam 4): PPL 8.1320 (+19.2%)
+Continuations stay coherent but flatten. Expert compression 7.75x vs fp16;
+projected 671B artifact with 2-bit experts: 152 GB (fits 192 GB RAM, the
+RAM-resident x100 path). Open question: the real 671B has 256 experts/layer
+vs 64 here (more redundancy, quantizes better), but a direct PPL probe needs
+1.34 TB of RAM to simulate, so the next honest step is the runtime AVQ port
+plus a real 671B 2-bit export. A 3-bit variant (228 GB, ~x50 speedup path)
+is the fallback if +19% is judged too costly.
