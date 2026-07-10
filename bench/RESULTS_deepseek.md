@@ -127,3 +127,22 @@ vs 64 here (more redundancy, quantizes better), but a direct PPL probe needs
 1.34 TB of RAM to simulate, so the next honest step is the runtime AVQ port
 plus a real 671B 2-bit export. A 3-bit variant (228 GB, ~x50 speedup path)
 is the fallback if +19% is judged too costly.
+
+## 4-bit 671B fully RAM-resident: the disk was NOT the only wall (July 10, 2026)
+Measured on AWS g5.24xlarge (A10G, 373 GB RAM, us-east-1): the 350 GB 4-bit artifact
+downloaded from S3 and read fully into page cache (339 GB cached, 38 s warm read),
+so every expert byte is in RAM, zero disk paging.
+
+Result: **~0.33 tok/s** steady state (3065 ms/token, warm rerun 0.31), coherent output.
+Versus 0.24 tok/s disk-bound (RTX 4090): only **~1.4x**, not the 20-40x a pure
+memory-bandwidth model predicts.
+
+Verdict (important): RAM residency removes the disk read (~1 s/token saved) but reveals
+the real per-token bottleneck: streaming ~10 GB of routed-expert weights from host RAM
+to the GPU across PCIe, plus the single-GPU expert compute (weak on the A10G). The 671B
+decode is not disk-bound-only; it is bound by getting the experts onto ONE GPU each
+token. True interactive speed needs the experts resident in VRAM (multi-GPU), not just
+in host RAM. This reframes the "x100 on a consumer box" goal: fitting the model in RAM
+is necessary but not sufficient; the expert-to-GPU transfer is the next wall. Raw log:
+runpod_logs/r1_671b_4bit_ram_resident.log. Caveat: A10G is a weak GPU; a 4090/A100 host
+with RAM residency would be somewhat faster, but the host->device transfer wall stands.
