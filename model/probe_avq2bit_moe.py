@@ -261,6 +261,8 @@ def main():
                     help="beam width for code assignment (1 = fast greedy, 4 = paper quality)")
     ap.add_argument("--rounds", type=int, default=1,
                     help="LSQ codebook refit rounds after init")
+    ap.add_argument("--mc", type=int, default=2, choices=[2, 3],
+                    help="additive codebooks M: 2 = 2-bit/weight, 3 = 3-bit/weight")
     ap.add_argument("--gpu-mem", default="20GiB",
                     help="per-GPU memory cap for device_map=auto (lower this if it OOMs)")
     ap.add_argument("--cpu-mem", default="60GiB", help="host RAM cap for CPU offload")
@@ -324,8 +326,8 @@ def main():
         gen_before = greedy_continue(model, tok, args.prompt)
         print(f"bf16 continuation: {gen_before!r}", flush=True)
 
-    print("quantizing routed experts to 2-bit additive (2x8, group 8)...", flush=True)
-    acct = quantize_experts(model, layers, mc=2, beam=args.beam, rounds=args.rounds)
+    print(f"quantizing routed experts to {args.mc}-bit additive ({args.mc}x8, group 8)...", flush=True)
+    acct = quantize_experts(model, layers, mc=args.mc, beam=args.beam, rounds=args.rounds)
 
     if args.cpu_load:
         # everything is a real tensor now; hand placement over to accelerate for the eval
@@ -335,15 +337,17 @@ def main():
         print("dispatched quantized model for evaluation", flush=True)
 
     ppl_after, _ = ppl(model, enc, n_ppl_seqs)
-    print(f"experts-2bit wikitext-2 PPL = {ppl_after:.4f}  ({nt} tokens)", flush=True)
+    print(f"experts-{args.mc}bit wikitext-2 PPL = {ppl_after:.4f}  ({nt} tokens)", flush=True)
     gen_after = greedy_continue(model, tok, args.prompt)
-    print(f"experts-2bit continuation: {gen_after!r}", flush=True)
+    print(f"experts-{args.mc}bit continuation: {gen_after!r}", flush=True)
 
     ratio = ppl_after / ppl_before if ppl_before > 0 else float("nan")
     frac_671 = R1_ROUTED_EXPERT_PARAMS   # routed-expert param count
     proj_fp16 = frac_671 * 2             # 16 bits/weight -> 2 bytes
     proj_4bit = frac_671 * 4 / 8         # 4 bits/weight  -> 0.5 bytes
     proj_2bit = frac_671 * 2 / 8         # 2 bits/weight  -> 0.25 bytes
+    proj_3bit = frac_671 * 3 / 8         # 3 bits/weight  -> 0.375 bytes
+    proj_mc = frac_671 * args.mc / 8     # this run's bits/weight
 
     print("\n================= SUMMARY =================", flush=True)
     print(f"model                : {args.model}", flush=True)
@@ -352,10 +356,10 @@ def main():
           f"(3 per routed expert)", flush=True)
     print(f"expert params        : {acct['expert_params'] / 1e9:.3f} B", flush=True)
     print(f"PPL bf16             : {ppl_before:.4f}", flush=True)
-    print(f"PPL experts-2bit     : {ppl_after:.4f}", flush=True)
+    print(f"PPL experts-{args.mc}bit     : {ppl_after:.4f}", flush=True)
     print(f"PPL ratio (after/bf16): {ratio:.4f}", flush=True)
     print(f"expert bytes fp16    : {human(acct['bytes_fp16'])}", flush=True)
-    print(f"expert bytes 2-bit   : {human(acct['bytes_2bit'])}  "
+    print(f"expert bytes {args.mc}-bit   : {human(acct['bytes_2bit'])}  "
           f"(indices {human(acct['idx_bytes'])} + codebooks {human(acct['cb_bytes'])} "
           f"+ scales {human(acct['scale_bytes'])})", flush=True)
     print(f"expert compression   : {acct['bytes_fp16'] / acct['bytes_2bit']:.2f}x "
@@ -364,6 +368,7 @@ def main():
     print(f"  experts @ fp16     : {human(proj_fp16)}", flush=True)
     print(f"  experts @ 4-bit    : {human(proj_4bit)}   "
           f"(repo CBKR artifact = 326 GB, matches)", flush=True)
+    print(f"  experts @ 3-bit    : {human(proj_3bit)}", flush=True)
     print(f"  experts @ 2-bit    : {human(proj_2bit)}", flush=True)
     print("==========================================", flush=True)
     print("DONE", flush=True)
