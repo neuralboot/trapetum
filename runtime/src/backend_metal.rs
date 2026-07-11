@@ -23,15 +23,22 @@ const TY: usize = 8;
 // GPUs have far fewer cores, so fewer, fatter threadgroups (less atomic-reduce
 // contention) win. Overridable via TRAPETUM_GS for tuning; default 8.
 //
-// DETERMINISM: grid.y > 1 makes the kernel reduce IC-slices with an atomic_fetch_add whose
-// float add-order is scheduler-dependent -> run-to-run NONDETERMINISTIC output (proven: 30/30
-// identical-input GEMV runs differ bitwise at GS=16, 0/30 at GS=1). TRAPETUM_DETERMINISTIC=1
-// forces grid.y=1 (each output element written by exactly one threadgroup, no cross-block
-// atomics) -> bitwise-reproducible decode, at the cost of less SM parallelism on small-OC layers.
+// DETERMINISM: grid.y > 1 makes the atomic-reduce kernel scheduler-order-dependent -> run-to-run
+// NONDETERMINISTIC (proven: 30/30 identical-input GEMV runs differ at GS=16). The two-stage
+// fixed-order reduction (mode 2) is deterministic AND measured FASTER than atomics on BOTH
+// backends (Metal M4 and the pod's RTX 6000 Ada: atomic contention was a hidden tax), so it is
+// now the DEFAULT. TRAPETUM_DETERMINISTIC:
+//   0       = atomic (fast-path A/B only; nondeterministic)
+//   1       = grid.y=1 (no cross-block atomics; slow on small-OC layers)
+//   2/unset = two-stage fixed-order (gemv4_partial -> gemv_reduce), deterministic, keeps IC split.
+fn det_mode() -> u64 {
+    static M: OnceLock<u64> = OnceLock::new();
+    *M.get_or_init(|| std::env::var("TRAPETUM_DETERMINISTIC").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
+}
 fn gs() -> u64 {
     static G: OnceLock<u64> = OnceLock::new();
     *G.get_or_init(|| {
-        if std::env::var("TRAPETUM_DETERMINISTIC").map(|v| v == "1").unwrap_or(false) { return 1; }
+        if det_mode() == 1 { return 1; } // mode 1: single grid.y block, no atomics
         std::env::var("TRAPETUM_GS").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
     })
 }
@@ -41,6 +48,7 @@ const KERNELS: &[&str] = &[
     "gemv4", "cast_f2h", "rmsnorm_k", "silu_mul_k", "resadd_k", "rope_k", "vadd_k", "attn_k",
     "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m", "attn_m", "rope_m", "mla_attn", "saxpy", "gelu_mul_k", "resadd_h_k",
     "gemm_mtile_t1", "gemm_mtile_t2", "gemm_mtile_t3", "gemm_mtile_t4", "argmax_stage1", "argmax_stage2",
+    "gemv4_partial", "gemv_reduce",
 ];
 
 struct Ctx {
@@ -62,6 +70,9 @@ struct Ctx {
     // for the max partial count (ARGMAX_NTG_MAX). Allocated once, reused every token
     // so the greedy path never mallocs per call.
     argmax_scratch: Mutex<Option<(Buffer, Buffer, Buffer)>>,
+    // Reusable Ypart scratch for the deterministic two-stage GEMV (mode 2): GS*OC f32,
+    // grown on demand. (buffer, capacity_in_floats).
+    ypart_scratch: Mutex<Option<(Buffer, usize)>>,
 }
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
@@ -82,7 +93,7 @@ fn ctx() -> &'static Ctx {
                 .expect("pipeline creation failed");
             pl.insert(*name, p);
         }
-        Ctx { _device: device, queue, pl, cur: Mutex::new(None), pending: Mutex::new(None), argmax_scratch: Mutex::new(None) }
+        Ctx { _device: device, queue, pl, cur: Mutex::new(None), pending: Mutex::new(None), argmax_scratch: Mutex::new(None), ypart_scratch: Mutex::new(None) }
     })
 }
 
@@ -193,11 +204,50 @@ pub unsafe fn qlinear_create(packed: *const u8, cb_f32: *const f32, ic: i32, oc:
     Box::into_raw(Box::new(QLin { packed: pb, cb: cbb, ic, oc })) as *mut c_void
 }
 
+/// Reusable GS*OC f32 Ypart scratch for the deterministic two-stage GEMV, grown on demand.
+fn ypart(need_floats: usize) -> Buffer {
+    let c = ctx();
+    let mut g = c.ypart_scratch.lock().unwrap();
+    if g.as_ref().map(|(_, cap)| *cap < need_floats).unwrap_or(true) {
+        let b = c._device.new_buffer((need_floats * 4) as u64, MTLResourceOptions::StorageModeShared);
+        *g = Some((b, need_floats));
+    }
+    g.as_ref().unwrap().0.to_owned()
+}
+
 pub unsafe fn qlinear_forward_dev(h: *mut c_void, d_x: *const c_void, d_y: *mut c_void) {
     let q = &*(h as *const QLin);
     let c = ctx();
     let y = bufref(d_y);
     let cb = cur_cb();
+    let gy = gs();
+    if det_mode() == 2 && gy > 1 {
+        // Two-stage deterministic: stage 1 writes each grid.y block's partial to its own row of
+        // Ypart (no atomics); stage 2 sums the gy partial rows per column in fixed order.
+        let yp = ypart(gy as usize * q.oc as usize);
+        let e1 = cb.new_compute_command_encoder();
+        e1.set_compute_pipeline_state(&c.pl["gemv4_partial"]);
+        e1.set_buffer(0, Some(bufref(d_x)), 0);
+        e1.set_buffer(1, Some(&q.packed), 0);
+        e1.set_buffer(2, Some(&q.cb), 0);
+        e1.set_buffer(3, Some(&yp), 0);
+        let p: [i32; 2] = [q.ic, q.oc];
+        e1.set_bytes(4, 8, p.as_ptr() as *const c_void);
+        e1.set_threadgroup_memory_length(0, tg(K * CPB * 2));
+        e1.set_threadgroup_memory_length(1, tg(TY * CPB * 4));
+        e1.dispatch_thread_groups(MTLSize::new(q.oc as u64 / CPB as u64, gy, 1), MTLSize::new(32, TY as u64, 1));
+        e1.end_encoding();
+        let e2 = cb.new_compute_command_encoder();
+        e2.set_compute_pipeline_state(&c.pl["gemv_reduce"]);
+        e2.set_buffer(0, Some(&yp), 0);
+        e2.set_buffer(1, Some(y), 0);
+        let rp: [i32; 2] = [q.oc, gy as i32];
+        e2.set_bytes(2, 8, rp.as_ptr() as *const c_void);
+        let tpb = 256u64;
+        e2.dispatch_thread_groups(MTLSize::new((q.oc as u64 + tpb - 1) / tpb, 1, 1), MTLSize::new(tpb, 1, 1));
+        e2.end_encoding();
+        return;
+    }
     // zero the f32 accumulator (cudaMemsetAsync equivalent)
     let blit = cb.new_blit_command_encoder();
     blit.fill_buffer(y, NSRange::new(0, q.oc as u64 * 4), 0);
@@ -213,7 +263,7 @@ pub unsafe fn qlinear_forward_dev(h: *mut c_void, d_x: *const c_void, d_y: *mut 
     enc.set_threadgroup_memory_length(0, tg(K * CPB * 2));
     enc.set_threadgroup_memory_length(1, tg(TY * CPB * 4));
     enc.dispatch_thread_groups(
-        MTLSize::new(q.oc as u64 / CPB as u64, gs(), 1),
+        MTLSize::new(q.oc as u64 / CPB as u64, gy, 1),
         MTLSize::new(32, TY as u64, 1),
     );
     enc.end_encoding();

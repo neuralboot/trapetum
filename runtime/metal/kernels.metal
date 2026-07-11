@@ -75,6 +75,71 @@ kernel void gemv4(
     }
 }
 
+// Deterministic two-stage GEMV (TRAPETUM_DETERMINISTIC=2). Stage 1: identical to gemv4 but
+// each grid.y block writes its IC-slice partial to its OWN row of Ypart (Ypart[gy*OC + j]) --
+// disjoint, no atomics. Stage 2 (gemv_reduce) sums the GS partial rows per column in FIXED
+// grid.y order, so the result is bitwise-reproducible while keeping gemv4's GS-way IC split.
+kernel void gemv4_partial(
+    device const half*  X       [[buffer(0)]],
+    device const uchar* packed  [[buffer(1)]],
+    device const half*  cb      [[buffer(2)]],
+    device float*       Ypart   [[buffer(3)]],
+    constant GemvParams& p      [[buffer(4)]],
+    threadgroup half*  s_cb     [[threadgroup(0)]],
+    threadgroup float* red      [[threadgroup(1)]],
+    uint3 tptg [[thread_position_in_threadgroup]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tgpg [[threadgroups_per_grid]])
+{
+    const int IC = p.ic, OC = p.oc;
+    int tx = tptg.x, ty = tptg.y, tid = ty*32 + tx, nth = 32*TY;
+    int j0 = tgpig.x * CPB;
+    for (int t = tid; t < K*CPB/2; t += nth) {
+        int idx = t*2, k = idx/CPB, jj = j0 + (idx%CPB);
+        *reinterpret_cast<threadgroup half2*>(&s_cb[idx]) =
+            *reinterpret_cast<device const half2*>(&cb[(ulong)k*OC + jj]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int per = (IC + (int)tgpg.y - 1) / (int)tgpg.y;
+    int ic0 = tgpig.y * per, ic1 = min(IC, ic0 + per);
+    int jbase = j0 + tx*8; ulong OCp = (ulong)(OC/2);
+    float acc[8] = {0,0,0,0,0,0,0,0};
+    for (int ic = ic0 + ty; ic < ic1; ic += TY) {
+        uint f = *reinterpret_cast<device const uint*>(&packed[(ulong)ic*OCp + (ulong)(jbase/2)]);
+        float xx = (float)X[ic];
+        #pragma unroll(8)
+        for (int c = 0; c < 8; c++) {
+            uchar id = (f >> (4*c)) & 0xF;
+            acc[c] += xx * (float)s_cb[id*CPB + tx*8 + c];
+        }
+    }
+    #pragma unroll(8)
+    for (int c = 0; c < 8; c++) red[ty*CPB + tx*8 + c] = acc[c];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ty == 0) {
+        #pragma unroll(8)
+        for (int c = 0; c < 8; c++) {
+            float s = 0;
+            for (int y = 0; y < TY; y++) s += red[y*CPB + tx*8 + c];
+            Ypart[(ulong)tgpig.y * OC + (j0 + tx*8 + c)] = s; // own grid.y row, disjoint -> no atomic
+        }
+    }
+}
+
+// Stage 2: Y[j] = sum over grid.y partials Ypart[g*OC + j], in FIXED g order (deterministic).
+struct ReduceParams { int oc; int gs; };
+kernel void gemv_reduce(
+    device const float* Ypart [[buffer(0)]],
+    device float*       Y     [[buffer(1)]],
+    constant ReduceParams& p  [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if ((int)i >= p.oc) return;
+    float s = 0;
+    for (int g = 0; g < p.gs; g++) s += Ypart[(ulong)g * p.oc + i];
+    Y[i] = s;
+}
+
 kernel void cast_f2h(
     device const float* src [[buffer(0)]],
     device half* dst        [[buffer(1)]],

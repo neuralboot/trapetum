@@ -1301,6 +1301,23 @@ pub fn argmax(v: &[f32]) -> usize {
     bi
 }
 
+/// Emit one `[ldump]` line: l2 norm, abs-max, and mean of a hidden-state (or logit) vector.
+/// Format is stable and matches `model/dump_layers_hf.py` for a layer-by-layer diff.
+pub fn dump_hidden(stage: &str, layer: usize, x: &[f32]) {
+    let n = x.len().max(1) as f64;
+    let mut sumsq = 0f64; let mut absmax = 0f64; let mut sum = 0f64;
+    for &v in x { let v = v as f64; sumsq += v * v; absmax = absmax.max(v.abs()); sum += v; }
+    eprintln!("[ldump] L={layer} stage={stage} l2={:.6e} absmax={:.6e} mean={:.6e}", sumsq.sqrt(), absmax, sum / n);
+}
+
+/// Emit `[ldump] top5= id:logit,...` (descending, smallest-index tie-break like [`argmax`]).
+pub fn dump_top5(logits: &[f32]) {
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+    let top: Vec<String> = idx.iter().take(5).map(|&i| format!("{}:{:.4}", i, logits[i])).collect();
+    eprintln!("[ldump] top5= {}", top.join(","));
+}
+
 /// `TRAPETUM_LOGIT_DEBUG=1` -> dump top-2 logits + margin per greedy token (read once, cached).
 pub fn logit_debug_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1359,6 +1376,71 @@ pub fn check_gpu_gemv_determinism(ic: usize, oc: usize, iters: usize) -> (usize,
         if diff { mism += 1; }
     }
     (mism, worst)
+}
+
+/// Correctness of whatever `TRAPETUM_DETERMINISTIC` mode is active: compare the GPU fused GEMV
+/// against a CPU reference that uses the SAME fp16-rounded codebook the GPU stores (so the ONLY
+/// difference is float summation order, not fp16-vs-f32 codebook rounding). Returns
+/// `(worst_rel, l2_rel)`. For mode 2 (fixed-order two-stage) this is the "equals the atomic/mode-1
+/// result within summation-order tolerance" measurement. `x` and activations mirror the GPU
+/// (fp16 X). Deterministic CPU side.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn check_gpu_gemv_vs_fp16cb_ref(ic: usize, oc: usize) -> (f64, f64) {
+    assert_eq!(oc % 256, 0); assert_eq!(ic % 2, 0);
+    let mut s = 0x51DE_0117u64;
+    let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+    let w: Vec<f32> = (0..oc*ic).map(|_| r()*0.5).collect();
+    let x: Vec<f32> = (0..ic).map(|_| r()).collect();
+    let (packed, cb, _) = quantize_host(&w, oc, ic);
+    // CPU reference with the GPU's exact fp16 codebook values and fp16-rounded activations,
+    // accumulated in f32: y[o] = sum_i cb16[idx[o,i]*oc+o] * x16[i]. idx from packed (input-major).
+    let cb16: Vec<f32> = cb.iter().map(|&c| f16::from_f32(c).to_f32()).collect();
+    let x16: Vec<f32> = x.iter().map(|&v| f16::from_f32(v).to_f32()).collect();
+    let half = oc / 2;
+    let mut yref = vec![0f32; oc];
+    for o in 0..oc {
+        let (j, sh) = (o / 2, if o & 1 == 0 { 0 } else { 4 });
+        let mut acc = 0f32;
+        for i in 0..ic { let id = ((packed[i*half + j] >> sh) & 0xF) as usize; acc += cb16[id*oc + o] * x16[i]; }
+        yref[o] = acc;
+    }
+    let q = QuantLinear::new(&packed, &cb, ic, oc);
+    let dx = DevHalf::from_host(&x);
+    let mut y = DevF32::zeros(oc);
+    q.forward_into(&dx, &mut y);
+    let got = y.to_host();
+    let (mut worst, mut num, mut den) = (0f64, 0f64, 0f64);
+    for o in 0..oc {
+        let d = (got[o] - yref[o]) as f64;
+        worst = worst.max(d.abs() / (yref[o] as f64).abs().max(1e-3));
+        num += d*d; den += (yref[o] as f64)*(yref[o] as f64);
+    }
+    (worst, num.sqrt() / den.sqrt().max(1e-12))
+}
+
+/// Wall time per fused GEMV call (ms), best-of, under whatever `TRAPETUM_DETERMINISTIC` mode is
+/// active. Used to measure the two-stage (mode 2) overhead vs the atomic path (run twice with
+/// different env). Each timed call syncs so the GPU work is included.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn bench_gpu_gemv_ms(ic: usize, oc: usize, iters: usize) -> f64 {
+    assert_eq!(oc % 256, 0); assert_eq!(ic % 2, 0);
+    let mut s = 0xB0A7_u64.wrapping_mul(0x9E37_79B9);
+    let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+    let w: Vec<f32> = (0..oc*ic).map(|_| r()*0.5).collect();
+    let x: Vec<f32> = (0..ic).map(|_| r()).collect();
+    let (packed, cb, _) = quantize_host(&w, oc, ic);
+    let q = QuantLinear::new(&packed, &cb, ic, oc);
+    let dx = DevHalf::from_host(&x);
+    let mut y = DevF32::zeros(oc);
+    for _ in 0..5 { q.forward_into(&dx, &mut y); let _ = y.to_host(); }
+    let mut best = f64::MAX;
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        q.forward_into(&dx, &mut y);
+        let _ = y.to_host(); // drains (syncs) so GPU time is counted
+        best = best.min(t.elapsed().as_secs_f64() * 1e3);
+    }
+    best
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -2707,6 +2789,27 @@ struct QLoraQ {
     qa_normed: DevHalf,     // [q_lora_rank] scratch (normed, re-uploaded for q_b)
 }
 
+/// DeepSeek-V2 decoupled RoPE, INTERLEAVED convention: rotate each adjacent pair (2d, 2d+1)
+/// by angle `pos * inv_freq[d]`. This is provably equivalent -- for the Q.K score, the ONLY
+/// place the rope part is ever used -- to HF `apply_rotary_pos_emb` in
+/// `modeling_deepseek_reference.py`, which instead de-interleaves via `view(d/2,2).transpose`
+/// (evens -> first half, odds -> second half) and applies split-half `rotate_half` with
+/// `cos/sin = cat(freqs, freqs)`. Both produce the identical rotated pair
+/// `(x[2d]cos - x[2d+1]sin, x[2d+1]cos + x[2d]sin)`; HF merely stores the two components at
+/// positions `(d, d/2+d)` instead of `(2d, 2d+1)`, and the dot product is a reordering-
+/// invariant sum over those pairs, so `q.k` is identical. Verified against the literal HF
+/// math by `mla_tests::mla_rope_matches_hf` (the `check_mla_block` reference reuses this same
+/// interleaved rope and therefore CANNOT catch a convention bug -- that test is the guard).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub(crate) fn mla_rope_interleaved(v: &mut [f32], pos: usize, inv_freq: &[f32]) {
+    for d in 0..v.len()/2 {
+        let ang = pos as f32 * inv_freq[d];
+        let (c, s) = (ang.cos(), ang.sin());
+        let (x0, x1) = (v[2*d], v[2*d+1]);
+        v[2*d] = x0*c - x1*s; v[2*d+1] = x1*c + x0*s;
+    }
+}
+
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl MlaAttn {
     #[allow(clippy::too_many_arguments)]
@@ -2765,15 +2868,7 @@ impl MlaAttn {
     }
 
     fn rope(&self, v: &mut [f32], pos: usize) {
-        // DeepSeek-V2 uses INTERLEAVED RoPE (adjacent pairs 2i,2i+1), not Llama split-half:
-        // apply_rotary_pos_emb reshapes view(d/2,2).transpose before rotate_half, equivalent
-        // to rotating adjacent pairs (q.k is permutation-invariant, so rotate in place).
-        for d in 0..self.d_rope/2 {
-            let ang = pos as f32 * self.inv_freq[d];
-            let (c, s) = (ang.cos(), ang.sin());
-            let (x0, x1) = (v[2*d], v[2*d+1]);
-            v[2*d] = x0*c - x1*s; v[2*d+1] = x1*c + x0*s;
-        }
+        mla_rope_interleaved(v, pos, &self.inv_freq);
     }
 
     /// `h_normed` = RMSNorm(h). Returns the attention output (hidden,), to be residual-added.
@@ -3116,6 +3211,76 @@ pub fn check_mla_block() -> f64 {
     worst
 }
 
+#[cfg(all(test, any(feature = "cuda", feature = "metal")))]
+mod mla_tests {
+    #[test]
+    fn mla_block_math_correct() {
+        // The Rust MLA (interleaved rope + W_UK/W_UV absorption + softmax_scale used as-is)
+        // matches the full-reconstruction CPU reference. This is the proof that the block-0
+        // "Paris" divergence was NOT the MLA math but the EXPORT: it wrote rope_theta (~10000)
+        // into the softmax_scale header slot (correct ~0.11 = q_head_dim^-0.5 * mscale^2) and a
+        // PLAIN inv_freq instead of the yarn-corrected one -- both fixed in model/export_deepseek.py.
+        let e = super::check_mla_block();
+        assert!(e < 3e-2, "MLA block rel err {e:e} vs reference (fp16 synthetic ~1.6e-2 expected)");
+    }
+
+    #[test]
+    fn mla_rope_matches_hf() {
+        // Prove the production interleaved rope (`mla_rope_interleaved`) produces the SAME Q.K
+        // score as HF `apply_rotary_pos_emb` (modeling_deepseek_reference.py: de-interleave via
+        // view(m,2).transpose, then rotate_half with cos/sin = cat(freqs, freqs)). This is the
+        // check `check_mla_block` CANNOT make: its CPU reference reuses the interleaved rope, so
+        // a rope-convention bug would slip through byte-identical on both sides. Here the HF side
+        // is coded LITERALLY from the reference, independent of the Rust rope.
+        let m = 32usize; let d = 2 * m; // qk_rope_head_dim = 64
+        // A non-trivial (yarn-shaped) inv_freq; its exact values don't affect the equivalence.
+        let inv_freq: Vec<f32> = (0..m).map(|k| 10000f32.powf(-2.0 * k as f32 / d as f32)).collect();
+        // HF apply_rotary_pos_emb on one head vector at position `pos`.
+        let hf = |x: &[f32], pos: usize| -> Vec<f32> {
+            let mut p = vec![0f32; d];                       // view(m,2).transpose -> [evens | odds]
+            for k in 0..m { p[k] = x[2*k]; p[m+k] = x[2*k+1]; }
+            let mut y = vec![0f32; d];
+            for k in 0..m {                                  // cos/sin = cat(freqs,freqs); rotate_half
+                let a = pos as f32 * inv_freq[k]; let (c, s) = (a.cos(), a.sin());
+                y[k]   = p[k]   * c - p[m+k] * s;            // rotate_half puts -p[m+k] at index k
+                y[m+k] = p[m+k] * c + p[k]   * s;
+            }
+            y
+        };
+        // A DELIBERATELY WRONG convention: Llama split-half applied to the RAW interleaved layout
+        // (pair index i with i+m). Used only to prove the test has teeth (must NOT match HF).
+        let wrong = |x: &[f32], pos: usize| -> Vec<f32> {
+            let mut y = x.to_vec();
+            for k in 0..m {
+                let a = pos as f32 * inv_freq[k]; let (c, s) = (a.cos(), a.sin());
+                y[k]   = x[k]   * c - x[m+k] * s;
+                y[m+k] = x[m+k] * c + x[k]   * s;
+            }
+            y
+        };
+        let mut st = 0x1234_5678_9abc_def0u64;
+        let mut rnd = move || { st ^= st<<13; st ^= st>>7; st ^= st<<17; ((st>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+        let dot = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x,y)| x*y).sum() };
+        let (mut worst, mut worst_wrong) = (0f32, 0f32);
+        for _ in 0..128 {
+            let q: Vec<f32> = (0..d).map(|_| rnd()).collect();
+            let k: Vec<f32> = (0..d).map(|_| rnd()).collect();
+            let pq = (rnd().abs() * 40.0) as usize;
+            let pk = (rnd().abs() * 40.0) as usize;
+            let (mut qi, mut ki) = (q.clone(), k.clone());
+            super::mla_rope_interleaved(&mut qi, pq, &inv_freq);   // production path
+            super::mla_rope_interleaved(&mut ki, pk, &inv_freq);
+            let dh = dot(&hf(&q, pq), &hf(&k, pk));
+            let den = dh.abs().max(1.0);
+            worst = worst.max((dot(&qi, &ki) - dh).abs() / den);
+            worst_wrong = worst_wrong.max((dot(&wrong(&q, pq), &wrong(&k, pk)) - dh).abs() / den);
+        }
+        assert!(worst < 1e-5, "interleaved rope Q.K diverges from HF apply_rotary_pos_emb: rel {worst:e}");
+        assert!(worst_wrong > 1e-2, "negative control failed: the wrong (raw split-half) convention \
+                should NOT match HF, but rel err was only {worst_wrong:e} -- the test lacks teeth");
+    }
+}
+
 /// A full DeepSeek decoder layer: RMSNorm -> MLA attention -> residual, then a MoE block
 /// (which norms + residual-adds internally). Composes the validated MlaAttn + MoeBlock.
 /// (DeepSeek-V2/V3 use a dense MLP for the first `first_k_dense` layers; swap MoeBlock for
@@ -3154,6 +3319,17 @@ pub enum DsFfn { Dense(MlpBlock), Moe(MoeBlock), MoeOffload(MoeBlockOffload) }
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct DsLayer { attn_norm: DevF32, attn: MlaAttn, ffn: DsFfn }
 #[cfg(any(feature = "cuda", feature = "metal"))]
+impl DsFfn {
+    /// The FFN sub-block's RMSNorm weight (DeepSeek `post_attention_layernorm`) on the host.
+    fn norm_w_host(&self) -> Vec<f32> {
+        match self {
+            DsFfn::Dense(m) => m.norm_w.to_host(),
+            DsFfn::Moe(m) => m.norm_w.to_host(),
+            DsFfn::MoeOffload(m) => m.norm_w.to_host(),
+        }
+    }
+}
+
 impl DsLayer {
     fn forward(&mut self, h: &mut DevHalf, pos: usize) {
         let mut normed = DevHalf::zeros(h.n);
@@ -3164,6 +3340,35 @@ impl DsLayer {
             DsFfn::Moe(m) => m.forward(h),
             DsFfn::MoeOffload(m) => m.forward(h),
         }
+    }
+
+    /// Same as [`forward`], but emits intra-layer `[ldump]` sub-stages for a layer-by-layer diff
+    /// (see `DeepSeekModel::forward_dump` / `model/dump_layers_hf.py --split`): the two RMSNorm
+    /// WEIGHT checksums (`norm1_w`/`norm2_w`, to catch a wrong eps or wrong-loaded norm instantly),
+    /// the attention output BEFORE its residual (`attn_out`), the stream after the first residual
+    /// (`post_attn`), the FFN output before its residual (`ffn_out`, recovered as post_ffn-post_attn),
+    /// and the stream after the second residual (`post_ffn`). All on the given position's state.
+    fn forward_split_dump(&mut self, h: &mut DevHalf, pos: usize, li: usize) {
+        dump_hidden("norm1_w", li, &self.attn_norm.to_host());
+        dump_hidden("norm2_w", li, &self.ffn.norm_w_host());
+        let mut normed = DevHalf::zeros(h.n);
+        rmsnorm(h, &self.attn_norm, &mut normed, self.attn.eps);
+        {
+            let o = self.attn.forward(&normed, pos);
+            dump_hidden("attn_out", li, &o.to_host());
+            residual_add(h, o);
+        }
+        let post_attn = h.to_host();
+        dump_hidden("post_attn", li, &post_attn);
+        match &mut self.ffn {
+            DsFfn::Dense(m) => m.forward(h),
+            DsFfn::Moe(m) => m.forward(h),
+            DsFfn::MoeOffload(m) => m.forward(h),
+        }
+        let post_ffn = h.to_host();
+        let ffn_out: Vec<f32> = post_ffn.iter().zip(&post_attn).map(|(a, b)| a - b).collect();
+        dump_hidden("ffn_out", li, &ffn_out);
+        dump_hidden("post_ffn", li, &post_ffn);
     }
 }
 
@@ -3195,6 +3400,37 @@ impl DeepSeekModel {
         rmsnorm(&self.h, &self.final_norm, &mut self.normed, self.eps);
         self.lm_head.forward_into(&self.normed, &mut self.logits);
         self.logits.to_host()
+    }
+
+    /// Like [`forward`], but dumps per-layer hidden-state statistics (l2/absmax/mean) for a
+    /// layer-by-layer diff against an HF reference (see `model/dump_layers_hf.py`). Emits, on
+    /// stderr, one `[ldump]` line per stage: `embed` (post-embedding), `block` L=0..n-1 (after each
+    /// full decoder layer, post both residual adds), `final` (post final norm), and `logits`
+    /// (+ a `top5=` line). Call ONLY for the LAST prompt position (predicts token 1). Used only when
+    /// `deepseek_run` sees `TRAPETUM_LAYER_DEBUG=1`, so it costs nothing otherwise.
+    pub fn forward_dump(&mut self, token: usize, pos: usize) -> Vec<f32> {
+        // TRAPETUM_LAYER_DEBUG_SPLIT=<idx>: that layer also emits intra-layer sub-stages
+        // (norm1_w/norm2_w/attn_out/post_attn/ffn_out/post_ffn) to corner an in-layer divergence.
+        let split = std::env::var("TRAPETUM_LAYER_DEBUG_SPLIT").ok().and_then(|v| v.parse::<usize>().ok());
+        let row = &self.embedding[token*self.hidden..(token+1)*self.hidden];
+        self.h.upload(row);
+        dump_hidden("embed", 0, &self.h.to_host());
+        for i in 0..self.layers.len() {
+            if Some(i) == split {
+                self.layers[i].forward_split_dump(&mut self.h, pos, i);
+            } else {
+                self.layers[i].forward(&mut self.h, pos);
+            }
+            let hh = self.h.to_host();
+            dump_hidden("block", i, &hh);
+        }
+        rmsnorm(&self.h, &self.final_norm, &mut self.normed, self.eps);
+        dump_hidden("final", 0, &self.normed.to_host());
+        self.lm_head.forward_into(&self.normed, &mut self.logits);
+        let logits = self.logits.to_host();
+        dump_hidden("logits", 0, &logits);
+        dump_top5(&logits);
+        logits
     }
 
     /// Load a DeepSeek `.cbk` exported by `model/export_deepseek.py`: `CBKD` (V2-Lite style,

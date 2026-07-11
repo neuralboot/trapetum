@@ -19,7 +19,7 @@
 //! accumulates the decode in f32; only summation order differs from a naive matmul).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Barrier;
+use std::sync::{Barrier, Condvar, Mutex, OnceLock};
 use std::thread;
 
 /// Number of codebook entries (must match `crate::K`).
@@ -521,8 +521,158 @@ const CHUNK_C: usize = 256;
 /// drain three phases -- A (gate+up rows), B (SiLU+multiply per expert), C (down rows) -- each via
 /// one atomic counter, with a barrier between. The row-major kernel keeps `packed_t` streaming and
 /// the codebook table in registers.
+/// Shared state a set of workers cooperatively drains for one routed-experts call: the expert
+/// refs + activation, the fixed chunk decomposition, three phase counters, a barrier, and raw
+/// base pointers to the per-expert scratch (workers write DISJOINT rows). `Sync` because the only
+/// interior mutability is the atomics/barrier and the raw pointers write non-overlapping ranges.
+struct WorkstealCtx<'a> {
+    experts: &'a [RoutedExpert<'a>],
+    x: &'a [f32],
+    hidden: usize, inter: usize,
+    a_per: usize, c_per: usize, na: usize, nc: usize, k: usize,
+    ctr_a: AtomicUsize, ctr_b: AtomicUsize, ctr_c: AtomicUsize,
+    barrier: Barrier,
+    gp: RawF32, upp: RawF32, ap: RawF32, opp: RawF32,
+}
+unsafe impl Sync for WorkstealCtx<'_> {}
+
+/// One worker's contribution to a routed-experts call: drain phase A (gate+up row chunks),
+/// barrier, phase B (SiLU per expert), barrier, phase C (down row chunks). The chunk-to-row
+/// mapping is fixed, so which worker runs which chunk never affects any output row's value.
+fn worksteal_worker(c: &WorkstealCtx) {
+    loop {
+        let t = c.ctr_a.fetch_add(1, Ordering::Relaxed);
+        if t >= c.na { break; }
+        let (e, ci) = (t / c.a_per, t % c.a_per);
+        let (o0, o1) = (ci * CHUNK_A, ((ci + 1) * CHUNK_A).min(c.inter));
+        let ex = &c.experts[e];
+        unsafe {
+            gemv_rowmajor_range(ex.gp_t, ex.gc_t, c.hidden, c.x, c.gp.0.add(e * c.inter), o0, o1);
+            gemv_rowmajor_range(ex.up_t, ex.uc_t, c.hidden, c.x, c.upp.0.add(e * c.inter), o0, o1);
+        }
+    }
+    c.barrier.wait();
+    loop {
+        let t = c.ctr_b.fetch_add(1, Ordering::Relaxed);
+        if t >= c.k { break; }
+        unsafe {
+            for r in 0..c.inter {
+                let gg = *c.gp.0.add(t * c.inter + r);
+                let uu = *c.upp.0.add(t * c.inter + r);
+                *c.ap.0.add(t * c.inter + r) = silu(gg) * uu;
+            }
+        }
+    }
+    c.barrier.wait();
+    loop {
+        let t = c.ctr_c.fetch_add(1, Ordering::Relaxed);
+        if t >= c.nc { break; }
+        let (e, ci) = (t / c.c_per, t % c.c_per);
+        let (o0, o1) = (ci * CHUNK_C, ((ci + 1) * CHUNK_C).min(c.hidden));
+        let ex = &c.experts[e];
+        let act_e = unsafe { std::slice::from_raw_parts(c.ap.0.add(e * c.inter), c.inter) };
+        unsafe { gemv_rowmajor_range(ex.dp_t, ex.dc_t, c.inter, act_e, c.opp.0.add(e * c.hidden), o0, o1); }
+    }
+}
+
+// ============================================================================
+// Persistent worker pool: spawn TRAPETUM_CPU_THREADS workers ONCE for the process, parked on a
+// condvar between calls, so a MoE layer's routed work does NOT pay a thread::spawn per call
+// (~26 layers/token x spawn = the overhead this removes). A job is a type-erased `&dyn Fn()+Sync`
+// handed over under a generation counter; the submitter blocks until all workers finish, so the
+// borrowed job data (WorkstealCtx over stack locals) is valid for the whole broadcast.
+// ============================================================================
+
+/// Type-erased job pointer (a `&dyn Fn()+Sync` valid only while the submitter blocks in `run`).
+struct Job(*const (dyn Fn() + Sync));
+unsafe impl Send for Job {}
+
+struct PoolState { gen: u64, job: Option<Job>, done: usize }
+
+struct Pool {
+    n: usize,
+    st: Mutex<PoolState>,
+    cv_work: Condvar,
+    cv_done: Condvar,
+}
+
+impl Pool {
+    fn new(n: usize) -> &'static Pool {
+        let p: &'static Pool = Box::leak(Box::new(Pool {
+            n, st: Mutex::new(PoolState { gen: 0, job: None, done: 0 }), cv_work: Condvar::new(), cv_done: Condvar::new(),
+        }));
+        for _ in 0..n {
+            thread::spawn(move || {
+                let mut last_gen = 0u64;
+                loop {
+                    let jobptr = {
+                        let mut st = p.st.lock().unwrap();
+                        while st.gen == last_gen { st = p.cv_work.wait(st).unwrap(); }
+                        last_gen = st.gen;
+                        st.job.as_ref().map(|j| j.0).unwrap()
+                    };
+                    // Safety: the submitter holds the job alive until done == n (below), and only
+                    // touches it after that; workers only run it between the gen bump and their done++.
+                    unsafe { (*jobptr)(); }
+                    let mut st = p.st.lock().unwrap();
+                    st.done += 1;
+                    if st.done == p.n { p.cv_done.notify_one(); }
+                }
+            });
+        }
+        p
+    }
+    /// Run `f` on all `n` workers and block until every one has returned.
+    fn run(&self, f: &(dyn Fn() + Sync)) {
+        // Erase the borrow lifetime to store the job pointer. SOUND because this call blocks
+        // until done == n, so `f` outlives every worker's use of the stored pointer.
+        let raw: *const (dyn Fn() + Sync + 'static) =
+            unsafe { std::mem::transmute(f as *const (dyn Fn() + Sync)) };
+        let mut st = self.st.lock().unwrap();
+        st.job = Some(Job(raw));
+        st.done = 0;
+        st.gen = st.gen.wrapping_add(1);
+        self.cv_work.notify_all();
+        while st.done < self.n { st = self.cv_done.wait(st).unwrap(); }
+        st.job = None;
+    }
+}
+
+/// Global persistent pool, sized `TRAPETUM_CPU_THREADS` (default 8), created on first use.
+fn pool() -> &'static Pool {
+    static P: OnceLock<&'static Pool> = OnceLock::new();
+    P.get_or_init(|| Pool::new(cpu_threads().max(1)))
+}
+
+/// Compute the weighted MoE routed sum on the PERSISTENT pool (production path): no thread::spawn
+/// per call. All `pool().n` workers cooperatively drain the phases (idle ones just fall through the
+/// barriers). Bit-identical to [`routed_experts_worksteal_nt`] -- same chunk decomposition and
+/// fixed-order combine, so the pool vs scope choice never changes a byte of `acc_out`.
 pub fn routed_experts_worksteal(x: &[f32], experts: &[RoutedExpert], hidden: usize, inter: usize, acc_out: &mut [f32]) {
-    routed_experts_worksteal_nt(x, experts, hidden, inter, acc_out, cpu_threads());
+    let p = pool();
+    if p.n <= 1 { routed_experts_worksteal_nt(x, experts, hidden, inter, acc_out, 1); return; }
+    assert_eq!(x.len(), hidden, "routed input width");
+    assert!(acc_out.len() >= hidden, "routed output width");
+    let k = experts.len();
+    for v in acc_out.iter_mut().take(hidden) { *v = 0.0; }
+    if k == 0 { return; }
+    let mut g = vec![0f32; k * inter];
+    let mut u = vec![0f32; k * inter];
+    let mut act = vec![0f32; k * inter];
+    let mut out = vec![0f32; k * hidden];
+    let a_per = (inter + CHUNK_A - 1) / CHUNK_A;
+    let c_per = (hidden + CHUNK_C - 1) / CHUNK_C;
+    let ctx = WorkstealCtx {
+        experts, x, hidden, inter, a_per, c_per, na: k * a_per, nc: k * c_per, k,
+        ctr_a: AtomicUsize::new(0), ctr_b: AtomicUsize::new(0), ctr_c: AtomicUsize::new(0),
+        barrier: Barrier::new(p.n), // all pool workers participate in the barriers
+        gp: RawF32(g.as_mut_ptr()), upp: RawF32(u.as_mut_ptr()), ap: RawF32(act.as_mut_ptr()), opp: RawF32(out.as_mut_ptr()),
+    };
+    p.run(&|| worksteal_worker(&ctx));
+    for (e, ex) in experts.iter().enumerate() {
+        let (w, base) = (ex.weight, e * hidden);
+        for i in 0..hidden { acc_out[i] += w * out[base + i]; }
+    }
 }
 
 /// Thread-count-explicit variant of [`routed_experts_worksteal`] (the public one reads
@@ -570,62 +720,19 @@ pub fn routed_experts_worksteal_nt(x: &[f32], experts: &[RoutedExpert], hidden: 
         return;
     }
 
-    let (ctr_a, ctr_b, ctr_c) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
-    let barrier = Barrier::new(nthreads);
-    let (gp, upp, ap, opp) = (RawF32(g.as_mut_ptr()), RawF32(u.as_mut_ptr()), RawF32(act.as_mut_ptr()), RawF32(out.as_mut_ptr()));
-
-    // SPAWN-COST NOTE (named future lever). `thread::scope` spawns `nthreads` workers ONCE per
-    // call to this function -- i.e. once per MoE layer per token. V2-Lite has ~26 MoE layers, so
-    // at ~100 us/spawn-batch this is ~2.6 ms/token of pure spawn overhead. With the fast row
-    // kernel the routed compute is ~0.7 ms/layer, so the spawn can be ~3x the compute it wraps.
-    // We keep `thread::scope` here deliberately: it makes the non-'static job closures lifetime-
-    // safe with zero unsafe, and it already demonstrates the target kernel throughput. The
-    // upgrade -- a PERSISTENT parked thread pool (workers spawned once for the process, jobs
-    // handed over via a generation counter) -- removes this overhead and is the next lever if
-    // end-to-end tok/s on the pod comes up short. It trades this safety for unsafe lifetime
-    // management of the job closure, so it is a conscious, measured deferral, not an oversight.
+    // thread::scope spawns exactly `nthreads` workers for THIS call (used by the determinism
+    // harness with explicit counts; the production path uses the persistent `pool()` instead,
+    // which avoids the per-call spawn). Both drive the SAME `worksteal_worker`, so results match.
+    let ctx = WorkstealCtx {
+        experts, x, hidden, inter, a_per, c_per, na, nc, k,
+        ctr_a: AtomicUsize::new(0), ctr_b: AtomicUsize::new(0), ctr_c: AtomicUsize::new(0),
+        barrier: Barrier::new(nthreads),
+        gp: RawF32(g.as_mut_ptr()), upp: RawF32(u.as_mut_ptr()), ap: RawF32(act.as_mut_ptr()), opp: RawF32(out.as_mut_ptr()),
+    };
     thread::scope(|s| {
         for _ in 0..nthreads {
-            let (ctr_a, ctr_b, ctr_c, barrier) = (&ctr_a, &ctr_b, &ctr_c, &barrier);
-            let (experts, x, gp, upp, ap, opp) = (&experts, &x, &gp, &upp, &ap, &opp);
-            s.spawn(move || {
-                // Phase A: gate + up row chunks across all experts.
-                loop {
-                    let t = ctr_a.fetch_add(1, Ordering::Relaxed);
-                    if t >= na { break; }
-                    let (e, c) = (t / a_per, t % a_per);
-                    let (o0, o1) = (c * CHUNK_A, ((c + 1) * CHUNK_A).min(inter));
-                    let ex = &experts[e];
-                    unsafe {
-                        gemv_rowmajor_range(ex.gp_t, ex.gc_t, hidden, x, gp.0.add(e * inter), o0, o1);
-                        gemv_rowmajor_range(ex.up_t, ex.uc_t, hidden, x, upp.0.add(e * inter), o0, o1);
-                    }
-                }
-                barrier.wait();
-                // Phase B: SiLU(gate)*up -> act, one task per expert.
-                loop {
-                    let t = ctr_b.fetch_add(1, Ordering::Relaxed);
-                    if t >= k { break; }
-                    unsafe {
-                        for r in 0..inter {
-                            let gg = *gp.0.add(t * inter + r);
-                            let uu = *upp.0.add(t * inter + r);
-                            *ap.0.add(t * inter + r) = silu(gg) * uu;
-                        }
-                    }
-                }
-                barrier.wait();
-                // Phase C: down row chunks across all experts (input = act[e]).
-                loop {
-                    let t = ctr_c.fetch_add(1, Ordering::Relaxed);
-                    if t >= nc { break; }
-                    let (e, c) = (t / c_per, t % c_per);
-                    let (o0, o1) = (c * CHUNK_C, ((c + 1) * CHUNK_C).min(hidden));
-                    let ex = &experts[e];
-                    let act_e = unsafe { std::slice::from_raw_parts(ap.0.add(e * inter), inter) };
-                    unsafe { gemv_rowmajor_range(ex.dp_t, ex.dc_t, inter, act_e, opp.0.add(e * hidden), o0, o1); }
-                }
-            });
+            let ctx = &ctx;
+            s.spawn(move || worksteal_worker(ctx));
         }
     });
 
@@ -824,26 +931,113 @@ mod tests {
 
     #[test]
     fn moe_block_run_to_run_spread_probe() {
-        // DIAGNOSTIC: how much does ONE V2-Lite MoE block's output vary run-to-run under the
-        // default (atomic) GS? Judges whether per-layer nondeterminism can compound to a ~1-logit
-        // end-to-end shift across ~26 layers, or whether a systematic ~1-logit diff must be a bug.
+        // DIAGNOSTIC: run-to-run variation of ONE V2-Lite MoE block. The DEFAULT is now mode 2
+        // (deterministic) -> this reports 0. Set TRAPETUM_DETERMINISTIC=0 to select the atomic
+        // path and measure the per-layer noise (~1.95e-3, the S14 figure that showed atomic drift
+        // compounds across ~26 layers into a token-flipping ~1-logit end-to-end shift).
         let worst = crate::moe_forward_run_to_run_spread(10);
         eprintln!("[moe_block_spread] worst abs diff over 10 runs = {worst:e} (per MoE block; x26 layers rough upper bound = {:e})", worst * 26.0);
         let _ = worst;
     }
 
     #[test]
+    fn det_gemv_mode_report() {
+        // Reports determinism + correctness + timing for the fused GEMV under whatever
+        // TRAPETUM_DETERMINISTIC mode is set. Run three times to fill the before/after table:
+        //   (unset)                -> mode 0 (atomic, nondeterministic, fast)
+        //   TRAPETUM_DETERMINISTIC=1 -> grid.y=1 (deterministic, slow on small OC)
+        //   TRAPETUM_DETERMINISTIC=2 -> two-stage fixed-order (deterministic, keeps IC split)
+        let (ic, oc) = (8192usize, 512usize);
+        let mode = std::env::var("TRAPETUM_DETERMINISTIC").unwrap_or_else(|_| "0".into());
+        let (mism, worst_abs) = crate::check_gpu_gemv_determinism(ic, oc, 30);
+        let (worst_rel, l2) = crate::check_gpu_gemv_vs_fp16cb_ref(ic, oc);
+        let ms = crate::bench_gpu_gemv_ms(ic, oc, 50);
+        eprintln!("[det_gemv mode={mode}] determinism: {mism}/30 differ (worst_abs={worst_abs:e}); \
+                   vs fp16cb-ref: worst_rel={worst_rel:e} l2={l2:e}; time={ms:.4} ms/call (ic={ic} oc={oc})");
+        // Correctness holds in every mode (fp16 summation-order tolerance). Do NOT assert
+        // determinism here -- it depends on the env-set mode; that is asserted in the =2 CI run.
+        assert!(l2 < 5e-3, "GPU GEMV vs fp16-codebook reference l2={l2:e} too large");
+    }
+
+    #[test]
+    fn det_gemv_overhead_bench() {
+        // Overhead of the active TRAPETUM_DETERMINISTIC mode across realistic shapes. Run in
+        // RELEASE, once with env unset (mode 0) and once with =2, and diff the ms/call. Small OC
+        // is launch-dominated; big IC*OC shows the true two-stage memory overhead (~GS/IC).
+        let mode = std::env::var("TRAPETUM_DETERMINISTIC").unwrap_or_else(|_| "0".into());
+        for (ic, oc) in [(2048usize, 2048usize), (2048, 7168), (8192, 2048), (2048, 16384)] {
+            let ms = crate::bench_gpu_gemv_ms(ic, oc, 50);
+            eprintln!("[det_gemv_overhead mode={mode}] ic={ic} oc={oc} -> {ms:.4} ms/call");
+        }
+    }
+
+    #[test]
     fn gpu_gemv_determinism_probe() {
         // DIAGNOSTIC (not a pass/fail gate): does the fused GPU codebook GEMV return bitwise-
-        // identical output run-to-run? If not, the base runtime is nondeterministic (atomic
-        // grid.y reduction), which is the real explanation for the flag-off vs main greedy
-        // divergence -- the branch's memory-layout change merely resampled it. Large IC forces
-        // multiple grid.y slices. Prints; asserts only that it ran.
+        // identical output run-to-run? The DEFAULT is now mode 2 (two-stage fixed-order) -> this
+        // reports 0/30 (deterministic). Set TRAPETUM_DETERMINISTIC=0 to select the atomic path and
+        // observe the historical nondeterminism (30/30), the root cause the S14 campaign fixed.
         let (mism, worst) = crate::check_gpu_gemv_determinism(8192, 512, 30);
         eprintln!("[gpu_determinism_probe] ic=8192 oc=512 iters=30 -> {mism}/30 runs differ bitwise from run 0, worst_abs_diff={worst:e}");
         // No determinism assertion: whether atomics reorder is GPU/scheduler dependent. The
         // number is the evidence we report.
         let _ = (mism, worst);
+    }
+
+    // Build k routed experts with RANDOM row-major packed + transposed codebooks (fast; we test
+    // scheduling/timing, not decode accuracy). Returns (store, x) -- refs are built by the caller.
+    fn rand_experts(hidden: usize, inter: usize, k: usize, seed: u64)
+        -> (Vec<(Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>, f32)>, Vec<f32>) {
+        let mut r = Lcg(seed);
+        let x: Vec<f32> = (0..hidden).map(|_| r.f32()).collect();
+        let bytes = |n: usize, r: &mut Lcg| -> Vec<u8> { (0..n).map(|_| ((r.f32() * 0.5 + 0.5) * 255.0) as u8).collect() };
+        let cbk = |n: usize, r: &mut Lcg| -> Vec<f32> { (0..n).map(|_| r.f32() * 0.05).collect() };
+        let mut store = Vec::new();
+        for e in 0..k {
+            store.push((bytes(inter * (hidden / 2), &mut r), cbk(K * inter, &mut r),
+                        bytes(inter * (hidden / 2), &mut r), cbk(K * inter, &mut r),
+                        bytes(hidden * (inter / 2), &mut r), cbk(K * hidden, &mut r), 0.1 + 0.13 * e as f32));
+        }
+        (store, x)
+    }
+    fn refs<'a>(store: &'a [(Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>, f32)]) -> Vec<RoutedExpert<'a>> {
+        store.iter().map(|s| RoutedExpert { gp_t: &s.0, gc_t: &s.1, up_t: &s.2, uc_t: &s.3, dp_t: &s.4, dc_t: &s.5, weight: s.6 }).collect()
+    }
+
+    #[test]
+    fn pool_matches_scope() {
+        // The persistent-pool production path must be BIT-identical to the thread::scope path
+        // (same chunk decomposition + fixed-order combine). V2-Lite dims.
+        let (hidden, inter, k) = (2048usize, 1536usize, 6usize);
+        let (store, x) = rand_experts(hidden, inter, k, 0x9A55_0011);
+        let experts = refs(&store);
+        let mut a = vec![0f32; hidden];
+        let mut b = vec![0f32; hidden];
+        routed_experts_worksteal(&x, &experts, hidden, inter, &mut a);            // persistent pool
+        routed_experts_worksteal_nt(&x, &experts, hidden, inter, &mut b, cpu_threads()); // thread::scope
+        assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+                "pool result differs from scope result (should be bit-identical)");
+    }
+
+    #[test]
+    fn pool_vs_scope_overhead() {
+        // Per-call cost of the persistent pool vs a fresh thread::scope spawn. At V2-Lite dims the
+        // compute dominates; a TINY-dim run isolates the pure spawn/wake overhead (the lever).
+        for (hidden, inter, k, label) in [(2048usize, 1536usize, 6usize, "V2-Lite"), (256, 256, 2, "tiny")] {
+            let (store, x) = rand_experts(hidden, inter, k, 0x1122_3344 ^ hidden as u64);
+            let experts = refs(&store);
+            let mut acc = vec![0f32; hidden];
+            let nt = cpu_threads();
+            for _ in 0..5 { routed_experts_worksteal(&x, &experts, hidden, inter, &mut acc); routed_experts_worksteal_nt(&x, &experts, hidden, inter, &mut acc, nt); }
+            let iters = 200;
+            let t = std::time::Instant::now();
+            for _ in 0..iters { routed_experts_worksteal(&x, &experts, hidden, inter, &mut acc); }
+            let pool_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..iters { routed_experts_worksteal_nt(&x, &experts, hidden, inter, &mut acc, nt); }
+            let scope_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            eprintln!("[pool_vs_scope {label}] hidden={hidden} inter={inter} k={k} threads={nt}: pool={pool_us:.1} us/call  scope={scope_us:.1} us/call  saved={:.1} us", scope_us - pool_us);
+        }
     }
 
     #[test]
