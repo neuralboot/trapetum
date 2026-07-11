@@ -39,6 +39,10 @@ def mla_scale_and_inv_freq(c, q_head_dim, rope_dim, rope_theta):
     softmax_scale slot (~10000 vs ~0.11) and a PLAIN inv_freq -- the block-0 attention bug the
     layer bisect found. NOTE: assumes the rope cos/sin _mscale == 1 (i.e. config mscale ==
     mscale_all_dim, true for V2-Lite/V3); asserted below, since the runtime bakes only inv_freq."""
+    # the runtime writes only projection weights: a model with attention biases
+    # would silently lose them (q_a/kv_a/o_proj use bias=config.attention_bias)
+    assert not getattr(c, "attention_bias", False), \
+        "attention_bias=True is not representable by the runtime export"
     softmax_scale = q_head_dim ** (-0.5)
     inv_freq = 1.0 / (rope_theta ** (torch.arange(0, rope_dim, 2).float() / rope_dim))  # plain default
     rs = getattr(c, "rope_scaling", None)
