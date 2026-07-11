@@ -147,3 +147,29 @@ in host RAM. This reframes the "x100 on a consumer box" goal: fitting the model 
 is necessary but not sufficient; the expert-to-GPU transfer is the next wall. Raw log:
 runpod_logs/r1_671b_4bit_ram_resident.log. Caveat: A10G is a weak GPU; a 4090/A100 host
 with RAM residency would be somewhat faster, but the host->device transfer wall stands.
+
+## CPU probes S12/S13-M/S15: the inversion is measured (M4, 2026-07-11)
+
+The K=16 codebook decode is one NEON `tbl` (x86: `pshufb`) per 32 weights, so a
+CPU expert path is memory-bound, never decode-bound. Three probes, see
+`bench/cpu_probes/`:
+
+- S12 micro-kernel (fused tbl decode + SDOT GEMV): 53.1 GB/s packed at 8 threads,
+  linear scaling (6.6 at 1T, 26.3 at 4T).
+- S13-M full expert (gate+up+SiLU+int8 requant+down, per-row scales, 58 layers x
+  8 random experts, work-stealing, barriers): 47.0 GB/s sustained, 217 ms/token
+  expert-side = 4.6 tok/s. Full-structure overhead vs micro-kernel: 11.5%.
+- S15 complete 671B decode token (MLA attention real dims + 4K KV + router +
+  dense + shared + routed + lm_head = 18.46 GB/token): 361 ms/token = 2.77 tok/s
+  FULL MODEL pure CPU on an entry-level laptop chip, 51.1 GB/s = 96% of the
+  micro-kernel. Component ms: MoE 187.5, attention 138.5, dense 15.1, KV 11.5,
+  lm_head 8.7.
+
+Reference points: our 4090+NVMe system does 0.24 tok/s and RAM-resident 0.33.
+Pure-CPU M4 full-pipeline is x11.5 the 4090 offload path, losslessly (same
+artifact, same arithmetic). Residual-overlap accounting: MoE output is a
+commutative sum (shared expert + routed), so on a discrete-GPU host the
+non-routed terms (173.8 ms on CPU here) are VRAM-resident (~9 ms) and run
+concurrently -> t_token ~ t_routed + eps. Projections (50% derate): desktop
+DDR5 ~8-10 tok/s, EPYC 12ch ~22, M3 Ultra 512GB ~15-25 end-to-end lossless.
+Next: S14 = hybrid path in the Rust runtime on V2-Lite (tok/s + greedy match).
