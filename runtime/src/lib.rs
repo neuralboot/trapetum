@@ -3357,6 +3357,23 @@ mod mla_tests {
     }
 
     #[test]
+    fn mixed_precision_prec_flags_contract() {
+        // Lock the S19 mixed-precision format contract the loader and export_deepseek.py share.
+        assert_eq!(super::PREC_SHARED_K256, 1); assert_eq!(super::PREC_LMHEAD_K256, 2);
+        // role_k promotes exactly the roles whose bit is set; everything else stays K=16.
+        assert_eq!(super::role_k(0, super::PREC_LMHEAD_K256), 16, "no flags -> all K16 (backward compat)");
+        assert_eq!(super::role_k(super::PREC_LMHEAD_K256, super::PREC_LMHEAD_K256), 256);
+        assert_eq!(super::role_k(super::PREC_LMHEAD_K256, super::PREC_SHARED_K256), 16, "unset bit stays K16");
+        // lm_head packed-byte size the loader reads must match the export: K16 = hidden*(vocab/2)
+        // nibble bytes, K256 = hidden*vocab uint8 indices; codebook = k*vocab f32 in both.
+        let (hidden, vocab) = (2048usize, 102400usize); // V2-Lite
+        for (k, want_packed, want_cb) in [(16usize, hidden*(vocab/2), 16*vocab), (256, hidden*vocab, 256*vocab)] {
+            let packed = if k == 256 { hidden*vocab } else { hidden*(vocab/2) };
+            assert_eq!(packed, want_packed); assert_eq!(k*vocab, want_cb);
+        }
+    }
+
+    #[test]
     fn mla_rope_matches_hf() {
         // Prove the production interleaved rope (`mla_rope_interleaved`) produces the SAME Q.K
         // score as HF `apply_rotary_pos_emb` (modeling_deepseek_reference.py: de-interleave via
@@ -3520,6 +3537,18 @@ pub struct DeepSeekModel {
     eps: f32,
 }
 
+// Mixed-precision (S19) header `prec_flags` bits. A mixed file uses a bumped magic (CBKE for the
+// CBKD family, CBKS for the CBKR family) and writes ONE extra i32 -- this bitmask -- right after the
+// base header. Old magics (CBKD/CBKR/CBKV) carry no such field and load as all-K16 (prec_flags=0),
+// so every existing artifact is byte-for-byte backward compatible. Each set bit promotes a tensor
+// ROLE from 4-bit (K=16) to 8-bit (K=256), driven by the S18 spectral finding (lm_head is the worst
+// per-layer aggregate; shared experts are 13/15 of the worst-damaged tensors). Reserved bits stay 0.
+const PREC_SHARED_K256: u32 = 1 << 0; // shared-expert gate/up/down at K=256 (wired in increment 3)
+const PREC_LMHEAD_K256: u32 = 1 << 1; // lm_head at K=256
+/// K for a tensor role given the mixed-precision flags: 256 if its bit is set, else 16.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn role_k(prec: u32, bit: u32) -> usize { if prec & bit != 0 { 256 } else { 16 } }
+
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl DeepSeekModel {
     pub fn vocab(&self) -> usize { self.vocab }
@@ -3575,13 +3604,20 @@ impl DeepSeekModel {
         // artifacts). CBKV = 19-i32 header with a trailing `experts_avq` field (0/2/3) for
         // additive-codebook routed experts. Old scalar files keep the CBKR magic and load
         // unchanged; only avq exports use CBKV.
-        if &magic == b"CBKR" { return Self::load_deepseek_qlora(path, r, max_seq, false); }
-        if &magic == b"CBKV" { return Self::load_deepseek_qlora(path, r, max_seq, true); }
-        assert_eq!(&magic, b"CBKD", "not a DeepSeek .cbk (expected CBKD, CBKR or CBKV)");
+        if &magic == b"CBKR" { return Self::load_deepseek_qlora(path, r, max_seq, false, false); }
+        if &magic == b"CBKV" { return Self::load_deepseek_qlora(path, r, max_seq, true, false); }
+        if &magic == b"CBKS" { return Self::load_deepseek_qlora(path, r, max_seq, false, true); } // mixed CBKR
+        // CBKD = all-K16 (14-i32 header). CBKE = mixed-precision CBKD (S19): same header + one
+        // trailing prec_flags i32 promoting lm_head/shared to K=256 (see PREC_* bits).
+        let mixed = &magic == b"CBKE";
+        assert!(&magic == b"CBKD" || mixed, "not a DeepSeek .cbk (expected CBKD, CBKE, CBKR, CBKS or CBKV)");
         let cfg: Vec<usize> = (0..14).map(|_| rd_i32(&mut r) as usize).collect();
         let (n_layers, hidden, n_heads, kv_lora, nope, rope, vhd, inter_dense, moe_inter,
              n_routed, n_shared, top_k, vocab, first_k_dense) =
             (cfg[0],cfg[1],cfg[2],cfg[3],cfg[4],cfg[5],cfg[6],cfg[7],cfg[8],cfg[9],cfg[10],cfg[11],cfg[12],cfg[13]);
+        // prec_flags i32 follows the base header ONLY for the mixed magic (CBKE); CBKD has none.
+        let prec: u32 = if mixed { rd_i32(&mut r) as u32 } else { 0 };
+        assert!(prec & PREC_SHARED_K256 == 0, "shared-expert K256 not wired yet (increment 3); prec_flags={prec:#x}");
         let eps = rd_f32(&mut r); let softmax_scale = rd_f32(&mut r); let rscale = rd_f32(&mut r);
         let inv_freq = rd_f32_vec(&mut r, rope/2);
         let embedding = rd_f16_vec(&mut r, vocab*hidden);
@@ -3623,11 +3659,13 @@ impl DeepSeekModel {
             eprintln!("  loaded layer {}/{}", li+1, n_layers);
         }
         let final_norm = rd_f32_vec(&mut r, hidden);
-        let (lp, lc) = (rd_u8_vec(&mut r, hidden*(vocab/2)), rd_f32_vec(&mut r, K*vocab));
+        let lmk = role_k(prec, PREC_LMHEAD_K256);
+        let lp = rd_u8_vec(&mut r, if lmk == 256 { hidden*vocab } else { hidden*(vocab/2) });
+        let lc = rd_f32_vec(&mut r, lmk*vocab);
         Ok(DeepSeekModel {
             embedding, layers,
             final_norm: DevF32::from_host(&final_norm),
-            lm_head: QuantLinear::new(&lp, &lc, hidden, vocab),
+            lm_head: QuantLinear::new_k(&lp, &lc, hidden, vocab, lmk),
             h: DevHalf::zeros(hidden), normed: DevHalf::zeros(hidden), logits: DevF32::zeros(vocab),
             hidden, vocab, eps,
         })
@@ -3641,7 +3679,7 @@ impl DeepSeekModel {
     /// o (4-bit), post_norm, then the dense-or-MoE FFN (MoE layers read `e_score_bias`
     /// BEFORE the router). Routed experts are NOT uploaded to the GPU here — they stay in
     /// host `ExpertHost`s and stream through `MoeBlockOffload` (the memory wall at 671B).
-    fn load_deepseek_qlora(path: &str, mut r: BufReader<File>, max_seq: usize, avq_header: bool) -> std::io::Result<DeepSeekModel> {
+    fn load_deepseek_qlora(path: &str, mut r: BufReader<File>, max_seq: usize, avq_header: bool, mixed: bool) -> std::io::Result<DeepSeekModel> {
         // mmap the whole file once: the routed experts' packed indices (the ~300GB bulk at
         // 671B) are handed to ExpertHost as zero-copy byte ranges into this, instead of being
         // read into owned Vecs -- the OS pages them in from disk on demand (and can evict
@@ -3659,6 +3697,9 @@ impl DeepSeekModel {
             (cfg[0],cfg[1],cfg[2],cfg[3],cfg[4],cfg[5],cfg[6],cfg[7],cfg[8],cfg[9],cfg[10],cfg[11],cfg[12],cfg[13],cfg[14],cfg[15],cfg[16],cfg[17]);
         let experts_avq = if avq_header { cfg[18] } else { 0 };
         assert!(experts_avq == 0 || experts_avq == 2 || experts_avq == 3, "experts_avq must be 0, 2 or 3");
+        // Mixed-precision prec_flags i32 follows the base header for the CBKS magic (mixed CBKR).
+        let prec: u32 = if mixed { rd_i32(&mut r) as u32 } else { 0 };
+        assert!(prec & PREC_SHARED_K256 == 0, "shared-expert K256 not wired yet (increment 3); prec_flags={prec:#x}");
         let eps = rd_f32(&mut r); let softmax_scale = rd_f32(&mut r); let rscale = rd_f32(&mut r);
         let inv_freq = rd_f32_vec(&mut r, rope/2);
         let embedding = rd_f16_vec(&mut r, vocab*hidden);
@@ -3720,11 +3761,13 @@ impl DeepSeekModel {
             eprintln!("  loaded layer {}/{} (q_lora)", li+1, n_layers);
         }
         let final_norm = rd_f32_vec(&mut r, hidden);
-        let (lp, lc) = (rd_u8_vec(&mut r, hidden*(vocab/2)), rd_f32_vec(&mut r, K*vocab));
+        let lmk = role_k(prec, PREC_LMHEAD_K256);
+        let lp = rd_u8_vec(&mut r, if lmk == 256 { hidden*vocab } else { hidden*(vocab/2) });
+        let lc = rd_f32_vec(&mut r, lmk*vocab);
         Ok(DeepSeekModel {
             embedding, layers,
             final_norm: DevF32::from_host(&final_norm),
-            lm_head: QuantLinear::new(&lp, &lc, hidden, vocab),
+            lm_head: QuantLinear::new_k(&lp, &lc, hidden, vocab, lmk),
             h: DevHalf::zeros(hidden), normed: DevHalf::zeros(hidden), logits: DevF32::zeros(vocab),
             hidden, vocab, eps,
         })
