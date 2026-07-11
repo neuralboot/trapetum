@@ -120,6 +120,7 @@ group 8), everything else untouched:
 - fast quantizer (beam 1):        PPL 8.6954  (+27.4%)
 - paper quantizer (beam 4, LSQ3): PPL 8.2608  (+21.1%)
 - dynamic mix (first 2 MoE layers spared, beam 4): PPL 8.1320 (+19.2%)
+- paper quantizer 3-bit (M=3, beam 4, LSQ3): PPL 7.1755 (**+5.2%**, near-lossless), 228 GB artifact
 Continuations stay coherent but flatten. Expert compression 7.75x vs fp16;
 projected 671B artifact with 2-bit experts: 152 GB (fits 192 GB RAM, the
 RAM-resident x100 path). Open question: the real 671B has 256 experts/layer
