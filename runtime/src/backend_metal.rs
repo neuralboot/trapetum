@@ -46,6 +46,11 @@ struct Ctx {
     // SINGLE command buffer, the Metal equivalent of the CUDA-graph lesson that
     // turns a per-op kernel win into an end-to-end one.
     cur: Mutex<Option<CommandBuffer>>,
+    // A command buffer committed by `dev_flush` but not yet waited on: it runs on the
+    // GPU while the host does other work (the CPU-experts overlap). `dev_wait`/`drain`
+    // join it. Because the queue is in-order, a `pending` buffer always completes before
+    // any later-committed `cur`.
+    pending: Mutex<Option<CommandBuffer>>,
     // Reusable device argmax scratch (partial max/idx arrays + 1 output u32), sized
     // for the max partial count (ARGMAX_NTG_MAX). Allocated once, reused every token
     // so the greedy path never mallocs per call.
@@ -70,7 +75,7 @@ fn ctx() -> &'static Ctx {
                 .expect("pipeline creation failed");
             pl.insert(*name, p);
         }
-        Ctx { _device: device, queue, pl, cur: Mutex::new(None), argmax_scratch: Mutex::new(None) }
+        Ctx { _device: device, queue, pl, cur: Mutex::new(None), pending: Mutex::new(None), argmax_scratch: Mutex::new(None) }
     })
 }
 
@@ -88,8 +93,33 @@ fn cur_cb() -> CommandBuffer {
 }
 
 fn drain() {
+    // Join any flushed-but-not-waited buffer first (it was committed earlier, so on the
+    // in-order queue it completes before `cur`), then commit + wait the open buffer.
+    if let Some(cb) = ctx().pending.lock().unwrap().take() {
+        cb.wait_until_completed();
+    }
     if let Some(cb) = ctx().cur.lock().unwrap().take() {
         cb.commit();
+        cb.wait_until_completed();
+    }
+}
+
+/// Commit the current command buffer WITHOUT waiting, so its GPU work overlaps host-side
+/// work (e.g. the CPU-experts routed FFNs). Join it later with [`dev_wait`] (or any
+/// host read-back / [`dev_sync`], which drain through `pending`). Assumes no other buffer
+/// is already pending -- callers pair one `dev_flush` with one `dev_wait`.
+pub unsafe fn dev_flush() {
+    if let Some(cb) = ctx().cur.lock().unwrap().take() {
+        cb.commit();
+        // A previous un-joined pending would be lost here; the CPU-experts path always
+        // waits before flushing again, so overwrite is not expected.
+        *ctx().pending.lock().unwrap() = Some(cb);
+    }
+}
+
+/// Wait for the buffer committed by [`dev_flush`] to finish. No-op if nothing is pending.
+pub unsafe fn dev_wait() {
+    if let Some(cb) = ctx().pending.lock().unwrap().take() {
         cb.wait_until_completed();
     }
 }

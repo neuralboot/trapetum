@@ -1690,6 +1690,14 @@ pub struct MoeBlock {
     n_group: usize,
     topk_group: usize,
     sigmoid: bool,
+    // CPU-experts mode only: overlap the GPU shared expert with the CPU routed experts
+    // (Metal). Default true; the micro-bench flips it to measure sequential vs overlapped.
+    overlap_shared: bool,
+    // Last routed_cpu component timings (ms), for the micro-bench. In sequential mode these
+    // are the isolated CPU-routed and GPU-shared costs; in overlapped mode shared is the
+    // residual wait after the CPU finished.
+    last_cpu_ms: f64,
+    last_shared_ms: f64,
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -1750,8 +1758,13 @@ impl MoeBlock {
             g_sh: DevF32::zeros(shared_inter.max(1)), u_sh: DevF32::zeros(shared_inter.max(1)),
             act_sh: DevHalf::zeros(shared_inter.max(1)),
             score_bias: None, n_group: 0, topk_group: 0, sigmoid: false,
+            overlap_shared: true, last_cpu_ms: 0.0, last_shared_ms: 0.0,
         }
     }
+
+    /// Enable/disable overlapping the GPU shared expert with the CPU routed experts
+    /// (CPU-experts mode, Metal). Used by the micro-bench to compare sequential vs overlapped.
+    pub fn set_overlap_shared(&mut self, on: bool) { self.overlap_shared = on; }
 
     /// Switch this block's router to DeepSeek-V3's sigmoid+bias grouped top-k ("noaux_tc"):
     /// `score_bias` is the learned `e_score_correction_bias` (length `n_experts`), experts
@@ -1799,8 +1812,11 @@ impl MoeBlock {
         saxpy(acc, &self.ey, w);
     }
 
-    fn run_shared(&mut self, acc: &mut DevF32) {
-        // shared expert uses its own (larger) scratch (shared_inter)
+    /// Encode the shared expert's GPU work (gate/up/SiLU/down) so its output lands in
+    /// `self.ey`. Does NOT drain or accumulate -- the caller either `saxpy`s it into an
+    /// accumulator (`run_shared`) or commits it without waiting to overlap the CPU routed
+    /// experts (`routed_cpu`). Uses the shared expert's larger `shared_inter` scratch.
+    fn encode_shared_into_ey(&mut self) {
         let ex = self.shared.as_ref().unwrap();
         let (g_ptr, u_ptr, d_ptr) = (ex.gate.handle, ex.up.handle, ex.down.handle);
         unsafe {
@@ -1809,6 +1825,10 @@ impl MoeBlock {
         }
         silu_mul(&self.g_sh, &self.u_sh, &mut self.act_sh);
         unsafe { qlinear_forward_dev(d_ptr, self.act_sh.ptr, self.ey.ptr); }
+    }
+
+    fn run_shared(&mut self, acc: &mut DevF32) {
+        self.encode_shared_into_ey();
         saxpy(acc, &self.ey, 1.0);
     }
 
@@ -1818,40 +1838,90 @@ impl MoeBlock {
         self.router.forward_into(&self.norm, &mut self.rlogits);
         let rl = self.rlogits.to_host();
         let picks = self.route(&rl);
-        let mut acc = if self.cpu_experts.is_some() {
-            self.routed_cpu(&picks)
+        if self.cpu_experts.is_some() {
+            // CPU-experts mode: routed_cpu owns both the routed (CPU) and the shared (GPU)
+            // contribution, overlapping them; it returns routed+shared already combined.
+            let acc = self.routed_cpu(&picks);
+            residual_add(h, &acc);
         } else {
             let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
             for (e, w) in picks { self.ffn(e, &mut acc, w); }
-            acc
-        };
-        if self.shared.is_some() { self.run_shared(&mut acc); }
-        residual_add(h, &acc);
+            if self.shared.is_some() { self.run_shared(&mut acc); }
+            residual_add(h, &acc);
+        }
     }
 
     /// CPU-experts hybrid (`TRAPETUM_CPU_EXPERTS=1`): run the top-k routed experts on the CPU
-    /// over the fp16-rounded normed activation, accumulate `sum_e w_e * expert_e(x)`, and
-    /// return it as a device buffer so the shared expert + residual proceed on the GPU as
-    /// usual. `TRAPETUM_CPU_EXPERTS_TIMING=1` prints the wall time of this section.
+    /// while the shared expert runs on the GPU, then combine `routed + shared`. The MoE
+    /// output is a commutative sum, so the two are independent: on Metal we commit the
+    /// shared-expert GPU work with `dev_flush` (no wait) and run the routed experts on CPU
+    /// threads concurrently, joining with `dev_wait` before the combine. Returns the
+    /// combined accumulator (routed + shared). `TRAPETUM_CPU_EXPERTS_TIMING=1` prints the
+    /// three timings (routed CPU, shared GPU wait-residual, and overlapped/sequential mode).
     fn routed_cpu(&mut self, picks: &[(usize, f32)]) -> DevF32 {
-        let t0 = std::time::Instant::now();
         // The GPU experts consume fp16 activations; mirror that by reading the fp16 `norm`
         // back to host (already rounded) so the CPU result tracks the GPU path's input.
+        // Read it BEFORE flushing the shared work, so this drain doesn't wait on the GPU.
         let x = self.norm.to_host();
-        let cpu = self.cpu_experts.as_ref().expect("routed_cpu without cpu_experts");
+
+        // Kick the shared expert onto the GPU concurrently (Metal only; CUDA stays
+        // sequential -- see the else branch below).
+        let overlapped;
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        {
+            overlapped = self.shared.is_some() && self.overlap_shared;
+            if overlapped {
+                self.encode_shared_into_ey();
+                unsafe { dev_flush(); } // commit, no wait: GPU runs shared while CPU runs routed
+            }
+        }
+        #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+        { overlapped = false; }
+
+        // Routed experts on CPU threads (concurrent with the shared GPU work when overlapped).
+        let t_cpu = std::time::Instant::now();
         let mut acc_host = vec![0f32; self.hidden];
         let mut y = vec![0f32; self.hidden];
         for &(e, w) in picks {
-            let ce = &cpu[e];
+            let ce = &self.cpu_experts.as_ref().expect("routed_cpu without cpu_experts")[e];
             cpu_experts::expert_forward_cpu(&x, &ce.gp, &ce.gc, &ce.up, &ce.uc, &ce.dp, &ce.dc,
                                             self.hidden, self.inter, &mut y);
             for i in 0..self.hidden { acc_host[i] += w * y[i]; }
         }
+        let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1e3;
+
+        // Combine routed + shared.
+        let mut shared_ms = 0f64;
+        let acc = if overlapped {
+            // Join the shared GPU work (residual time after the CPU finished), then add it.
+            let tw = std::time::Instant::now();
+            #[cfg(all(feature = "metal", not(feature = "cuda")))]
+            unsafe { dev_wait(); }
+            shared_ms = tw.elapsed().as_secs_f64() * 1e3;
+            let mut acc = DevF32::from_host(&acc_host);
+            if self.shared.is_some() { saxpy(&mut acc, &self.ey, 1.0); } // shared already in self.ey
+            acc
+        } else {
+            // Sequential: routed uploaded, then shared runs on the GPU after it.
+            let mut acc = DevF32::from_host(&acc_host);
+            if self.shared.is_some() {
+                let ts = std::time::Instant::now();
+                self.run_shared(&mut acc);
+                unsafe { dev_sync(); } // force completion so the measured shared time is real
+                shared_ms = ts.elapsed().as_secs_f64() * 1e3;
+            }
+            acc
+        };
+
+        self.last_cpu_ms = cpu_ms;
+        self.last_shared_ms = shared_ms;
         if std::env::var("TRAPETUM_CPU_EXPERTS_TIMING").map(|v| v == "1").unwrap_or(false) {
-            eprintln!("[cpu_experts] {} experts x (hidden={}, inter={}) in {:.3} ms",
-                      picks.len(), self.hidden, self.inter, t0.elapsed().as_secs_f64() * 1e3);
+            eprintln!("[cpu_experts] routed_cpu={cpu_ms:.3} ms  shared_gpu={shared_ms:.3} ms  \
+                       ({} experts, hidden={}, inter={}, {})",
+                      picks.len(), self.hidden, self.inter,
+                      if overlapped { "overlapped" } else { "sequential" });
         }
-        DevF32::from_host(&acc_host)
+        acc
     }
 }
 
@@ -1960,6 +2030,105 @@ pub fn check_moe_cpu_experts() -> (f64, f64, f64) {
     (worst, l2, cpu_ms)
 }
 
+/// Build a CPU-experts MoE (with a shared expert) and run one token through it twice from
+/// the SAME input: once with the shared expert overlapped onto the GPU (`overlap_shared=on`)
+/// and once sequential. The two must agree -- overlap only reschedules the commutative sum,
+/// it changes no arithmetic. Returns the worst rel err (expected ~0). Also the correctness
+/// guard for the concurrency mechanism (dev_flush/dev_wait ordering).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn check_moe_cpu_overlap() -> f64 {
+    let (hidden, inter, n_experts, top_k) = (256usize, 256usize, 64usize, 6usize);
+    let eps = 1e-5f32;
+    let mut s = 0x51DE_0FF5u64;
+    let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+    let packed = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<u8> { (0..n).map(|_| ((r()*0.5+0.5)*255.0) as u8).collect() };
+    let cbk = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<f32> { (0..n).map(|_| r()*0.05).collect() };
+    let nw: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
+    let rw: Vec<f32> = (0..n_experts*hidden).map(|_| r()*0.05).collect();
+    let mut estore: Vec<(Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>)> = Vec::new();
+    for _ in 0..n_experts {
+        estore.push((packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+                     packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+                     packed(inter*(hidden/2),&mut r), cbk(K*hidden,&mut r)));
+    }
+    let experts: Vec<_> = estore.iter().map(|e| (e.0.as_slice(),e.1.as_slice(),e.2.as_slice(),e.3.as_slice(),e.4.as_slice(),e.5.as_slice())).collect();
+    let sh = (packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+              packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+              packed(inter*(hidden/2),&mut r), cbk(K*hidden,&mut r));
+    let shared = Some((sh.0.as_slice(),sh.1.as_slice(),sh.2.as_slice(),sh.3.as_slice(),sh.4.as_slice(),sh.5.as_slice()));
+    let mut moe = MoeBlock::new_mode(hidden, inter, n_experts, top_k, eps, &nw, &rw, experts, shared, inter, 1.0, true);
+    let h0: Vec<f32> = (0..hidden).map(|_| r()*0.3).collect();
+    moe.set_overlap_shared(false);
+    let mut hs = DevHalf::from_host(&h0); moe.forward(&mut hs); let seq = hs.to_host();
+    moe.set_overlap_shared(true);
+    let mut ho = DevHalf::from_host(&h0); moe.forward(&mut ho); let ov = ho.to_host();
+    let mut worst = 0f64;
+    for i in 0..hidden { worst = worst.max(((seq[i]-ov[i]) as f64).abs() / (seq[i] as f64).abs().max(1e-3)); }
+    eprintln!("[check_moe_cpu_overlap] overlapped vs sequential worst_rel={worst:.3e}");
+    worst
+}
+
+/// Micro-bench the CPU-experts hybrid at a meaningful size (default: V2-Lite dims). Builds a
+/// CPU-experts MoE with a GPU shared expert and reports four numbers: the isolated CPU-routed
+/// cost, the isolated GPU-shared cost, the sequential total, and the overlapped total. Overlap
+/// works iff overlapped_total ~ max(cpu, shared) rather than their sum. Returns
+/// `(cpu_ms, shared_ms, sequential_ms, overlapped_ms)` (best of `passes`).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn bench_moe_cpu_experts(hidden: usize, inter: usize, n_experts: usize, top_k: usize,
+                             shared_inter: usize, passes: usize) -> (f64, f64, f64, f64) {
+    assert_eq!(hidden % 256, 0, "hidden must be %256 (shared expert is on the GPU)");
+    assert_eq!(shared_inter % 256, 0, "shared_inter must be %256 (GPU QuantLinear tiling)");
+    let eps = 1e-5f32;
+    let mut s = 0x0B16_5EEDu64;
+    let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+    let packed = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<u8> { (0..n).map(|_| ((r()*0.5+0.5)*255.0) as u8).collect() };
+    let cbk = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<f32> { (0..n).map(|_| r()*0.05).collect() };
+    let nw: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
+    let rw: Vec<f32> = (0..n_experts*hidden).map(|_| r()*0.05).collect();
+    let mut estore: Vec<(Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>)> = Vec::new();
+    for _ in 0..n_experts {
+        estore.push((packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+                     packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+                     packed(inter*(hidden/2),&mut r), cbk(K*hidden,&mut r)));
+    }
+    let experts: Vec<_> = estore.iter().map(|e| (e.0.as_slice(),e.1.as_slice(),e.2.as_slice(),e.3.as_slice(),e.4.as_slice(),e.5.as_slice())).collect();
+    let sh = (packed(hidden*(shared_inter/2),&mut r), cbk(K*shared_inter,&mut r),
+              packed(hidden*(shared_inter/2),&mut r), cbk(K*shared_inter,&mut r),
+              packed(shared_inter*(hidden/2),&mut r), cbk(K*hidden,&mut r));
+    let shared = Some((sh.0.as_slice(),sh.1.as_slice(),sh.2.as_slice(),sh.3.as_slice(),sh.4.as_slice(),sh.5.as_slice()));
+    let mut moe = MoeBlock::new_mode(hidden, inter, n_experts, top_k, eps, &nw, &rw, experts, shared, shared_inter, 1.0, true);
+    let h0: Vec<f32> = (0..hidden).map(|_| r()*0.3).collect();
+
+    // Best-of-`passes` wall time; also returns the CPU/shared component split of the BEST
+    // pass (last_cpu_ms/last_shared_ms), so totals and components come from the same pass.
+    let time_forward = |moe: &mut MoeBlock, passes: usize| -> (f64, f64, f64) {
+        let (mut best, mut bc, mut bs) = (f64::MAX, 0f64, 0f64);
+        for _ in 0..passes {
+            let mut hh = DevHalf::from_host(&h0);
+            let t = std::time::Instant::now();
+            moe.forward(&mut hh);
+            unsafe { dev_sync(); } // include the shared-expert GPU completion in the wall time
+            let el = t.elapsed().as_secs_f64() * 1e3;
+            if el < best { best = el; bc = moe.last_cpu_ms; bs = moe.last_shared_ms; }
+        }
+        (best, bc, bs)
+    };
+    // warm both modes (first Metal command buffer / pipeline JIT is not representative).
+    moe.set_overlap_shared(false); let _ = time_forward(&mut moe, 2);
+    moe.set_overlap_shared(true);  let _ = time_forward(&mut moe, 2);
+
+    moe.set_overlap_shared(false);
+    let (sequential_ms, cpu_ms, shared_ms) = time_forward(&mut moe, passes);
+    moe.set_overlap_shared(true);
+    let (overlapped_ms, _, _) = time_forward(&mut moe, passes);
+
+    eprintln!("[bench_moe_cpu_experts] hidden={hidden} inter={inter} experts={n_experts} top_k={top_k} shared_inter={shared_inter} passes={passes}");
+    eprintln!("  cpu_routed={cpu_ms:.3} ms   gpu_shared={shared_ms:.3} ms   ->  sum={:.3} ms   max={:.3} ms",
+              cpu_ms + shared_ms, cpu_ms.max(shared_ms));
+    eprintln!("  sequential_total={sequential_ms:.3} ms   overlapped_total={overlapped_ms:.3} ms");
+    (cpu_ms, shared_ms, sequential_ms, overlapped_ms)
+}
+
 #[cfg(all(test, any(feature = "cuda", feature = "metal")))]
 mod moe_cpu_tests {
     #[test]
@@ -1969,6 +2138,24 @@ mod moe_cpu_tests {
         // rel err is dominated by a single near-zero output element (small denominator),
         // while the L2 rel err reflects the true agreement. Pass on either (per spec).
         assert!(worst < 1e-2 || l2 < 1e-3, "CPU vs GPU MoE mismatch: worst_rel={worst:e} l2_rel={l2:e}");
+    }
+
+    #[test]
+    fn overlap_matches_sequential() {
+        // Overlapping the shared expert must not change the result (only its scheduling).
+        let worst = super::check_moe_cpu_overlap();
+        assert!(worst < 1e-4, "overlapped != sequential MoE output: worst_rel={worst:e}");
+    }
+
+    #[test]
+    fn overlap_bench_v2lite() {
+        // V2-Lite dims: hidden=2048, moe_inter=1408, 64 routed experts, top_k=6, 2 shared
+        // experts (shared_inter=2*1408=2816, a multiple of 256). Loaded M4, best of 5.
+        let (cpu, shared, seq, ov) = super::bench_moe_cpu_experts(2048, 1408, 64, 6, 2816, 5);
+        // Overlap must never be materially slower than sequential (allow scheduler noise).
+        assert!(ov <= seq * 1.15 + 0.5, "overlap slower than sequential: seq={seq:.3} ov={ov:.3}");
+        // Sanity: the components are positive and sequential ~ cpu+shared.
+        assert!(cpu > 0.0 && shared > 0.0, "component timings not captured: cpu={cpu} shared={shared}");
     }
 }
 
