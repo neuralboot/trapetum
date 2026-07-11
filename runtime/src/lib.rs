@@ -1361,6 +1361,71 @@ pub fn check_gpu_gemv_determinism(ic: usize, oc: usize, iters: usize) -> (usize,
     (mism, worst)
 }
 
+/// Correctness of whatever `TRAPETUM_DETERMINISTIC` mode is active: compare the GPU fused GEMV
+/// against a CPU reference that uses the SAME fp16-rounded codebook the GPU stores (so the ONLY
+/// difference is float summation order, not fp16-vs-f32 codebook rounding). Returns
+/// `(worst_rel, l2_rel)`. For mode 2 (fixed-order two-stage) this is the "equals the atomic/mode-1
+/// result within summation-order tolerance" measurement. `x` and activations mirror the GPU
+/// (fp16 X). Deterministic CPU side.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn check_gpu_gemv_vs_fp16cb_ref(ic: usize, oc: usize) -> (f64, f64) {
+    assert_eq!(oc % 256, 0); assert_eq!(ic % 2, 0);
+    let mut s = 0x51DE_0117u64;
+    let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+    let w: Vec<f32> = (0..oc*ic).map(|_| r()*0.5).collect();
+    let x: Vec<f32> = (0..ic).map(|_| r()).collect();
+    let (packed, cb, _) = quantize_host(&w, oc, ic);
+    // CPU reference with the GPU's exact fp16 codebook values and fp16-rounded activations,
+    // accumulated in f32: y[o] = sum_i cb16[idx[o,i]*oc+o] * x16[i]. idx from packed (input-major).
+    let cb16: Vec<f32> = cb.iter().map(|&c| f16::from_f32(c).to_f32()).collect();
+    let x16: Vec<f32> = x.iter().map(|&v| f16::from_f32(v).to_f32()).collect();
+    let half = oc / 2;
+    let mut yref = vec![0f32; oc];
+    for o in 0..oc {
+        let (j, sh) = (o / 2, if o & 1 == 0 { 0 } else { 4 });
+        let mut acc = 0f32;
+        for i in 0..ic { let id = ((packed[i*half + j] >> sh) & 0xF) as usize; acc += cb16[id*oc + o] * x16[i]; }
+        yref[o] = acc;
+    }
+    let q = QuantLinear::new(&packed, &cb, ic, oc);
+    let dx = DevHalf::from_host(&x);
+    let mut y = DevF32::zeros(oc);
+    q.forward_into(&dx, &mut y);
+    let got = y.to_host();
+    let (mut worst, mut num, mut den) = (0f64, 0f64, 0f64);
+    for o in 0..oc {
+        let d = (got[o] - yref[o]) as f64;
+        worst = worst.max(d.abs() / (yref[o] as f64).abs().max(1e-3));
+        num += d*d; den += (yref[o] as f64)*(yref[o] as f64);
+    }
+    (worst, num.sqrt() / den.sqrt().max(1e-12))
+}
+
+/// Wall time per fused GEMV call (ms), best-of, under whatever `TRAPETUM_DETERMINISTIC` mode is
+/// active. Used to measure the two-stage (mode 2) overhead vs the atomic path (run twice with
+/// different env). Each timed call syncs so the GPU work is included.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn bench_gpu_gemv_ms(ic: usize, oc: usize, iters: usize) -> f64 {
+    assert_eq!(oc % 256, 0); assert_eq!(ic % 2, 0);
+    let mut s = 0xB0A7_u64.wrapping_mul(0x9E37_79B9);
+    let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+    let w: Vec<f32> = (0..oc*ic).map(|_| r()*0.5).collect();
+    let x: Vec<f32> = (0..ic).map(|_| r()).collect();
+    let (packed, cb, _) = quantize_host(&w, oc, ic);
+    let q = QuantLinear::new(&packed, &cb, ic, oc);
+    let dx = DevHalf::from_host(&x);
+    let mut y = DevF32::zeros(oc);
+    for _ in 0..5 { q.forward_into(&dx, &mut y); let _ = y.to_host(); }
+    let mut best = f64::MAX;
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        q.forward_into(&dx, &mut y);
+        let _ = y.to_host(); // drains (syncs) so GPU time is counted
+        best = best.min(t.elapsed().as_secs_f64() * 1e3);
+    }
+    best
+}
+
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl Model {
     /// Plain greedy autoregressive decode (the reference the spec loop must match).

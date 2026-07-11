@@ -17,14 +17,16 @@
 // grid.y IC-split for the fused codebook GEMVs. GS>1 blocks reduce their IC-slice partials
 // into Yacc with atomicAdd, whose float add-order is scheduler-dependent -> run-to-run
 // NONDETERMINISTIC output (near-tie logits flip between runs, and the greedy sequence with
-// them). TRAPETUM_DETERMINISTIC=1 forces grid.y=1: each output element is written by exactly
-// one block, no cross-block atomics -> bitwise-reproducible decode. Cost: less SM parallelism
-// on small-OC layers. Read once (cached), mirrors the Metal backend's gs().
-static int det_gs() {
-    static int g = -1;
-    if (g < 0) { const char* e = getenv("TRAPETUM_DETERMINISTIC"); g = (e && e[0] == '1' && e[1] == 0) ? 1 : GS; }
-    return g;
+// them). TRAPETUM_DETERMINISTIC (read once, cached; mirrors the Metal backend):
+//   0/unset = atomic (fast, nondeterministic)
+//   1       = grid.y=1: each output element written by one block, no cross-block atomics (slow on small OC)
+//   2       = two-stage fixed-order reduction (gemv4_partial -> gemv_reduce), deterministic, keeps IC split
+static int det_mode() {
+    static int m = -1;
+    if (m < 0) { const char* e = getenv("TRAPETUM_DETERMINISTIC"); m = (e && e[1] == 0 && (e[0]=='1'||e[0]=='2')) ? (e[0]-'0') : 0; }
+    return m;
 }
+static int det_gs() { return det_mode() == 1 ? 1 : GS; } // mode 1 collapses grid.y; modes 0/2 keep GS
 
 // per-column quantization dither table (precomputed) and reserved dither seeds.
 __device__ static const unsigned QZ_SEED0 = 0x33383838u, QZ_SEED1 = 0x44463341u;
@@ -66,6 +68,49 @@ gemv4(const __half* __restrict__ X, const unsigned char* __restrict__ packed,
         #pragma unroll
         for (int c = 0; c < 8; c++) { float s = 0; for (int y = 0; y < TY; y++) s += red[y*CPB+tx*8+c]; atomicAdd(&Yacc[j0+tx*8+c], s); }
     }
+}
+
+// Deterministic two-stage GEMV (TRAPETUM_DETERMINISTIC=2). Stage 1: identical to gemv4 but each
+// grid.y block writes its IC-slice partial to its OWN row of Ypart (Ypart[blockIdx.y*OC + j]) --
+// disjoint, no atomics. Stage 2 (gemv_reduce) sums the GS partial rows per column in FIXED
+// blockIdx.y order -> bitwise-reproducible while keeping gemv4's GS-way IC split.
+__global__ void __launch_bounds__(32*TY)
+gemv4_partial(const __half* __restrict__ X, const unsigned char* __restrict__ packed,
+              const __half* __restrict__ cb, float* __restrict__ Ypart, int IC, int OC) {
+    extern __shared__ char sm[];
+    __half* s_cb = (__half*)sm; float* red = (float*)(s_cb + K*CPB);
+    int tx = threadIdx.x, ty = threadIdx.y, tid = ty*32+tx, nth = 32*TY;
+    int j0 = blockIdx.x*CPB;
+    for (int t = tid; t < K*CPB/2; t += nth) {
+        int idx = t*2, k = idx/CPB, jj = j0 + (idx%CPB);
+        *reinterpret_cast<__half2*>(&s_cb[idx]) = *reinterpret_cast<const __half2*>(&cb[(size_t)k*OC+jj]);
+    }
+    __syncthreads();
+    int per = (IC+gridDim.y-1)/gridDim.y, ic0 = blockIdx.y*per, ic1 = min(IC, ic0+per);
+    int jbase = j0 + tx*8; size_t OCp = OC/2;
+    float acc[8] = {0,0,0,0,0,0,0,0};
+    for (int ic = ic0+ty; ic < ic1; ic += TY) {
+        unsigned f = __ldg((const unsigned*)&packed[(size_t)ic*OCp + jbase/2]);
+        float xx = __half2float(__ldg(&X[ic]));
+        #pragma unroll
+        for (int c = 0; c < 8; c++) { unsigned char id = (f>>(4*c))&0xF; acc[c] += xx*__half2float(s_cb[id*CPB+tx*8+c]); }
+    }
+    #pragma unroll
+    for (int c = 0; c < 8; c++) red[ty*CPB+tx*8+c] = acc[c];
+    __syncthreads();
+    if (ty == 0) {
+        #pragma unroll
+        for (int c = 0; c < 8; c++) { float s = 0; for (int y = 0; y < TY; y++) s += red[y*CPB+tx*8+c]; Ypart[(size_t)blockIdx.y*OC + (j0+tx*8+c)] = s; }
+    }
+}
+
+// Stage 2: Y[j] = sum over grid.y partials Ypart[g*OC + j] in FIXED g order (deterministic).
+__global__ void gemv_reduce(const float* __restrict__ Ypart, float* __restrict__ Y, int OC, int GSy) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= OC) return;
+    float s = 0;
+    for (int g = 0; g < GSy; g++) s += Ypart[(size_t)g*OC + i];
+    Y[i] = s;
 }
 
 __global__ void cast_f2h(const float* __restrict__ src, __half* __restrict__ dst, int n) {
@@ -524,13 +569,35 @@ void* qlinear_create(const unsigned char* packed, const float* cb_f32, int IC, i
     return q;
 }
 
+// Reusable GS*OC f32 Ypart scratch for the deterministic two-stage GEMV (mode 2), grown on demand.
+static float* g_ypart = nullptr;
+static size_t g_ypart_cap = 0; // floats
+static float* ypart(size_t need_floats) {
+    if (need_floats > g_ypart_cap) {
+        if (g_ypart) cudaFree(g_ypart);
+        cudaMalloc(&g_ypart, need_floats * sizeof(float));
+        g_ypart_cap = need_floats;
+    }
+    return g_ypart;
+}
+
 // d_x: device half (IC,), d_y: device f32 (OC,). No host copies; fully on-device.
 void qlinear_forward_dev(void* handle, const void* d_x, void* d_y) {
     QLinear* q = (QLinear*)handle;
     ensure_stream();
-    cudaMemsetAsync(d_y, 0, (size_t)q->OC*sizeof(float), g_stream);
     size_t smem = (size_t)K*CPB*sizeof(__half) + (size_t)TY*CPB*sizeof(float);
-    dim3 grid(q->OC/CPB, det_gs()), block(32, TY); // det_gs()=1 under TRAPETUM_DETERMINISTIC -> no atomics
+    int gy = det_gs();
+    if (det_mode() == 2 && gy > 1) {
+        // Two-stage deterministic: partials to Ypart (no atomics), then fixed-order reduce.
+        float* yp = ypart((size_t)gy * q->OC);
+        dim3 grid(q->OC/CPB, gy), block(32, TY);
+        gemv4_partial<<<grid, block, smem, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, yp, q->IC, q->OC);
+        int tpb = 256;
+        gemv_reduce<<<(q->OC + tpb - 1)/tpb, tpb, 0, g_stream>>>(yp, (float*)d_y, q->OC, gy);
+        return;
+    }
+    cudaMemsetAsync(d_y, 0, (size_t)q->OC*sizeof(float), g_stream);
+    dim3 grid(q->OC/CPB, gy), block(32, TY); // det_gs()=1 under mode 1 -> no atomics
     gemv4<<<grid, block, smem, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, (float*)d_y, q->IC, q->OC);
 }
 

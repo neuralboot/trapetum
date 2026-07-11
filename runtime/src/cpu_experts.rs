@@ -833,6 +833,37 @@ mod tests {
     }
 
     #[test]
+    fn det_gemv_mode_report() {
+        // Reports determinism + correctness + timing for the fused GEMV under whatever
+        // TRAPETUM_DETERMINISTIC mode is set. Run three times to fill the before/after table:
+        //   (unset)                -> mode 0 (atomic, nondeterministic, fast)
+        //   TRAPETUM_DETERMINISTIC=1 -> grid.y=1 (deterministic, slow on small OC)
+        //   TRAPETUM_DETERMINISTIC=2 -> two-stage fixed-order (deterministic, keeps IC split)
+        let (ic, oc) = (8192usize, 512usize);
+        let mode = std::env::var("TRAPETUM_DETERMINISTIC").unwrap_or_else(|_| "0".into());
+        let (mism, worst_abs) = crate::check_gpu_gemv_determinism(ic, oc, 30);
+        let (worst_rel, l2) = crate::check_gpu_gemv_vs_fp16cb_ref(ic, oc);
+        let ms = crate::bench_gpu_gemv_ms(ic, oc, 50);
+        eprintln!("[det_gemv mode={mode}] determinism: {mism}/30 differ (worst_abs={worst_abs:e}); \
+                   vs fp16cb-ref: worst_rel={worst_rel:e} l2={l2:e}; time={ms:.4} ms/call (ic={ic} oc={oc})");
+        // Correctness holds in every mode (fp16 summation-order tolerance). Do NOT assert
+        // determinism here -- it depends on the env-set mode; that is asserted in the =2 CI run.
+        assert!(l2 < 5e-3, "GPU GEMV vs fp16-codebook reference l2={l2:e} too large");
+    }
+
+    #[test]
+    fn det_gemv_overhead_bench() {
+        // Overhead of the active TRAPETUM_DETERMINISTIC mode across realistic shapes. Run in
+        // RELEASE, once with env unset (mode 0) and once with =2, and diff the ms/call. Small OC
+        // is launch-dominated; big IC*OC shows the true two-stage memory overhead (~GS/IC).
+        let mode = std::env::var("TRAPETUM_DETERMINISTIC").unwrap_or_else(|_| "0".into());
+        for (ic, oc) in [(2048usize, 2048usize), (2048, 7168), (8192, 2048), (2048, 16384)] {
+            let ms = crate::bench_gpu_gemv_ms(ic, oc, 50);
+            eprintln!("[det_gemv_overhead mode={mode}] ic={ic} oc={oc} -> {ms:.4} ms/call");
+        }
+    }
+
+    #[test]
     fn gpu_gemv_determinism_probe() {
         // DIAGNOSTIC (not a pass/fail gate): does the fused GPU codebook GEMV return bitwise-
         // identical output run-to-run? If not, the base runtime is nondeterministic (atomic
