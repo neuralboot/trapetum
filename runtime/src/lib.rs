@@ -1301,6 +1301,23 @@ pub fn argmax(v: &[f32]) -> usize {
     bi
 }
 
+/// Emit one `[ldump]` line: l2 norm, abs-max, and mean of a hidden-state (or logit) vector.
+/// Format is stable and matches `model/dump_layers_hf.py` for a layer-by-layer diff.
+pub fn dump_hidden(stage: &str, layer: usize, x: &[f32]) {
+    let n = x.len().max(1) as f64;
+    let mut sumsq = 0f64; let mut absmax = 0f64; let mut sum = 0f64;
+    for &v in x { let v = v as f64; sumsq += v * v; absmax = absmax.max(v.abs()); sum += v; }
+    eprintln!("[ldump] L={layer} stage={stage} l2={:.6e} absmax={:.6e} mean={:.6e}", sumsq.sqrt(), absmax, sum / n);
+}
+
+/// Emit `[ldump] top5= id:logit,...` (descending, smallest-index tie-break like [`argmax`]).
+pub fn dump_top5(logits: &[f32]) {
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+    let top: Vec<String> = idx.iter().take(5).map(|&i| format!("{}:{:.4}", i, logits[i])).collect();
+    eprintln!("[ldump] top5= {}", top.join(","));
+}
+
 /// `TRAPETUM_LOGIT_DEBUG=1` -> dump top-2 logits + margin per greedy token (read once, cached).
 pub fn logit_debug_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3260,6 +3277,30 @@ impl DeepSeekModel {
         rmsnorm(&self.h, &self.final_norm, &mut self.normed, self.eps);
         self.lm_head.forward_into(&self.normed, &mut self.logits);
         self.logits.to_host()
+    }
+
+    /// Like [`forward`], but dumps per-layer hidden-state statistics (l2/absmax/mean) for a
+    /// layer-by-layer diff against an HF reference (see `model/dump_layers_hf.py`). Emits, on
+    /// stderr, one `[ldump]` line per stage: `embed` (post-embedding), `block` L=0..n-1 (after each
+    /// full decoder layer, post both residual adds), `final` (post final norm), and `logits`
+    /// (+ a `top5=` line). Call ONLY for the LAST prompt position (predicts token 1). Used only when
+    /// `deepseek_run` sees `TRAPETUM_LAYER_DEBUG=1`, so it costs nothing otherwise.
+    pub fn forward_dump(&mut self, token: usize, pos: usize) -> Vec<f32> {
+        let row = &self.embedding[token*self.hidden..(token+1)*self.hidden];
+        self.h.upload(row);
+        dump_hidden("embed", 0, &self.h.to_host());
+        for i in 0..self.layers.len() {
+            self.layers[i].forward(&mut self.h, pos);
+            let hh = self.h.to_host();
+            dump_hidden("block", i, &hh);
+        }
+        rmsnorm(&self.h, &self.final_norm, &mut self.normed, self.eps);
+        dump_hidden("final", 0, &self.normed.to_host());
+        self.lm_head.forward_into(&self.normed, &mut self.logits);
+        let logits = self.logits.to_host();
+        dump_hidden("logits", 0, &logits);
+        dump_top5(&logits);
+        logits
     }
 
     /// Load a DeepSeek `.cbk` exported by `model/export_deepseek.py`: `CBKD` (V2-Lite style,

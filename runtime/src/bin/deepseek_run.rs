@@ -9,8 +9,14 @@ fn main() {
     let t0 = Instant::now();
     let mut m = DeepSeekModel::load_deepseek(&a[1], 2048).unwrap();
     println!("loaded in {:.1}s, vocab={}, prompt={} tokens {:?}", t0.elapsed().as_secs_f64(), m.vocab(), prompt.len(), prompt);
+    // TRAPETUM_LAYER_DEBUG=1: dump per-layer hidden-state stats for the LAST prompt position
+    // (which predicts token 1) so we can diff layer-by-layer vs an HF reference (model/dump_layers_hf.py).
+    let layer_dbg = std::env::var("TRAPETUM_LAYER_DEBUG").map(|v| v == "1").unwrap_or(false);
     let mut last = vec![];
-    for (t, &tok) in prompt.iter().enumerate() { last = m.forward(tok, t); }
+    let last_i = prompt.len().saturating_sub(1);
+    for (t, &tok) in prompt.iter().enumerate() {
+        last = if layer_dbg && t == last_i { m.forward_dump(tok, t) } else { m.forward(tok, t) };
+    }
     // TRAPETUM_NTOK overrides the generation length (default 24); per-token
     // times expose the cold-to-warm transition when experts page in from disk.
     let n: usize = env::var("TRAPETUM_NTOK").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
