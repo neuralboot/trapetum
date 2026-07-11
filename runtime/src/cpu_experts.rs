@@ -522,6 +522,19 @@ const CHUNK_C: usize = 256;
 /// one atomic counter, with a barrier between. The row-major kernel keeps `packed_t` streaming and
 /// the codebook table in registers.
 pub fn routed_experts_worksteal(x: &[f32], experts: &[RoutedExpert], hidden: usize, inter: usize, acc_out: &mut [f32]) {
+    routed_experts_worksteal_nt(x, experts, hidden, inter, acc_out, cpu_threads());
+}
+
+/// Thread-count-explicit variant of [`routed_experts_worksteal`] (the public one reads
+/// `TRAPETUM_CPU_THREADS`). Exposed so the determinism harness can prove the result is
+/// IDENTICAL across worker counts without touching a process-global env var.
+///
+/// DETERMINISM CONTRACT (thread-count-invariant, bitwise): every output row is computed in
+/// full by exactly one work-steal task (chunks split the OUTPUT dimension, never the reduction),
+/// with a fixed 4-accumulator order inside the row; the final weighted combine runs on one thread
+/// in fixed EXPERT order (0..k), never thread-completion order. So `worker_threads` changes only
+/// WHICH core runs a chunk, not any summation order -- the bytes of `acc_out` are identical.
+pub fn routed_experts_worksteal_nt(x: &[f32], experts: &[RoutedExpert], hidden: usize, inter: usize, acc_out: &mut [f32], worker_threads: usize) {
     assert_eq!(x.len(), hidden, "routed input width");
     assert!(acc_out.len() >= hidden, "routed output width");
     let k = experts.len();
@@ -537,7 +550,7 @@ pub fn routed_experts_worksteal(x: &[f32], experts: &[RoutedExpert], hidden: usi
     let a_per = (inter + CHUNK_A - 1) / CHUNK_A;
     let c_per = (hidden + CHUNK_C - 1) / CHUNK_C;
     let (na, nc) = (k * a_per, k * c_per);
-    let nthreads = cpu_threads().min(na.max(nc).max(1));
+    let nthreads = worker_threads.max(1).min(na.max(nc).max(1));
 
     if nthreads <= 1 {
         // Sequential fallback (still row-major/contiguous).
@@ -807,6 +820,38 @@ mod tests {
         eprintln!("  o-outer gemv_cpu_f32   (8t): {ms_old:.3} ms  ({:.2} GB/s)", gbs(ms_old));
         eprintln!("  i-outer gemv_cpu_stream(8t): {ms_stream:.3} ms  ({:.2} GB/s)", gbs(ms_stream));
         eprintln!("  row-major gemv_rowmajor(1t): {ms_rm:.3} ms  ({:.2} GB/s)  [1 thread; x8 in the engine]", gbs(ms_rm));
+    }
+
+    #[test]
+    fn worksteal_is_thread_count_invariant() {
+        // PROOF that the routed CPU reduction is bit-identical across worker counts: the
+        // greedy-decode thread-dependence must NOT originate here. Uses the pod's V2-Lite dims
+        // with RANDOM packed indices + codebooks (any bytes are valid indices; no need for real
+        // k-means -- we are testing the reduction order, not the decode values), so it is fast.
+        let (hidden, inter, k) = (2048usize, 1536usize, 6usize);
+        let mut r = Lcg(0xD37E_2711_u64);
+        let x: Vec<f32> = (0..hidden).map(|_| r.f32()).collect();
+        let bytes = |n: usize, r: &mut Lcg| -> Vec<u8> { (0..n).map(|_| ((r.f32() * 0.5 + 0.5) * 255.0) as u8).collect() };
+        let cbk = |n: usize, r: &mut Lcg| -> Vec<f32> { (0..n).map(|_| r.f32() * 0.05).collect() };
+        // Row-major packed is [oc][ic/2]; transposed codebook is [oc*K]. gate/up: oc=inter; down: oc=hidden.
+        let mut store: Vec<(Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>, f32)> = Vec::new();
+        for e in 0..k {
+            store.push((bytes(inter * (hidden / 2), &mut r), cbk(K * inter, &mut r),
+                        bytes(inter * (hidden / 2), &mut r), cbk(K * inter, &mut r),
+                        bytes(hidden * (inter / 2), &mut r), cbk(K * hidden, &mut r), 0.1 + 0.13 * e as f32));
+        }
+        let experts: Vec<RoutedExpert> = store.iter().map(|s| RoutedExpert {
+            gp_t: &s.0, gc_t: &s.1, up_t: &s.2, uc_t: &s.3, dp_t: &s.4, dc_t: &s.5, weight: s.6,
+        }).collect();
+        let mut baseline = vec![0f32; hidden];
+        routed_experts_worksteal_nt(&x, &experts, hidden, inter, &mut baseline, 1);
+        for nt in [4usize, 8, 16, 32, 64] {
+            let mut got = vec![0f32; hidden];
+            routed_experts_worksteal_nt(&x, &experts, hidden, inter, &mut got, nt);
+            // BITWISE identical: not a tolerance -- the reduction order is fixed by construction.
+            assert!(baseline.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "routed output changed at worker_threads={nt} (thread-count-DEPENDENT reduction!)");
+        }
     }
 
     #[test]

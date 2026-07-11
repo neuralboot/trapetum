@@ -775,6 +775,17 @@ impl Model {
     /// must call [`forward`](Self::forward) instead.
     pub fn forward_argmax(&mut self, token: usize, pos: usize, real_vocab: usize) -> u32 {
         self.run_forward(token, pos);
+        // TRAPETUM_LOGIT_DEBUG=1: dump top-2 (id, logit) and their margin for this token, so a
+        // GPU-vs-hybrid greedy divergence can be classified -- a tiny margin at the divergence
+        // point means the paths tie within fp noise (equivalent within tolerance), a large margin
+        // means a real bug to bisect. Off by default; when on we read logits to host (the argmax
+        // is then taken there with the same smallest-index tie-break as `argmax_device`).
+        if logit_debug_enabled() {
+            let logits = self.logits.to_host();
+            let (i0, l0, i1, l1) = top2(&logits[..real_vocab.min(logits.len())]);
+            eprintln!("[logit] pos={pos} top1_id={i0} top1={l0:.5} top2_id={i1} top2={l1:.5} margin={:.5}", l0 - l1);
+            return i0 as u32;
+        }
         self.logits.argmax_device(real_vocab)
     }
 
@@ -1288,6 +1299,23 @@ pub fn argmax(v: &[f32]) -> usize {
     let mut bi = 0usize; let mut bv = f32::MIN;
     for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i; } }
     bi
+}
+
+/// `TRAPETUM_LOGIT_DEBUG=1` -> dump top-2 logits + margin per greedy token (read once, cached).
+fn logit_debug_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TRAPETUM_LOGIT_DEBUG").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Top-2 `(id0, logit0, id1, logit1)` with strict `>` so the top resolves ties to the SMALLEST
+/// index, matching `DevF32::argmax_device`. `logit0 - logit1` is the greedy margin.
+pub fn top2(v: &[f32]) -> (usize, f32, usize, f32) {
+    let (mut i0, mut l0, mut i1, mut l1) = (0usize, f32::NEG_INFINITY, 0usize, f32::NEG_INFINITY);
+    for (i, &x) in v.iter().enumerate() {
+        if x > l0 { l1 = l0; i1 = i0; l0 = x; i0 = i; }
+        else if x > l1 { l1 = x; i1 = i; }
+    }
+    (i0, l0, i1, l1)
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
