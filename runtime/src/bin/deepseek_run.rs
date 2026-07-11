@@ -2,7 +2,7 @@
 //!   deepseek_run <model.cbk> <prompt.bin>   (greedy-decodes 24 tokens, prints ids)
 use std::env;
 use std::time::Instant;
-use trapetum::{DeepSeekModel, argmax, read_i32s};
+use trapetum::{DeepSeekModel, argmax, dump_logit_margin, read_i32s};
 fn main() {
     let a: Vec<String> = env::args().collect();
     let prompt: Vec<usize> = read_i32s(&a[2]).iter().map(|&t| t as usize).collect();
@@ -14,6 +14,10 @@ fn main() {
     // TRAPETUM_NTOK overrides the generation length (default 24); per-token
     // times expose the cold-to-warm transition when experts page in from disk.
     let n: usize = env::var("TRAPETUM_NTOK").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
+    // TRAPETUM_LOGIT_DEBUG=1: report the top-2/margin of the token chosen from the prompt's last
+    // logits and of every generated token, so GPU-vs-hybrid divergences can be classified as
+    // near-ties (fp noise) vs real gaps. deepseek_run argmaxes host logits directly, so it dumps here.
+    dump_logit_margin(prompt.len().saturating_sub(1), &last);
     let mut tok = argmax(&last); let mut got = Vec::new();
     let mut per_tok = Vec::with_capacity(n);
     let t0 = Instant::now();
@@ -22,6 +26,7 @@ fn main() {
         let ti = Instant::now();
         let lg = m.forward(tok, prompt.len()+i);
         per_tok.push(ti.elapsed().as_secs_f64()*1e3);
+        dump_logit_margin(prompt.len()+i, &lg);
         tok = argmax(&lg);
         println!("tok {:>3}: {:>9.1} ms", i, per_tok[i]);
     }

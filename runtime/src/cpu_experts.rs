@@ -828,6 +828,14 @@ mod tests {
         // greedy-decode thread-dependence must NOT originate here. Uses the pod's V2-Lite dims
         // with RANDOM packed indices + codebooks (any bytes are valid indices; no need for real
         // k-means -- we are testing the reduction order, not the decode values), so it is fast.
+        //
+        // SCOPE: this covers ONLY the CPU routed-experts reduction (routed_experts_worksteal).
+        // It says nothing about the GPU kernels (attention, shared expert, dense FFN, lm_head),
+        // whose fused codebook GEMV reduces IC-split partials with atomicAdd across grid.y blocks
+        // (kernels/gemv_codebook_4bit.cu:45, and the Metal gemv4 twin) -- that atomic add-order is
+        // nondeterministic RUN-TO-RUN and is the base-runtime nondeterminism to fix separately
+        // (see S14 #7 report / the deterministic-reduction proposal). CPU determinism proven here
+        // does not make the end-to-end greedy output deterministic while those kernels remain.
         let (hidden, inter, k) = (2048usize, 1536usize, 6usize);
         let mut r = Lcg(0xD37E_2711_u64);
         let x: Vec<f32> = (0..hidden).map(|_| r.f32()).collect();
