@@ -2789,6 +2789,27 @@ struct QLoraQ {
     qa_normed: DevHalf,     // [q_lora_rank] scratch (normed, re-uploaded for q_b)
 }
 
+/// DeepSeek-V2 decoupled RoPE, INTERLEAVED convention: rotate each adjacent pair (2d, 2d+1)
+/// by angle `pos * inv_freq[d]`. This is provably equivalent -- for the Q.K score, the ONLY
+/// place the rope part is ever used -- to HF `apply_rotary_pos_emb` in
+/// `modeling_deepseek_reference.py`, which instead de-interleaves via `view(d/2,2).transpose`
+/// (evens -> first half, odds -> second half) and applies split-half `rotate_half` with
+/// `cos/sin = cat(freqs, freqs)`. Both produce the identical rotated pair
+/// `(x[2d]cos - x[2d+1]sin, x[2d+1]cos + x[2d]sin)`; HF merely stores the two components at
+/// positions `(d, d/2+d)` instead of `(2d, 2d+1)`, and the dot product is a reordering-
+/// invariant sum over those pairs, so `q.k` is identical. Verified against the literal HF
+/// math by `mla_tests::mla_rope_matches_hf` (the `check_mla_block` reference reuses this same
+/// interleaved rope and therefore CANNOT catch a convention bug -- that test is the guard).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub(crate) fn mla_rope_interleaved(v: &mut [f32], pos: usize, inv_freq: &[f32]) {
+    for d in 0..v.len()/2 {
+        let ang = pos as f32 * inv_freq[d];
+        let (c, s) = (ang.cos(), ang.sin());
+        let (x0, x1) = (v[2*d], v[2*d+1]);
+        v[2*d] = x0*c - x1*s; v[2*d+1] = x1*c + x0*s;
+    }
+}
+
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl MlaAttn {
     #[allow(clippy::too_many_arguments)]
@@ -2847,15 +2868,7 @@ impl MlaAttn {
     }
 
     fn rope(&self, v: &mut [f32], pos: usize) {
-        // DeepSeek-V2 uses INTERLEAVED RoPE (adjacent pairs 2i,2i+1), not Llama split-half:
-        // apply_rotary_pos_emb reshapes view(d/2,2).transpose before rotate_half, equivalent
-        // to rotating adjacent pairs (q.k is permutation-invariant, so rotate in place).
-        for d in 0..self.d_rope/2 {
-            let ang = pos as f32 * self.inv_freq[d];
-            let (c, s) = (ang.cos(), ang.sin());
-            let (x0, x1) = (v[2*d], v[2*d+1]);
-            v[2*d] = x0*c - x1*s; v[2*d+1] = x1*c + x0*s;
-        }
+        mla_rope_interleaved(v, pos, &self.inv_freq);
     }
 
     /// `h_normed` = RMSNorm(h). Returns the attention output (hidden,), to be residual-added.
@@ -3209,6 +3222,62 @@ mod mla_tests {
         // PLAIN inv_freq instead of the yarn-corrected one -- both fixed in model/export_deepseek.py.
         let e = super::check_mla_block();
         assert!(e < 3e-2, "MLA block rel err {e:e} vs reference (fp16 synthetic ~1.6e-2 expected)");
+    }
+
+    #[test]
+    fn mla_rope_matches_hf() {
+        // Prove the production interleaved rope (`mla_rope_interleaved`) produces the SAME Q.K
+        // score as HF `apply_rotary_pos_emb` (modeling_deepseek_reference.py: de-interleave via
+        // view(m,2).transpose, then rotate_half with cos/sin = cat(freqs, freqs)). This is the
+        // check `check_mla_block` CANNOT make: its CPU reference reuses the interleaved rope, so
+        // a rope-convention bug would slip through byte-identical on both sides. Here the HF side
+        // is coded LITERALLY from the reference, independent of the Rust rope.
+        let m = 32usize; let d = 2 * m; // qk_rope_head_dim = 64
+        // A non-trivial (yarn-shaped) inv_freq; its exact values don't affect the equivalence.
+        let inv_freq: Vec<f32> = (0..m).map(|k| 10000f32.powf(-2.0 * k as f32 / d as f32)).collect();
+        // HF apply_rotary_pos_emb on one head vector at position `pos`.
+        let hf = |x: &[f32], pos: usize| -> Vec<f32> {
+            let mut p = vec![0f32; d];                       // view(m,2).transpose -> [evens | odds]
+            for k in 0..m { p[k] = x[2*k]; p[m+k] = x[2*k+1]; }
+            let mut y = vec![0f32; d];
+            for k in 0..m {                                  // cos/sin = cat(freqs,freqs); rotate_half
+                let a = pos as f32 * inv_freq[k]; let (c, s) = (a.cos(), a.sin());
+                y[k]   = p[k]   * c - p[m+k] * s;            // rotate_half puts -p[m+k] at index k
+                y[m+k] = p[m+k] * c + p[k]   * s;
+            }
+            y
+        };
+        // A DELIBERATELY WRONG convention: Llama split-half applied to the RAW interleaved layout
+        // (pair index i with i+m). Used only to prove the test has teeth (must NOT match HF).
+        let wrong = |x: &[f32], pos: usize| -> Vec<f32> {
+            let mut y = x.to_vec();
+            for k in 0..m {
+                let a = pos as f32 * inv_freq[k]; let (c, s) = (a.cos(), a.sin());
+                y[k]   = x[k]   * c - x[m+k] * s;
+                y[m+k] = x[m+k] * c + x[k]   * s;
+            }
+            y
+        };
+        let mut st = 0x1234_5678_9abc_def0u64;
+        let mut rnd = move || { st ^= st<<13; st ^= st>>7; st ^= st<<17; ((st>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+        let dot = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x,y)| x*y).sum() };
+        let (mut worst, mut worst_wrong) = (0f32, 0f32);
+        for _ in 0..128 {
+            let q: Vec<f32> = (0..d).map(|_| rnd()).collect();
+            let k: Vec<f32> = (0..d).map(|_| rnd()).collect();
+            let pq = (rnd().abs() * 40.0) as usize;
+            let pk = (rnd().abs() * 40.0) as usize;
+            let (mut qi, mut ki) = (q.clone(), k.clone());
+            super::mla_rope_interleaved(&mut qi, pq, &inv_freq);   // production path
+            super::mla_rope_interleaved(&mut ki, pk, &inv_freq);
+            let dh = dot(&hf(&q, pq), &hf(&k, pk));
+            let den = dh.abs().max(1.0);
+            worst = worst.max((dot(&qi, &ki) - dh).abs() / den);
+            worst_wrong = worst_wrong.max((dot(&wrong(&q, pq), &wrong(&k, pk)) - dh).abs() / den);
+        }
+        assert!(worst < 1e-5, "interleaved rope Q.K diverges from HF apply_rotary_pos_emb: rel {worst:e}");
+        assert!(worst_wrong > 1e-2, "negative control failed: the wrong (raw split-half) convention \
+                should NOT match HF, but rel err was only {worst_wrong:e} -- the test lacks teeth");
     }
 }
 
