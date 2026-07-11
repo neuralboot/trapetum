@@ -23,16 +23,17 @@ const TY: usize = 8;
 // GPUs have far fewer cores, so fewer, fatter threadgroups (less atomic-reduce
 // contention) win. Overridable via TRAPETUM_GS for tuning; default 8.
 //
-// DETERMINISM: grid.y > 1 makes the kernel reduce IC-slices with an atomic_fetch_add whose
-// float add-order is scheduler-dependent -> run-to-run NONDETERMINISTIC output (proven: 30/30
-// identical-input GEMV runs differ bitwise at GS=16, 0/30 at GS=1). TRAPETUM_DETERMINISTIC:
-//   0/unset = atomic (fast, nondeterministic)
+// DETERMINISM: grid.y > 1 makes the atomic-reduce kernel scheduler-order-dependent -> run-to-run
+// NONDETERMINISTIC (proven: 30/30 identical-input GEMV runs differ at GS=16). The two-stage
+// fixed-order reduction (mode 2) is deterministic AND measured FASTER than atomics on BOTH
+// backends (Metal M4 and the pod's RTX 6000 Ada: atomic contention was a hidden tax), so it is
+// now the DEFAULT. TRAPETUM_DETERMINISTIC:
+//   0       = atomic (fast-path A/B only; nondeterministic)
 //   1       = grid.y=1 (no cross-block atomics; slow on small-OC layers)
-//   2       = two-stage fixed-order reduction (grid.y kept; gemv4_partial -> gemv_reduce sums
-//             the GS partials per column in fixed order) -> deterministic AND keeps the IC split.
+//   2/unset = two-stage fixed-order (gemv4_partial -> gemv_reduce), deterministic, keeps IC split.
 fn det_mode() -> u64 {
     static M: OnceLock<u64> = OnceLock::new();
-    *M.get_or_init(|| std::env::var("TRAPETUM_DETERMINISTIC").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    *M.get_or_init(|| std::env::var("TRAPETUM_DETERMINISTIC").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
 }
 fn gs() -> u64 {
     static G: OnceLock<u64> = OnceLock::new();

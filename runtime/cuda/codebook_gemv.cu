@@ -14,16 +14,17 @@
 #define TY 8
 #define GS 20
 
-// grid.y IC-split for the fused codebook GEMVs. GS>1 blocks reduce their IC-slice partials
-// into Yacc with atomicAdd, whose float add-order is scheduler-dependent -> run-to-run
-// NONDETERMINISTIC output (near-tie logits flip between runs, and the greedy sequence with
-// them). TRAPETUM_DETERMINISTIC (read once, cached; mirrors the Metal backend):
-//   0/unset = atomic (fast, nondeterministic)
-//   1       = grid.y=1: each output element written by one block, no cross-block atomics (slow on small OC)
-//   2       = two-stage fixed-order reduction (gemv4_partial -> gemv_reduce), deterministic, keeps IC split
+// grid.y IC-split for the fused codebook GEMVs. GS>1 blocks reduce IC-slice partials with
+// atomicAdd (scheduler-order-dependent -> run-to-run NONDETERMINISTIC). The two-stage fixed-order
+// reduction (mode 2) is deterministic AND measured FASTER than atomics on BOTH backends (pod
+// RTX 6000 Ada: DET=2 9.7-10.0 tok/s vs DET=0 9.4-9.5; Metal likewise), so it is the DEFAULT.
+// TRAPETUM_DETERMINISTIC (read once, cached; mirrors the Metal backend):
+//   0       = atomic (fast-path; nondeterministic)
+//   1       = grid.y=1: one block per output element, no cross-block atomics (slow on small OC)
+//   2/unset = two-stage fixed-order (gemv4_partial -> gemv_reduce), deterministic, keeps IC split
 static int det_mode() {
     static int m = -1;
-    if (m < 0) { const char* e = getenv("TRAPETUM_DETERMINISTIC"); m = (e && e[1] == 0 && (e[0]=='1'||e[0]=='2')) ? (e[0]-'0') : 0; }
+    if (m < 0) { const char* e = getenv("TRAPETUM_DETERMINISTIC"); m = (e && e[1] == 0 && e[0] >= '0' && e[0] <= '2') ? (e[0]-'0') : 2; }
     return m;
 }
 static int det_gs() { return det_mode() == 1 ? 1 : GS; } // mode 1 collapses grid.y; modes 0/2 keep GS
