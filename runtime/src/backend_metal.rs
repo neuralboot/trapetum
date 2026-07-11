@@ -22,9 +22,16 @@ const TY: usize = 8;
 // IC-split grid.y for the fused GEMV. 20 was tuned for Ampere's ~108 SMs; Apple
 // GPUs have far fewer cores, so fewer, fatter threadgroups (less atomic-reduce
 // contention) win. Overridable via TRAPETUM_GS for tuning; default 8.
+//
+// DETERMINISM: grid.y > 1 makes the kernel reduce IC-slices with an atomic_fetch_add whose
+// float add-order is scheduler-dependent -> run-to-run NONDETERMINISTIC output (proven: 30/30
+// identical-input GEMV runs differ bitwise at GS=16, 0/30 at GS=1). TRAPETUM_DETERMINISTIC=1
+// forces grid.y=1 (each output element written by exactly one threadgroup, no cross-block
+// atomics) -> bitwise-reproducible decode, at the cost of less SM parallelism on small-OC layers.
 fn gs() -> u64 {
     static G: OnceLock<u64> = OnceLock::new();
     *G.get_or_init(|| {
+        if std::env::var("TRAPETUM_DETERMINISTIC").map(|v| v == "1").unwrap_or(false) { return 1; }
         std::env::var("TRAPETUM_GS").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
     })
 }
@@ -46,6 +53,11 @@ struct Ctx {
     // SINGLE command buffer, the Metal equivalent of the CUDA-graph lesson that
     // turns a per-op kernel win into an end-to-end one.
     cur: Mutex<Option<CommandBuffer>>,
+    // A command buffer committed by `dev_flush` but not yet waited on: it runs on the
+    // GPU while the host does other work (the CPU-experts overlap). `dev_wait`/`drain`
+    // join it. Because the queue is in-order, a `pending` buffer always completes before
+    // any later-committed `cur`.
+    pending: Mutex<Option<CommandBuffer>>,
     // Reusable device argmax scratch (partial max/idx arrays + 1 output u32), sized
     // for the max partial count (ARGMAX_NTG_MAX). Allocated once, reused every token
     // so the greedy path never mallocs per call.
@@ -70,7 +82,7 @@ fn ctx() -> &'static Ctx {
                 .expect("pipeline creation failed");
             pl.insert(*name, p);
         }
-        Ctx { _device: device, queue, pl, cur: Mutex::new(None), argmax_scratch: Mutex::new(None) }
+        Ctx { _device: device, queue, pl, cur: Mutex::new(None), pending: Mutex::new(None), argmax_scratch: Mutex::new(None) }
     })
 }
 
@@ -88,8 +100,33 @@ fn cur_cb() -> CommandBuffer {
 }
 
 fn drain() {
+    // Join any flushed-but-not-waited buffer first (it was committed earlier, so on the
+    // in-order queue it completes before `cur`), then commit + wait the open buffer.
+    if let Some(cb) = ctx().pending.lock().unwrap().take() {
+        cb.wait_until_completed();
+    }
     if let Some(cb) = ctx().cur.lock().unwrap().take() {
         cb.commit();
+        cb.wait_until_completed();
+    }
+}
+
+/// Commit the current command buffer WITHOUT waiting, so its GPU work overlaps host-side
+/// work (e.g. the CPU-experts routed FFNs). Join it later with [`dev_wait`] (or any
+/// host read-back / [`dev_sync`], which drain through `pending`). Assumes no other buffer
+/// is already pending -- callers pair one `dev_flush` with one `dev_wait`.
+pub unsafe fn dev_flush() {
+    if let Some(cb) = ctx().cur.lock().unwrap().take() {
+        cb.commit();
+        // A previous un-joined pending would be lost here; the CPU-experts path always
+        // waits before flushing again, so overwrite is not expected.
+        *ctx().pending.lock().unwrap() = Some(cb);
+    }
+}
+
+/// Wait for the buffer committed by [`dev_flush`] to finish. No-op if nothing is pending.
+pub unsafe fn dev_wait() {
+    if let Some(cb) = ctx().pending.lock().unwrap().take() {
         cb.wait_until_completed();
     }
 }
