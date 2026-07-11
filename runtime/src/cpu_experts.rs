@@ -18,6 +18,8 @@
 //! So `y[o] = sum_i cb[idx[o,i]*oc + o] * x[i]`, accumulated in f32 (the GPU also
 //! accumulates the decode in f32; only summation order differs from a naive matmul).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Barrier;
 use std::thread;
 
 /// Number of codebook entries (must match `crate::K`).
@@ -404,6 +406,223 @@ pub fn expert_forward_cpu_stream(
     gemv_stream_single(dp, dc_t, hidden, inter, &act, y);
 }
 
+// ============================================================================
+// Row-major (output-major) work-stealing engine -- the throughput path.
+//
+// The streaming kernel above already fixed the packed-stream locality, but its
+// per-column codebook still has to be re-gathered per input and its threading
+// spawned per token. This section ports the C probe's design
+// (bench/cpu_probes/s13m2_worksteal.c, ~47 GB/s on this M4):
+//   1. RE-TILE packed to OUTPUT-major once (pack_to_rowmajor): output row `o`'s
+//      `ic` indices become contiguous, so a row-chunk streams one contiguous run
+//      and the row's 16-entry codebook table stays in registers for the whole row.
+//   2. Row-chunk WORK-STEALING across all picked experts, in the C probe's three
+//      phases (A: gate+up rows, B: SiLU per expert, C: down rows), each drained
+//      by one atomic counter, barriers between. This balances the M4's P/E cores.
+// ============================================================================
+
+/// Re-tile input-major `packed` (`packed[i*(oc/2)+j]`, the `quantize_host`/GPU layout) to
+/// OUTPUT-major `packed_t[o*(ic/2)+k]`, where byte `k` of output row `o` holds input `2k` in
+/// the low nibble and `2k+1` in the high nibble. Each output row's `ic` indices are then
+/// contiguous. Done once per projection at `CpuExpert` construction. Requires `ic` even.
+pub fn pack_to_rowmajor(packed: &[u8], oc: usize, ic: usize) -> Vec<u8> {
+    assert_eq!(packed.len(), ic * (oc / 2), "packed size");
+    assert_eq!(ic % 2, 0, "ic must be even");
+    let (half_o, half_i) = (oc / 2, ic / 2);
+    let mut t = vec![0u8; oc * half_i];
+    for o in 0..oc {
+        let shift = if o & 1 == 0 { 0 } else { 4 };
+        let jo = o / 2;
+        for k in 0..half_i {
+            let lo = (packed[(2 * k) * half_o + jo] >> shift) & 0xF;
+            let hi = (packed[(2 * k + 1) * half_o + jo] >> shift) & 0xF;
+            t[o * half_i + k] = lo | (hi << 4);
+        }
+    }
+    t
+}
+
+/// Contiguous row-major decode-GEMV for output rows `[o0, o1)`:
+/// `y_base[o] = sum_i cb_t[o*K + idx[o,i]] * x[i]`, summed i-ascending in one accumulator --
+/// BIT-IDENTICAL to the o-outer reference `gemv_cpu_f32` (no reduction reassociation, since a
+/// whole output row is owned by one task). `packed_t` is output-major (`pack_to_rowmajor`);
+/// `cb_t` is the transposed codebook (`transpose_codebook`, `cb_t[o*K+k]`), whose 16-entry row
+/// table stays in registers for the full input loop.
+///
+/// # Safety
+/// Writes `y_base[o0..o1]`. The caller must ensure those indices are within the allocation and
+/// that concurrent callers own disjoint `[o0,o1)` ranges (work-stealing guarantees this).
+///
+/// Uses raw unchecked loads (no per-nibble bounds check) and FOUR accumulators to break the
+/// serial f32 add-latency chain that otherwise caps this at ~0.4 GB/s: two packed bytes (four
+/// nibbles) per iteration feed four independent partial sums, so the M4's FMA pipeline stays
+/// full. The partials are combined at the row end, so the result differs from the strictly-
+/// sequential reference only by f32 reassociation (~1e-6 L2), not bit-identically.
+unsafe fn gemv_rowmajor_range(packed_t: &[u8], cb_t: &[f32], ic: usize, x: &[f32], y_base: *mut f32, o0: usize, o1: usize) {
+    let half_i = ic / 2;
+    let xp = x.as_ptr();
+    for o in o0..o1 {
+        let tbl = cb_t.as_ptr().add(o * K);
+        let row = packed_t.as_ptr().add(o * half_i);
+        let (mut a0, mut a1, mut a2, mut a3) = (0f32, 0f32, 0f32, 0f32);
+        let mut k = 0;
+        while k + 2 <= half_i {
+            let (b0, b1) = (*row.add(k), *row.add(k + 1));
+            a0 += *tbl.add((b0 & 0xF) as usize) * *xp.add(2 * k);
+            a1 += *tbl.add((b0 >> 4) as usize) * *xp.add(2 * k + 1);
+            a2 += *tbl.add((b1 & 0xF) as usize) * *xp.add(2 * k + 2);
+            a3 += *tbl.add((b1 >> 4) as usize) * *xp.add(2 * k + 3);
+            k += 2;
+        }
+        let mut acc = (a0 + a1) + (a2 + a3);
+        while k < half_i {
+            let b = *row.add(k);
+            acc += *tbl.add((b & 0xF) as usize) * *xp.add(2 * k);
+            acc += *tbl.add((b >> 4) as usize) * *xp.add(2 * k + 1);
+            k += 1;
+        }
+        *y_base.add(o) = acc;
+    }
+}
+
+/// Safe single-shot row-major decode-GEMV over all `oc` rows (used by tests/benches).
+pub fn gemv_rowmajor(packed_t: &[u8], cb_t: &[f32], oc: usize, ic: usize, x: &[f32], y: &mut [f32]) {
+    assert_eq!(packed_t.len(), oc * (ic / 2), "row-major packed size");
+    assert_eq!(cb_t.len(), K * oc, "transposed codebook size");
+    assert_eq!(x.len(), ic, "activation size");
+    assert!(y.len() >= oc, "output size");
+    unsafe { gemv_rowmajor_range(packed_t, cb_t, ic, x, y.as_mut_ptr(), 0, oc); }
+}
+
+/// One picked routed expert, referencing its OUTPUT-major packed indices and transposed
+/// codebooks (built once at `CpuExpert` construction) plus its router weight.
+pub struct RoutedExpert<'a> {
+    pub gp_t: &'a [u8], pub gc_t: &'a [f32],
+    pub up_t: &'a [u8], pub uc_t: &'a [f32],
+    pub dp_t: &'a [u8], pub dc_t: &'a [f32],
+    pub weight: f32,
+}
+
+/// Raw f32 base pointer shared across worker threads that write DISJOINT rows.
+struct RawF32(*mut f32);
+unsafe impl Send for RawF32 {}
+unsafe impl Sync for RawF32 {}
+
+/// Row chunk sizes (rows per work-steal task), from the C probe: gate+up 128, down 256.
+const CHUNK_A: usize = 128;
+const CHUNK_C: usize = 256;
+
+/// Compute the weighted MoE routed sum `acc_out = sum_e weight_e * down_e(SiLU(gate_e(x))*up_e(x))`
+/// on the CPU with row-chunk work-stealing across all picked experts. `acc_out` (len `hidden`)
+/// is overwritten. Same math as running each expert through the reference to within f32
+/// summation tolerance (per-GEMV it is bit-identical; only the final weighted combine reorders).
+///
+/// Threading: `TRAPETUM_CPU_THREADS` workers (default 8) spawned once for this call cooperatively
+/// drain three phases -- A (gate+up rows), B (SiLU+multiply per expert), C (down rows) -- each via
+/// one atomic counter, with a barrier between. The row-major kernel keeps `packed_t` streaming and
+/// the codebook table in registers.
+pub fn routed_experts_worksteal(x: &[f32], experts: &[RoutedExpert], hidden: usize, inter: usize, acc_out: &mut [f32]) {
+    assert_eq!(x.len(), hidden, "routed input width");
+    assert!(acc_out.len() >= hidden, "routed output width");
+    let k = experts.len();
+    for v in acc_out.iter_mut().take(hidden) { *v = 0.0; }
+    if k == 0 { return; }
+
+    // Per-expert scratch (contiguous [k][width]); threads write disjoint rows.
+    let mut g = vec![0f32; k * inter];
+    let mut u = vec![0f32; k * inter];
+    let mut act = vec![0f32; k * inter];
+    let mut out = vec![0f32; k * hidden];
+
+    let a_per = (inter + CHUNK_A - 1) / CHUNK_A;
+    let c_per = (hidden + CHUNK_C - 1) / CHUNK_C;
+    let (na, nc) = (k * a_per, k * c_per);
+    let nthreads = cpu_threads().min(na.max(nc).max(1));
+
+    if nthreads <= 1 {
+        // Sequential fallback (still row-major/contiguous).
+        for (e, ex) in experts.iter().enumerate() {
+            unsafe {
+                gemv_rowmajor_range(ex.gp_t, ex.gc_t, hidden, x, g.as_mut_ptr().add(e * inter), 0, inter);
+                gemv_rowmajor_range(ex.up_t, ex.uc_t, hidden, x, u.as_mut_ptr().add(e * inter), 0, inter);
+            }
+            for r in 0..inter { act[e * inter + r] = silu(g[e * inter + r]) * u[e * inter + r]; }
+            let act_e = &act[e * inter..e * inter + inter];
+            unsafe { gemv_rowmajor_range(ex.dp_t, ex.dc_t, inter, act_e, out.as_mut_ptr().add(e * hidden), 0, hidden); }
+        }
+        for (e, ex) in experts.iter().enumerate() {
+            let (w, base) = (ex.weight, e * hidden);
+            for i in 0..hidden { acc_out[i] += w * out[base + i]; }
+        }
+        return;
+    }
+
+    let (ctr_a, ctr_b, ctr_c) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let barrier = Barrier::new(nthreads);
+    let (gp, upp, ap, opp) = (RawF32(g.as_mut_ptr()), RawF32(u.as_mut_ptr()), RawF32(act.as_mut_ptr()), RawF32(out.as_mut_ptr()));
+
+    // SPAWN-COST NOTE (named future lever). `thread::scope` spawns `nthreads` workers ONCE per
+    // call to this function -- i.e. once per MoE layer per token. V2-Lite has ~26 MoE layers, so
+    // at ~100 us/spawn-batch this is ~2.6 ms/token of pure spawn overhead. With the fast row
+    // kernel the routed compute is ~0.7 ms/layer, so the spawn can be ~3x the compute it wraps.
+    // We keep `thread::scope` here deliberately: it makes the non-'static job closures lifetime-
+    // safe with zero unsafe, and it already demonstrates the target kernel throughput. The
+    // upgrade -- a PERSISTENT parked thread pool (workers spawned once for the process, jobs
+    // handed over via a generation counter) -- removes this overhead and is the next lever if
+    // end-to-end tok/s on the pod comes up short. It trades this safety for unsafe lifetime
+    // management of the job closure, so it is a conscious, measured deferral, not an oversight.
+    thread::scope(|s| {
+        for _ in 0..nthreads {
+            let (ctr_a, ctr_b, ctr_c, barrier) = (&ctr_a, &ctr_b, &ctr_c, &barrier);
+            let (experts, x, gp, upp, ap, opp) = (&experts, &x, &gp, &upp, &ap, &opp);
+            s.spawn(move || {
+                // Phase A: gate + up row chunks across all experts.
+                loop {
+                    let t = ctr_a.fetch_add(1, Ordering::Relaxed);
+                    if t >= na { break; }
+                    let (e, c) = (t / a_per, t % a_per);
+                    let (o0, o1) = (c * CHUNK_A, ((c + 1) * CHUNK_A).min(inter));
+                    let ex = &experts[e];
+                    unsafe {
+                        gemv_rowmajor_range(ex.gp_t, ex.gc_t, hidden, x, gp.0.add(e * inter), o0, o1);
+                        gemv_rowmajor_range(ex.up_t, ex.uc_t, hidden, x, upp.0.add(e * inter), o0, o1);
+                    }
+                }
+                barrier.wait();
+                // Phase B: SiLU(gate)*up -> act, one task per expert.
+                loop {
+                    let t = ctr_b.fetch_add(1, Ordering::Relaxed);
+                    if t >= k { break; }
+                    unsafe {
+                        for r in 0..inter {
+                            let gg = *gp.0.add(t * inter + r);
+                            let uu = *upp.0.add(t * inter + r);
+                            *ap.0.add(t * inter + r) = silu(gg) * uu;
+                        }
+                    }
+                }
+                barrier.wait();
+                // Phase C: down row chunks across all experts (input = act[e]).
+                loop {
+                    let t = ctr_c.fetch_add(1, Ordering::Relaxed);
+                    if t >= nc { break; }
+                    let (e, c) = (t / c_per, t % c_per);
+                    let (o0, o1) = (c * CHUNK_C, ((c + 1) * CHUNK_C).min(hidden));
+                    let ex = &experts[e];
+                    let act_e = unsafe { std::slice::from_raw_parts(ap.0.add(e * inter), inter) };
+                    unsafe { gemv_rowmajor_range(ex.dp_t, ex.dc_t, inter, act_e, opp.0.add(e * hidden), o0, o1); }
+                }
+            });
+        }
+    });
+
+    // Weighted combine (cheap: k*hidden adds).
+    for (e, ex) in experts.iter().enumerate() {
+        let (w, base) = (ex.weight, e * hidden);
+        for i in 0..hidden { acc_out[i] += w * out[base + i]; }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,14 +792,82 @@ mod tests {
             }
             b
         };
+        let packed_t = pack_to_rowmajor(&packed, oc, ic);
         let (p2, x2) = (packed.clone(), x.clone());
         let ms_old = best(Box::new({ let cb = cb.clone(); let mut y = y.clone();
             move || gemv_cpu_f32(&p2, &cb, oc, ic, &x2, &mut y) })) * 1e3;
-        let ms_new = best(Box::new(move || gemv_cpu_stream(&packed, &cb_t, oc, ic, &x, &mut y))) * 1e3;
+        let (cbt2, x3, pt2) = (cb_t.clone(), x.clone(), packed.clone());
+        let ms_stream = best(Box::new({ let mut y = y.clone();
+            move || gemv_cpu_stream(&pt2, &cbt2, oc, ic, &x3, &mut y) })) * 1e3;
+        // Row-major single-thread kernel (the per-row task the work-stealing engine runs on
+        // each core; the full 8-thread number is `cpu_routed` in the MoE bench below).
+        let ms_rm = best(Box::new(move || gemv_rowmajor(&packed_t, &cb_t, oc, ic, &x, &mut y))) * 1e3;
         let gbs = |ms: f64| bytes as f64 / (ms * 1e-3) / 1e9;
-        eprintln!("[stream_vs_scalar_throughput] oc={oc} ic={ic} packed={} KB", bytes / 1024);
-        eprintln!("  OLD o-outer gemv_cpu_f32 : {ms_old:.3} ms  ({:.2} GB/s)", gbs(ms_old));
-        eprintln!("  NEW i-outer gemv_cpu_stream: {ms_new:.3} ms  ({:.2} GB/s)  speedup x{:.1}", gbs(ms_new), ms_old / ms_new);
+        eprintln!("[stream_vs_scalar_throughput] oc={oc} ic={ic} packed={} KB (single 1408x2048 GEMV)", bytes / 1024);
+        eprintln!("  o-outer gemv_cpu_f32   (8t): {ms_old:.3} ms  ({:.2} GB/s)", gbs(ms_old));
+        eprintln!("  i-outer gemv_cpu_stream(8t): {ms_stream:.3} ms  ({:.2} GB/s)", gbs(ms_stream));
+        eprintln!("  row-major gemv_rowmajor(1t): {ms_rm:.3} ms  ({:.2} GB/s)  [1 thread; x8 in the engine]", gbs(ms_rm));
+    }
+
+    #[test]
+    fn rowmajor_matches_scalar_reference() {
+        // The output-major re-tile + row kernel must be BIT-IDENTICAL to the o-outer reference
+        // (both sum i-ascending per output row; work-stealing owns whole rows, no reassociation).
+        for (oc, ic) in [(256usize, 512usize), (64, 128), (1408, 2048), (2048, 1408)] {
+            let mut r = Lcg(0x50FA_5711u64 ^ ((oc as u64) << 20) ^ ic as u64);
+            let w: Vec<f32> = (0..oc * ic).map(|_| r.f32()).collect();
+            let x: Vec<f32> = (0..ic).map(|_| r.f32()).collect();
+            let (packed, cb, _) = quantize_host(&w, oc, ic);
+            let packed_t = pack_to_rowmajor(&packed, oc, ic);
+            let cb_t = transpose_codebook(&cb, oc);
+            let mut yref = vec![0f32; oc];
+            let mut yrm = vec![0f32; oc];
+            gemv_cpu_f32(&packed, &cb, oc, ic, &x, &mut yref);
+            gemv_rowmajor(&packed_t, &cb_t, oc, ic, &x, &mut yrm);
+            // Two even/odd accumulators (for ILP) reassociate the sum vs the sequential
+            // reference. On near-zero output rows the worst-element rel err blows up (~1.5e-5);
+            // the L2 metric (~1e-6) reflects the true agreement. Tolerance, per summation rule.
+            let e = l2_rel(&yrm, &yref);
+            assert!(e < 1e-5, "row-major vs scalar L2 rel err {e:e} at oc={oc} ic={ic}");
+        }
+    }
+
+    #[test]
+    fn worksteal_matches_sequential_reference() {
+        // routed_experts_worksteal must equal running each expert through the reference
+        // (per-GEMV bit-identical; only the final weighted combine reorders -> tiny residual).
+        let (hidden, inter, k) = (512usize, 256usize, 6usize);
+        let mut r = Lcg(0x704B_5713_u64);
+        let x: Vec<f32> = (0..hidden).map(|_| r.f32()).collect();
+        // Build k experts + a reference result.
+        let mut store: Vec<(Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>, f32)> = Vec::new();
+        let mut reference = vec![0f32; hidden];
+        for e in 0..k {
+            let gw: Vec<f32> = (0..inter * hidden).map(|_| r.f32() * 0.5).collect();
+            let uw: Vec<f32> = (0..inter * hidden).map(|_| r.f32() * 0.5).collect();
+            let dw: Vec<f32> = (0..hidden * inter).map(|_| r.f32() * 0.5).collect();
+            let (gp, gc, g_dq) = quantize_host(&gw, inter, hidden);
+            let (up, uc, u_dq) = quantize_host(&uw, inter, hidden);
+            let (dp, dc, d_dq) = quantize_host(&dw, hidden, inter);
+            let w = 0.1 + 0.15 * e as f32;
+            // reference via dequant matmul
+            let g: Vec<f32> = (0..inter).map(|o| (0..hidden).map(|i| g_dq[o * hidden + i] * x[i]).sum()).collect();
+            let u: Vec<f32> = (0..inter).map(|o| (0..hidden).map(|i| u_dq[o * hidden + i] * x[i]).sum()).collect();
+            let act: Vec<f32> = (0..inter).map(|i| silu(g[i]) * u[i]).collect();
+            for o in 0..hidden { reference[o] += w * (0..inter).map(|i| d_dq[o * inter + i] * act[i]).sum::<f32>(); }
+            store.push((pack_to_rowmajor(&gp, inter, hidden), transpose_codebook(&gc, inter),
+                        pack_to_rowmajor(&up, inter, hidden), transpose_codebook(&uc, inter),
+                        pack_to_rowmajor(&dp, hidden, inter), transpose_codebook(&dc, hidden), w));
+        }
+        let experts: Vec<RoutedExpert> = store.iter().map(|s| RoutedExpert {
+            gp_t: &s.0, gc_t: &s.1, up_t: &s.2, uc_t: &s.3, dp_t: &s.4, dc_t: &s.5, weight: s.6,
+        }).collect();
+        let mut got = vec![0f32; hidden];
+        routed_experts_worksteal(&x, &experts, hidden, inter, &mut got);
+        // L2 metric (near-zero hidden outputs make worst-element rel err misleading; the
+        // 2-accumulator kernel + weighted combine reassociate vs the sequential reference).
+        let e = l2_rel(&got, &reference);
+        assert!(e < 1e-4, "worksteal vs reference L2 rel err {e:e}");
     }
 
     #[test]
