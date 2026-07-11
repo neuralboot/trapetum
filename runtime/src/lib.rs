@@ -1656,8 +1656,10 @@ fn moe_route_v3(logits: &[f32], score_bias: &[f32], n_experts: usize, n_group: u
 /// path (`TRAPETUM_CPU_EXPERTS=1`). Owns the exact six slices `ExpertHost::Scalar` stores;
 /// evaluated by [`cpu_experts::expert_forward_cpu`]. This is the VRAM-savings variant: the
 /// bulk of a MoE model's weights (the routed experts) stays in RAM.
+// Codebooks are stored PRE-TRANSPOSED (`cb_t[o*K+k]`, see `cpu_experts::transpose_codebook`)
+// so the streaming decode-GEMV reads each output column's 16-entry table contiguously.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-struct CpuExpert { gp: Vec<u8>, gc: Vec<f32>, up: Vec<u8>, uc: Vec<f32>, dp: Vec<u8>, dc: Vec<f32> }
+struct CpuExpert { gp: Vec<u8>, gc_t: Vec<f32>, up: Vec<u8>, uc_t: Vec<f32>, dp: Vec<u8>, dc_t: Vec<f32> }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct MoeBlock {
@@ -1735,10 +1737,11 @@ impl MoeBlock {
         // Routed experts: host-side copies (CPU mode) or GPU-uploaded QuantLinears (GPU mode).
         // The shared expert always stays on the GPU.
         let (gpu_experts, cpu_experts) = if cpu {
+            // gate/up: oc=inter; down: oc=hidden. Transpose each codebook once here.
             let ce: Vec<CpuExpert> = experts.iter().map(|e| CpuExpert {
-                gp: e.0.to_vec(), gc: e.1.to_vec(),
-                up: e.2.to_vec(), uc: e.3.to_vec(),
-                dp: e.4.to_vec(), dc: e.5.to_vec(),
+                gp: e.0.to_vec(), gc_t: cpu_experts::transpose_codebook(e.1, inter),
+                up: e.2.to_vec(), uc_t: cpu_experts::transpose_codebook(e.3, inter),
+                dp: e.4.to_vec(), dc_t: cpu_experts::transpose_codebook(e.5, hidden),
             }).collect();
             (Vec::new(), Some(ce))
         } else {
@@ -1878,15 +1881,44 @@ impl MoeBlock {
         #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
         { overlapped = false; }
 
-        // Routed experts on CPU threads (concurrent with the shared GPU work when overlapped).
+        // Routed experts on CPU threads: parallelize ACROSS the top-k experts (one expert per
+        // thread, each with the single-threaded streaming forward). This spawns a thread batch
+        // ONCE per token instead of once per GEMV, and keeps each expert's packed stream hot in
+        // one core's cache. Threads accumulate into private weighted partials, reduced at the end.
         let t_cpu = std::time::Instant::now();
-        let mut acc_host = vec![0f32; self.hidden];
-        let mut y = vec![0f32; self.hidden];
-        for &(e, w) in picks {
-            let ce = &self.cpu_experts.as_ref().expect("routed_cpu without cpu_experts")[e];
-            cpu_experts::expert_forward_cpu(&x, &ce.gp, &ce.gc, &ce.up, &ce.uc, &ce.dp, &ce.dc,
-                                            self.hidden, self.inter, &mut y);
-            for i in 0..self.hidden { acc_host[i] += w * y[i]; }
+        let (hidden, inter) = (self.hidden, self.inter);
+        let cpu = self.cpu_experts.as_ref().expect("routed_cpu without cpu_experts");
+        let nthreads = cpu_experts::cpu_threads().min(picks.len().max(1));
+        let mut acc_host = vec![0f32; hidden];
+        if nthreads <= 1 {
+            let mut y = vec![0f32; hidden];
+            for &(e, w) in picks {
+                let ce = &cpu[e];
+                cpu_experts::expert_forward_cpu_stream(&x, &ce.gp, &ce.gc_t, &ce.up, &ce.uc_t, &ce.dp, &ce.dc_t, hidden, inter, &mut y);
+                for i in 0..hidden { acc_host[i] += w * y[i]; }
+            }
+        } else {
+            // Contiguous static split of picks across threads (top_k is small; the streaming
+            // kernel is compute-uniform per expert, so static balance is fine here).
+            let per = (picks.len() + nthreads - 1) / nthreads;
+            let partials: Vec<Vec<f32>> = std::thread::scope(|s| {
+                let mut handles = Vec::new();
+                for chunk in picks.chunks(per) {
+                    let (cpu, x) = (&cpu, &x);
+                    handles.push(s.spawn(move || {
+                        let mut accp = vec![0f32; hidden];
+                        let mut y = vec![0f32; hidden];
+                        for &(e, w) in chunk {
+                            let ce = &cpu[e];
+                            cpu_experts::expert_forward_cpu_stream(x, &ce.gp, &ce.gc_t, &ce.up, &ce.uc_t, &ce.dp, &ce.dc_t, hidden, inter, &mut y);
+                            for i in 0..hidden { accp[i] += w * y[i]; }
+                        }
+                        accp
+                    }));
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for p in &partials { for i in 0..hidden { acc_host[i] += p[i]; } }
         }
         let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1e3;
 
