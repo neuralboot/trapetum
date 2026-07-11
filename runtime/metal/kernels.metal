@@ -140,6 +140,90 @@ kernel void gemv_reduce(
     Y[i] = s;
 }
 
+// ============================================================================
+// K256 8-bit codebook GEMV (S19 mixed precision). Indices are one uint8 per
+// element (idx[IC,OC], NOT nibble-packed), codebook cb[256,OC] half. Used for the
+// shared experts + lm_head, whose k-means MSE at K=256 is ~K^-2 better than K=16
+// (S18: 13/15 worst-damaged tensors are shared experts, lm_head worst per-layer).
+// CPB8=32 columns/threadgroup keeps the staged codebook (256*32 halves = 16 KB)
+// plus red (8*32 f32 = 1 KB) inside Apple's 32 KB threadgroup limit; each of the 32
+// lanes owns one output column. The CUDA twin uses CPB=128 with a vectorized uint32
+// index read and 64 KB opt-in shared -- Apple caps threadgroup memory at 32 KB, so
+// the Metal tile is narrower (correctness platform; the pod/CUDA path is the fast one).
+#define K8   256
+#define CPB8 32
+
+kernel void gemv8(
+    device const half*  X       [[buffer(0)]],
+    device const uchar* idx     [[buffer(1)]],   // [IC, OC] one uint8 index per element
+    device const half*  cb      [[buffer(2)]],   // [K8, OC]
+    device atomic_float* Yacc   [[buffer(3)]],
+    constant GemvParams& p      [[buffer(4)]],
+    threadgroup half*  s_cb     [[threadgroup(0)]],   // K8*CPB8 halfs
+    threadgroup float* red      [[threadgroup(1)]],   // TY*CPB8 floats
+    uint3 tptg [[thread_position_in_threadgroup]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tgpg [[threadgroups_per_grid]])
+{
+    const int IC = p.ic, OC = p.oc;
+    int tx = tptg.x, ty = tptg.y, tid = ty*32 + tx, nth = 32*TY;
+    int j0 = tgpig.x * CPB8;
+    for (int t = tid; t < K8*CPB8; t += nth) { int k = t/CPB8, jj = j0 + (t%CPB8); s_cb[t] = cb[(ulong)k*OC + jj]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int per = (IC + (int)tgpg.y - 1) / (int)tgpg.y;
+    int ic0 = tgpig.y * per, ic1 = min(IC, ic0 + per);
+    int col = j0 + tx;
+    float acc = 0;
+    for (int ic = ic0 + ty; ic < ic1; ic += TY) {
+        uchar id = idx[(ulong)ic*OC + col];
+        acc += (float)X[ic] * (float)s_cb[id*CPB8 + tx];
+    }
+    red[ty*CPB8 + tx] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ty == 0) {
+        float s = 0;
+        for (int y = 0; y < TY; y++) s += red[y*CPB8 + tx];
+        atomic_fetch_add_explicit(&Yacc[j0 + tx], s, memory_order_relaxed);
+    }
+}
+
+// Deterministic two-stage twin of gemv8: each grid.y block writes its IC-slice partial
+// to its own row of Ypart (disjoint, no atomics); gemv_reduce (K-agnostic) sums the GS
+// partial rows per column in fixed grid.y order -> bitwise-reproducible.
+kernel void gemv8_partial(
+    device const half*  X       [[buffer(0)]],
+    device const uchar* idx     [[buffer(1)]],
+    device const half*  cb      [[buffer(2)]],
+    device float*       Ypart   [[buffer(3)]],
+    constant GemvParams& p      [[buffer(4)]],
+    threadgroup half*  s_cb     [[threadgroup(0)]],
+    threadgroup float* red      [[threadgroup(1)]],
+    uint3 tptg [[thread_position_in_threadgroup]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tgpg [[threadgroups_per_grid]])
+{
+    const int IC = p.ic, OC = p.oc;
+    int tx = tptg.x, ty = tptg.y, tid = ty*32 + tx, nth = 32*TY;
+    int j0 = tgpig.x * CPB8;
+    for (int t = tid; t < K8*CPB8; t += nth) { int k = t/CPB8, jj = j0 + (t%CPB8); s_cb[t] = cb[(ulong)k*OC + jj]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int per = (IC + (int)tgpg.y - 1) / (int)tgpg.y;
+    int ic0 = tgpig.y * per, ic1 = min(IC, ic0 + per);
+    int col = j0 + tx;
+    float acc = 0;
+    for (int ic = ic0 + ty; ic < ic1; ic += TY) {
+        uchar id = idx[(ulong)ic*OC + col];
+        acc += (float)X[ic] * (float)s_cb[id*CPB8 + tx];
+    }
+    red[ty*CPB8 + tx] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ty == 0) {
+        float s = 0;
+        for (int y = 0; y < TY; y++) s += red[y*CPB8 + tx];
+        Ypart[(ulong)tgpig.y * OC + (j0 + tx)] = s;
+    }
+}
+
 kernel void cast_f2h(
     device const float* src [[buffer(0)]],
     device half* dst        [[buffer(1)]],

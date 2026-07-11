@@ -1091,6 +1091,26 @@ mod tests {
         let _ = (mism, worst);
     }
 
+    #[test]
+    fn gemv8_k256_matches_dequant_and_is_deterministic() {
+        // S19 increment 1: the K256 8-bit decode GEMV (gemv8) decodes uint8 indices against a
+        // per-column 256-entry codebook and matches a CPU reference that uses the GPU's exact
+        // fp16 codebook + fp16 activations -- so the only residual is float summation order.
+        // Also checks the path is bitwise run-to-run deterministic under the default (two-stage)
+        // mode. Two shapes: a wide small-OC (8192x512) and a shared-expert-shaped OC (2048x1408).
+        for (ic, oc) in [(8192usize, 512usize), (2048usize, 1408usize)] {
+            let (worst_rel, l2, mism) = crate::check_gpu_gemv8_vs_ref(ic, oc, 10);
+            let mode = std::env::var("TRAPETUM_DETERMINISTIC").unwrap_or_else(|_| "2(default)".into());
+            eprintln!("[gemv8_k256 ic={ic} oc={oc} mode={mode}] vs fp16cb-ref: worst_rel={worst_rel:e} l2={l2:e}; \
+                       determinism: {mism}/10 runs differ bitwise");
+            assert!(l2 < 5e-3, "K256 gemv8 vs fp16-codebook reference l2={l2:e} too large (ic={ic} oc={oc})");
+            // Under the default deterministic mode the path must be bitwise stable. If the env
+            // forces the atomic mode (=0) skip the determinism gate (atomics reorder by design).
+            let atomic = std::env::var("TRAPETUM_DETERMINISTIC").map(|v| v == "0").unwrap_or(false);
+            if !atomic { assert_eq!(mism, 0, "K256 gemv8 not deterministic under mode {mode} (ic={ic} oc={oc})"); }
+        }
+    }
+
     // Build k routed experts with RANDOM row-major packed + transposed codebooks (fast; we test
     // scheduling/timing, not decode accuracy). Returns (store, x) -- refs are built by the caller.
     fn rand_experts(hidden: usize, inter: usize, k: usize, seed: u64)

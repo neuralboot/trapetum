@@ -19,7 +19,7 @@ use std::sync::Arc;
 mod backend {
     use std::os::raw::c_void;
     extern "C" {
-        pub fn qlinear_create(packed: *const u8, cb: *const f32, ic: i32, oc: i32) -> *mut c_void;
+        pub fn qlinear_create(packed: *const u8, cb: *const f32, ic: i32, oc: i32, k: i32) -> *mut c_void;
         pub fn qlinear_forward_dev(h: *mut c_void, d_x: *const c_void, d_y: *mut c_void);
         pub fn qlinear_free(h: *mut c_void);
         // AVQ (additive-codebook) linear for MoE routed experts (M in {2,3}); see AvqLinear.
@@ -179,21 +179,38 @@ pub struct QuantLinear {
     handle: *mut c_void,
     ic: usize,
     oc: usize,
+    k: usize,
 }
 
 impl QuantLinear {
+    /// 4-bit (K=16) scalar codebook linear.
     /// - `packed`: `(ic, oc/2)` bytes, two 4-bit indices per byte (low nibble first).
-    /// - `codebook`: `(K, oc)` f32, one per-output-channel table.
+    /// - `codebook`: `(16, oc)` f32, one per-output-channel table.
     pub fn new(packed: &[u8], codebook: &[f32], ic: usize, oc: usize) -> Self {
-        assert_eq!(packed.len(), ic * (oc / 2), "packed must be ic*(oc/2) bytes");
-        assert_eq!(codebook.len(), K * oc, "codebook must be K*oc floats");
-        assert_eq!(oc % 256, 0, "oc must be a multiple of 256 (kernel tiling)");
-        assert_eq!(ic % 2, 0, "ic must be even (packed nibbles)");
-        let handle =
-            unsafe { qlinear_create(packed.as_ptr(), codebook.as_ptr(), ic as i32, oc as i32) };
-        assert!(!handle.is_null(), "qlinear_create returned null (CUDA error?)");
-        Self { handle, ic, oc }
+        Self::new_k(packed, codebook, ic, oc, 16)
     }
+
+    /// Scalar codebook linear at `k` entries per output column. `k=16` is the nibble-packed
+    /// 4-bit path (`data` is `ic*(oc/2)` bytes, gemv4). `k=256` is the 8-bit path (S19 mixed
+    /// precision): `data` is `ic*oc` bytes, one uint8 index per element, decoded by gemv8.
+    /// `codebook` is `(k, oc)` f32 in both cases (one per-output-channel table).
+    pub fn new_k(data: &[u8], codebook: &[f32], ic: usize, oc: usize, k: usize) -> Self {
+        assert!(k == 16 || k == 256, "QuantLinear: only K=16 (4-bit) and K=256 (8-bit) are supported");
+        let want_bytes = if k == 256 { ic * oc } else { ic * (oc / 2) };
+        assert_eq!(data.len(), want_bytes, "data must be {} bytes for K={k}", want_bytes);
+        assert_eq!(codebook.len(), k * oc, "codebook must be k*oc floats");
+        // oc%128==0 covers both tilings: Metal gemv8 CPB8=32, CUDA gemv8 CPB=128, gemv4 CPB=256.
+        let div = if k == 256 { 128 } else { 256 };
+        assert_eq!(oc % div, 0, "oc must be a multiple of {div} (kernel tiling for K={k})");
+        assert_eq!(ic % 2, 0, "ic must be even (packed nibbles / uint32 index read)");
+        let handle =
+            unsafe { qlinear_create(data.as_ptr(), codebook.as_ptr(), ic as i32, oc as i32, k as i32) };
+        assert!(!handle.is_null(), "qlinear_create returned null (CUDA error?)");
+        Self { handle, ic, oc, k }
+    }
+
+    /// Codebook size (16 or 256).
+    pub fn k(&self) -> usize { self.k }
 
     /// `y` (device f32) = `x` (device fp16) W^T. Fully on-device, no host copies.
     pub fn forward_into(&self, x: &DevHalf, y: &mut DevF32) {
@@ -1416,6 +1433,53 @@ pub fn check_gpu_gemv_vs_fp16cb_ref(ic: usize, oc: usize) -> (f64, f64) {
         num += d*d; den += (yref[o] as f64)*(yref[o] as f64);
     }
     (worst, num.sqrt() / den.sqrt().max(1e-12))
+}
+
+/// K256 (8-bit) decode-correctness: compare the GPU `gemv8` fused decode against a CPU reference
+/// that uses the SAME fp16-rounded codebook + fp16 activations the GPU stores, so the only residual
+/// is float summation order (not fp16-vs-f32 codebook rounding). Synthetic: random uint8 indices
+/// `idx[ic*oc]` and a random `cb[256*oc]` codebook (one table per output column). Returns
+/// `(worst_rel, l2_rel)`. Also asserts the K256 path is bitwise run-to-run deterministic under the
+/// active mode (the two-stage default): `iters` extra runs must match the first bit-for-bit.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn check_gpu_gemv8_vs_ref(ic: usize, oc: usize, iters: usize) -> (f64, f64, usize) {
+    assert_eq!(oc % 128, 0, "K256 tiling needs oc % 128 == 0"); assert_eq!(ic % 2, 0);
+    let mut s = 0x8B00_0256u64;
+    let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+    // random per-column codebook (256 entries) and random uint8 indices [ic, oc] (input-major)
+    let cb: Vec<f32> = (0..256*oc).map(|_| r()*0.5).collect();
+    let idx: Vec<u8> = (0..ic*oc).map(|_| ((r()*0.5 + 0.5) * 255.0) as u8).collect();
+    let x: Vec<f32> = (0..ic).map(|_| r()).collect();
+    // CPU reference with the GPU's exact fp16 codebook + fp16-rounded X, f32 accumulate:
+    // y[o] = sum_i cb16[idx[i,o]*oc + o] * x16[i].
+    let cb16: Vec<f32> = cb.iter().map(|&c| f16::from_f32(c).to_f32()).collect();
+    let x16: Vec<f32> = x.iter().map(|&v| f16::from_f32(v).to_f32()).collect();
+    let mut yref = vec![0f32; oc];
+    for o in 0..oc {
+        let mut acc = 0f32;
+        for i in 0..ic { let id = idx[i*oc + o] as usize; acc += cb16[id*oc + o] * x16[i]; }
+        yref[o] = acc;
+    }
+    let q = QuantLinear::new_k(&idx, &cb, ic, oc, 256);
+    let dx = DevHalf::from_host(&x);
+    let mut y = DevF32::zeros(oc);
+    q.forward_into(&dx, &mut y);
+    let got = y.to_host();
+    let (mut worst, mut num, mut den) = (0f64, 0f64, 0f64);
+    for o in 0..oc {
+        let d = (got[o] - yref[o]) as f64;
+        worst = worst.max(d.abs() / (yref[o] as f64).abs().max(1e-3));
+        num += d*d; den += (yref[o] as f64)*(yref[o] as f64);
+    }
+    // determinism: extra runs must be bitwise identical to the first
+    let mut mism = 0usize;
+    for _ in 0..iters {
+        let mut yy = DevF32::zeros(oc);
+        q.forward_into(&dx, &mut yy);
+        let cur = yy.to_host();
+        if got.iter().zip(&cur).any(|(a, b)| a.to_bits() != b.to_bits()) { mism += 1; }
+    }
+    (worst, num.sqrt() / den.sqrt().max(1e-12), mism)
 }
 
 /// Wall time per fused GEMV call (ms), best-of, under whatever `TRAPETUM_DETERMINISTIC` mode is

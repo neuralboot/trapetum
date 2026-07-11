@@ -18,6 +18,10 @@ use metal_rs::{
 const K: usize = 16;
 const CPB: usize = 256;
 const TY: usize = 8;
+// K256 8-bit codebook path (S19 mixed precision): 256 entries, 32 columns/threadgroup
+// (256*32 half codebook = 16 KB, fits Apple's 32 KB threadgroup limit). See gemv8 in kernels.metal.
+const K8: usize = 256;
+const CPB8: usize = 32;
 
 // IC-split grid.y for the fused GEMV. 20 was tuned for Ampere's ~108 SMs; Apple
 // GPUs have far fewer cores, so fewer, fatter threadgroups (less atomic-reduce
@@ -49,6 +53,7 @@ const KERNELS: &[&str] = &[
     "gemv_fp16", "gemm_mtile", "gemm_mtile2", "rmsnorm_m", "attn_m", "rope_m", "mla_attn", "saxpy", "gelu_mul_k", "resadd_h_k",
     "gemm_mtile_t1", "gemm_mtile_t2", "gemm_mtile_t3", "gemm_mtile_t4", "argmax_stage1", "argmax_stage2",
     "gemv4_partial", "gemv_reduce",
+    "gemv8", "gemv8_partial",
 ];
 
 struct Ctx {
@@ -184,16 +189,18 @@ struct QLin {
     cb: Buffer,
     ic: i32,
     oc: i32,
+    k: i32, // codebook size: 16 (nibble-packed, gemv4) or 256 (uint8 indices, gemv8)
 }
 
-pub unsafe fn qlinear_create(packed: *const u8, cb_f32: *const f32, ic: i32, oc: i32) -> *mut c_void {
+pub unsafe fn qlinear_create(packed: *const u8, cb_f32: *const f32, ic: i32, oc: i32, k: i32) -> *mut c_void {
     let c = ctx();
-    let np = ic as usize * (oc as usize / 2);
+    // K=16: two 4-bit indices per byte -> ic*(oc/2) bytes. K=256: one uint8 index per element -> ic*oc bytes.
+    let np = if k == 256 { ic as usize * oc as usize } else { ic as usize * (oc as usize / 2) };
     let pb = c
         ._device
         .new_buffer(np as u64, MTLResourceOptions::StorageModeShared);
     std::ptr::copy_nonoverlapping(packed, pb.contents() as *mut u8, np);
-    let ncb = K * oc as usize;
+    let ncb = k as usize * oc as usize;
     let cbb = c
         ._device
         .new_buffer((ncb * 2) as u64, MTLResourceOptions::StorageModeShared);
@@ -201,7 +208,7 @@ pub unsafe fn qlinear_create(packed: *const u8, cb_f32: *const f32, ic: i32, oc:
     for i in 0..ncb {
         *dst.add(i) = half::f16::from_f32(*cb_f32.add(i)).to_bits();
     }
-    Box::into_raw(Box::new(QLin { packed: pb, cb: cbb, ic, oc })) as *mut c_void
+    Box::into_raw(Box::new(QLin { packed: pb, cb: cbb, ic, oc, k })) as *mut c_void
 }
 
 /// Reusable GS*OC f32 Ypart scratch for the deterministic two-stage GEMV, grown on demand.
@@ -221,6 +228,54 @@ pub unsafe fn qlinear_forward_dev(h: *mut c_void, d_x: *const c_void, d_y: *mut 
     let y = bufref(d_y);
     let cb = cur_cb();
     let gy = gs();
+    if q.k == 256 {
+        // K256 8-bit path: gemv8 (uint8 indices, CPB8 columns/threadgroup). Same determinism
+        // knob as gemv4: two-stage fixed-order reduce by default, atomic under DET=0, grid.y=1 under DET=1.
+        let smem_cb = tg(K8 * CPB8 * 2);
+        let smem_red = tg(TY * CPB8 * 4);
+        let gx = q.oc as u64 / CPB8 as u64;
+        if det_mode() == 2 && gy > 1 {
+            let yp = ypart(gy as usize * q.oc as usize);
+            let e1 = cb.new_compute_command_encoder();
+            e1.set_compute_pipeline_state(&c.pl["gemv8_partial"]);
+            e1.set_buffer(0, Some(bufref(d_x)), 0);
+            e1.set_buffer(1, Some(&q.packed), 0);
+            e1.set_buffer(2, Some(&q.cb), 0);
+            e1.set_buffer(3, Some(&yp), 0);
+            let p: [i32; 2] = [q.ic, q.oc];
+            e1.set_bytes(4, 8, p.as_ptr() as *const c_void);
+            e1.set_threadgroup_memory_length(0, smem_cb);
+            e1.set_threadgroup_memory_length(1, smem_red);
+            e1.dispatch_thread_groups(MTLSize::new(gx, gy, 1), MTLSize::new(32, TY as u64, 1));
+            e1.end_encoding();
+            let e2 = cb.new_compute_command_encoder();
+            e2.set_compute_pipeline_state(&c.pl["gemv_reduce"]);
+            e2.set_buffer(0, Some(&yp), 0);
+            e2.set_buffer(1, Some(y), 0);
+            let rp: [i32; 2] = [q.oc, gy as i32];
+            e2.set_bytes(2, 8, rp.as_ptr() as *const c_void);
+            let tpb = 256u64;
+            e2.dispatch_thread_groups(MTLSize::new((q.oc as u64 + tpb - 1) / tpb, 1, 1), MTLSize::new(tpb, 1, 1));
+            e2.end_encoding();
+            return;
+        }
+        let blit = cb.new_blit_command_encoder();
+        blit.fill_buffer(y, NSRange::new(0, q.oc as u64 * 4), 0);
+        blit.end_encoding();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.pl["gemv8"]);
+        enc.set_buffer(0, Some(bufref(d_x)), 0);
+        enc.set_buffer(1, Some(&q.packed), 0);
+        enc.set_buffer(2, Some(&q.cb), 0);
+        enc.set_buffer(3, Some(y), 0);
+        let p: [i32; 2] = [q.ic, q.oc];
+        enc.set_bytes(4, 8, p.as_ptr() as *const c_void);
+        enc.set_threadgroup_memory_length(0, smem_cb);
+        enc.set_threadgroup_memory_length(1, smem_red);
+        enc.dispatch_thread_groups(MTLSize::new(gx, gy, 1), MTLSize::new(32, TY as u64, 1));
+        enc.end_encoding();
+        return;
+    }
     if det_mode() == 2 && gy > 1 {
         // Two-stage deterministic: stage 1 writes each grid.y block's partial to its own row of
         // Ypart (no atomics); stage 2 sums the gy partial rows per column in fixed order.
@@ -459,7 +514,7 @@ pub unsafe fn bench_gemv(ic: i32, oc: i32, iters: i32) -> (f64, f64) {
     let np = ic as usize * (oc as usize / 2);
     let packed: Vec<u8> = (0..np).map(|i| (i * 37 + 11) as u8).collect();
     let cbk: Vec<f32> = (0..K * oc as usize).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
-    let q = qlinear_create(packed.as_ptr(), cbk.as_ptr(), ic, oc);
+    let q = qlinear_create(packed.as_ptr(), cbk.as_ptr(), ic, oc, 16);
     let xf: Vec<f32> = (0..ic as usize).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
     let dx = dev_alloc_half(ic);
     dev_upload_to_half(dx, xf.as_ptr(), ic);
@@ -510,7 +565,7 @@ pub unsafe fn bench_mtile(ic: i32, oc: i32, m: i32, iters: i32) -> f64 {
     let np = ic as usize * (oc as usize / 2);
     let packed: Vec<u8> = (0..np).map(|i| (i * 37 + 11) as u8).collect();
     let cbk: Vec<f32> = (0..K * oc as usize).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
-    let q = qlinear_create(packed.as_ptr(), cbk.as_ptr(), ic, oc);
+    let q = qlinear_create(packed.as_ptr(), cbk.as_ptr(), ic, oc, 16);
     let ql = &*(q as *const QLin);
     // X is [M][IC] fp16, Y is [M][OC] f32
     let xf: Vec<f32> = (0..(m as usize * ic as usize)).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
@@ -555,7 +610,7 @@ pub unsafe fn bench_mtile2(ic: i32, oc: i32, m: i32, iters: i32) -> f64 {
     let np = ic as usize * (oc as usize / 2);
     let packed: Vec<u8> = (0..np).map(|i| (i * 37 + 11) as u8).collect();
     let cbk: Vec<f32> = (0..K * oc as usize).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
-    let q = qlinear_create(packed.as_ptr(), cbk.as_ptr(), ic, oc);
+    let q = qlinear_create(packed.as_ptr(), cbk.as_ptr(), ic, oc, 16);
     let ql = &*(q as *const QLin);
     let xf: Vec<f32> = (0..(m as usize * ic as usize)).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
     let dx = dev_alloc_half(m * ic);
@@ -595,7 +650,7 @@ pub unsafe fn check_mtile(ic: i32, oc: i32, m: i32) -> f64 {
     let np = ic as usize * (oc as usize / 2);
     let packed: Vec<u8> = (0..np).map(|i| ((i * 131 + 7) % 256) as u8).collect();
     let cbk: Vec<f32> = (0..K * oc as usize).map(|i| (((i * 7) % 31) as f32 - 15.0) * 0.02).collect();
-    let q = qlinear_create(packed.as_ptr(), cbk.as_ptr(), ic, oc);
+    let q = qlinear_create(packed.as_ptr(), cbk.as_ptr(), ic, oc, 16);
     let ql = &*(q as *const QLin);
     // distinct X per column
     let xf: Vec<f32> = (0..(m as usize * ic as usize)).map(|i| (((i * 13 + 1) % 23) as f32 - 11.0) * 0.05).collect();
