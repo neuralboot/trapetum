@@ -173,3 +173,38 @@ non-routed terms (173.8 ms on CPU here) are VRAM-resident (~9 ms) and run
 concurrently -> t_token ~ t_routed + eps. Projections (50% derate): desktop
 DDR5 ~8-10 tok/s, EPYC 12ch ~22, M3 Ultra 512GB ~15-25 end-to-end lossless.
 Next: S14 = hybrid path in the Rust runtime on V2-Lite (tok/s + greedy match).
+
+## S14: hybrid CPU-experts path, measured end-to-end on real V2-Lite (pod 4090 + 128 vCPU, 2026-07-11)
+
+Branch s14-cpu-experts, 8 increments. TRAPETUM_CPU_EXPERTS=1 keeps routed expert
+weights host-side (never uploaded to VRAM) and executes them on CPU via a
+row-major work-stealing engine; attention/router/shared/dense stay on GPU.
+
+- Baseline pure GPU: 98 ms/token (10.2 tok/s). Hybrid: 150 ms/token (6.7 tok/s)
+  at the 16-thread sweet spot (64 threads collapses to 5.5 ms/layer:
+  oversubscription with spin barriers, same pathology as on the M4).
+  Per-layer split: routed_cpu ~2 ms, shared_gpu 0.05 ms. Expected: V2-Lite fits
+  in VRAM so pure GPU wins here; the hybrid is the only fast path for models
+  that do not fit (671B-class).
+- FIDELITY FINDINGS (the real yield of S14):
+  1. The pure-GPU baseline itself is run-to-run NONDETERMINISTIC: the fused
+     codebook GEMV accumulates IC-slices across grid.y=20 blocks with atomicAdd
+     (both CUDA and Metal). Kernel probe: 30/30 runs bitwise-differ at GS=20,
+     0/30 at grid.y=1. Near-tie logits flip; greedy diverges by token 3.
+  2. TRAPETUM_DETERMINISTIC=1 (grid.y=1, both backends) makes decode
+     byte-stable. Under it, pre-S14 main == branch flag-off BYTE-FOR-BYTE
+     (2x2 runs): no regression from the S14 refactor, triple-confirmed
+     (empirical A/B, author audit, independent adversarial source review).
+  3. fp16-GPU vs f32-CPU expert arithmetic is a genuine ~1-logit systematic
+     difference after 26 layers: deterministic GPU picks token 254 (margin
+     0.66), deterministic hybrid picks 245 (margin 1.17). Two valid arithmetics
+     of the same artifact: raw-id equality is not a meaningful lossless gate;
+     per-path determinism + logit margins / PPL is (S17 reframed).
+- Parked: Option B fast deterministic kernel (two-stage fixed-order reduction,
+  est. +2-5%); persistent thread pool (per-layer spawn ~100us compounds);
+  CUDA-side shared/routed overlap (Metal has it, bit-identical);
+  export coherence check (nobody answers Paris: pre-existing).
+- Pod gotchas burned: DeepSeek modeling file demands flash_attn at import
+  (stub it), hf_xet crashes (HF_HUB_DISABLE_XET=1), HF cache must live on the
+  volume not the 30GB container disk, pkill -f self-matches your own ssh
+  command line.
