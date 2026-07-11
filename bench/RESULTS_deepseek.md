@@ -208,3 +208,27 @@ row-major work-stealing engine; attention/router/shared/dense stay on GPU.
   (stub it), hf_xet crashes (HF_HUB_DISABLE_XET=1), HF cache must live on the
   volume not the 30GB container disk, pkill -f self-matches your own ssh
   command line.
+
+## The Paris bug: found, fixed, validated (2026-07-11, branch det-kernel-pool)
+
+Layer-bisect campaign (deliverables 4-6) on real V2-Lite, judged against HF with
+IDENTICAL dequantized 4-bit weights:
+- SYMPTOM: runtime output incoherent ("a big fan of the work...") while HF fp16
+  answers " Paris." cleanly; divergence systematic from layer 0 (rel l2 0.26).
+- ROOT CAUSE (commit 9c0f439): export_deepseek.py wrote rope_theta (10000) into
+  the header slot the runtime reads as softmax_scale (correct: q_head_dim^-0.5
+  * mscale^2 = 0.114721 for V2-Lite) -> near-one-hot attention since the FIRST
+  DeepSeek run. Secondary: inv_freq was plain rope, not yarn-corrected (up to
+  97% per-frequency error). The Rust MLA math itself was correct. The CBKR
+  (V3/671B) path had the SAME two bugs: the S3 671B artifact is affected and
+  should be re-exported.
+- VALIDATION (pod, fixed artifact): attn_out Rust 2.311358 vs HF 2.311895
+  (fp16 tolerance; was 28% off); GPU-det and HYBRID paths now produce IDENTICAL
+  16-token greedy sequences; output is on-topic ("a city of 36 arrondissements,
+  20 of which" = Paris semantics). Remaining gap to " Paris" as token 1 is the
+  4-bit quantization near-tie (HF-quantized also has Paris only 3rd at ~0.7
+  logits), not the runtime.
+- S18 spectral probe (~5000 tensors): quantization damage is diffuse (median
+  top-16 SV rel err 1.28%, max 2.65%, no catastrophic tensor), but 13 of the
+  15 worst tensors are SHARED experts -> cheap mixed-precision policy: shared
+  experts + lm_head at 6-8 bit (52 tensors, negligible size, every token path).
