@@ -21,10 +21,52 @@ quantized output; the runtime streams routed experts from host RAM (see MoeBlock
       --prompt "The capital of France is" --gen 16
   python export_deepseek.py --model deepseek-ai/DeepSeek-V3 --out /workspace/ds3
 """
-import argparse, os, struct
+import argparse, math, os, struct
 import numpy as np
 import torch
 from export_runtime import quantize, w_f32, w_f16, K   # shared codebook helpers
+
+
+def _yarn_get_mscale(scale, mscale=1.0):
+    return 1.0 if scale <= 1 else 0.1 * mscale * math.log(scale) + 1.0
+
+
+def mla_scale_and_inv_freq(c, q_head_dim, rope_dim, rope_theta):
+    """softmax_scale + rope inv_freq for the runtime MLA, EXACTLY as modeling_deepseek
+    (revision 604d566): DeepseekV2Attention uses softmax_scale = q_head_dim**-0.5, times
+    mscale**2 when rope_scaling.mscale_all_dim is set; and DeepseekV2YarnRotaryEmbedding blends
+    freq_inter/freq_extra by a correction-range ramp. The prior export wrote rope_theta into the
+    softmax_scale slot (~10000 vs ~0.11) and a PLAIN inv_freq -- the block-0 attention bug the
+    layer bisect found. NOTE: assumes the rope cos/sin _mscale == 1 (i.e. config mscale ==
+    mscale_all_dim, true for V2-Lite/V3); asserted below, since the runtime bakes only inv_freq."""
+    softmax_scale = q_head_dim ** (-0.5)
+    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, rope_dim, 2).float() / rope_dim))  # plain default
+    rs = getattr(c, "rope_scaling", None)
+    if rs is not None:
+        factor = float(rs.get("factor", 1.0))
+        mscale_all_dim = rs.get("mscale_all_dim", 0)
+        if mscale_all_dim:
+            m = _yarn_get_mscale(factor, mscale_all_dim)
+            softmax_scale = softmax_scale * m * m
+        if rs.get("type") == "yarn":
+            mscale = rs.get("mscale", 0)
+            _mscale = _yarn_get_mscale(factor, mscale) / _yarn_get_mscale(factor, mscale_all_dim)
+            assert abs(_mscale - 1.0) < 1e-6, (
+                f"rope cos/sin _mscale={_mscale} != 1 (config mscale {mscale} != mscale_all_dim "
+                f"{mscale_all_dim}); the runtime bakes only inv_freq and cannot represent it")
+            dim, base = rope_dim, rope_theta
+            beta_fast = float(rs.get("beta_fast", 32)); beta_slow = float(rs.get("beta_slow", 1))
+            orig_max = float(rs.get("original_max_position_embeddings", 4096))
+            freq_extra = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+            freq_inter = 1.0 / (factor * base ** (torch.arange(0, dim, 2).float() / dim))
+            corr = lambda nr: (dim * math.log(orig_max / (nr * 2 * math.pi))) / (2 * math.log(base))
+            low = max(math.floor(corr(beta_fast)), 0)
+            high = min(math.ceil(corr(beta_slow)), dim - 1)
+            if low == high: high += 0.001
+            ramp = torch.clamp((torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low), 0, 1)
+            inv_freq_mask = 1.0 - ramp
+            inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+    return float(softmax_scale), inv_freq.float().contiguous()
 
 DEV = os.environ.get("EXPORT_DEV", "cuda")
 
@@ -111,7 +153,10 @@ def main():
           f"vhd={vhd} inter={inter_dense} moe_inter={moe_inter} n_routed={n_routed} n_shared={n_shared} "
           f"top_k={top_k} vocab={vocab} first_k_dense={first_k_dense} q_lora_rank={q_lora_rank}", flush=True)
 
-    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, rope, 2).float() / rope))
+    # softmax_scale (NOT rope_theta) + yarn-corrected inv_freq, matching modeling_deepseek.
+    softmax_scale, inv_freq = mla_scale_and_inv_freq(c, nope + rope, rope, rope_theta)
+    print(f"mla: q_head_dim={nope + rope} softmax_scale={softmax_scale:.6f} (was rope_theta={rope_theta}); "
+          f"inv_freq[{inv_freq.numel()}] yarn={getattr(c, 'rope_scaling', None) is not None}", flush=True)
     path = os.path.join(args.out, "model.cbk")
     f = open(path, "wb")
 
@@ -124,7 +169,7 @@ def main():
         f.write(struct.pack("<18i", n_layers, hidden, n_heads, kv_lora, nope, rope, vhd,
                             inter_dense_pad, moe_inter_pad, n_routed, n_shared, top_k, vocab, first_k_dense,
                             q_lora_rank, n_group, topk_group, sigmoid_flag))
-        f.write(struct.pack("<3f", eps, rope_theta, rscale))
+        f.write(struct.pack("<3f", eps, softmax_scale, rscale))
         f.write(inv_freq.numpy().astype("<f4").tobytes())
         w_f16(f, model.model.embed_tokens.weight)   # [vocab][hidden] fp16
 
@@ -148,7 +193,7 @@ def main():
         f.write(b"CBKD")
         f.write(struct.pack("<14i", n_layers, hidden, n_heads, kv_lora, nope, rope, vhd,
                             inter_dense_pad, moe_inter_pad, n_routed, n_shared, top_k, vocab, first_k_dense))
-        f.write(struct.pack("<3f", eps, rope_theta, rscale))
+        f.write(struct.pack("<3f", eps, softmax_scale, rscale))
         f.write(inv_freq.numpy().astype("<f4").tobytes())
         w_f16(f, model.model.embed_tokens.weight)   # [vocab][hidden] fp16
 

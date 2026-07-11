@@ -3198,6 +3198,20 @@ pub fn check_mla_block() -> f64 {
     worst
 }
 
+#[cfg(all(test, any(feature = "cuda", feature = "metal")))]
+mod mla_tests {
+    #[test]
+    fn mla_block_math_correct() {
+        // The Rust MLA (interleaved rope + W_UK/W_UV absorption + softmax_scale used as-is)
+        // matches the full-reconstruction CPU reference. This is the proof that the block-0
+        // "Paris" divergence was NOT the MLA math but the EXPORT: it wrote rope_theta (~10000)
+        // into the softmax_scale header slot (correct ~0.11 = q_head_dim^-0.5 * mscale^2) and a
+        // PLAIN inv_freq instead of the yarn-corrected one -- both fixed in model/export_deepseek.py.
+        let e = super::check_mla_block();
+        assert!(e < 3e-2, "MLA block rel err {e:e} vs reference (fp16 synthetic ~1.6e-2 expected)");
+    }
+}
+
 /// A full DeepSeek decoder layer: RMSNorm -> MLA attention -> residual, then a MoE block
 /// (which norms + residual-adds internally). Composes the validated MlaAttn + MoeBlock.
 /// (DeepSeek-V2/V3 use a dense MLP for the first `first_k_dense` layers; swap MoeBlock for
