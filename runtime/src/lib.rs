@@ -1149,6 +1149,9 @@ impl Drop for Graph {
 /// C ABI for embedding the engine in a native app (iOS/macOS), no server.
 pub mod ffi;
 
+/// CPU forward for scalar 4-bit codebook experts (host-side, no GPU). See module docs.
+pub mod cpu_experts;
+
 /// Microbenchmark: fused 4-bit decode GEMV vs dense fp16 GEMV at `ic`x`oc`,
 /// averaged over `iters`. Returns (ms_4bit, ms_fp16). Metal backend only.
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
