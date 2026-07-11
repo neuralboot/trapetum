@@ -1328,6 +1328,39 @@ pub fn dump_logit_margin(pos: usize, logits: &[f32]) {
     eprintln!("[logit] pos={pos} top1_id={i0} top1={l0:.5} top2_id={i1} top2={l1:.5} margin={:.5}", l0 - l1);
 }
 
+/// Diagnostic: run the SAME fused codebook GEMV `iters` times on identical inputs and count how
+/// many runs differ BITWISE from the first. A nonzero count proves the GPU decode is
+/// run-to-run NONDETERMINISTIC -- the fused kernel reduces `gridDim.y` IC-slices with an
+/// `atomicAdd`, whose float add-order is scheduler-dependent (see kernels/gemv_codebook_4bit.cu
+/// / the Metal gemv4 twin). Large IC (`>> CPB`) forces multiple grid.y slices so the atomics are
+/// actually exercised. Returns `(mismatch_runs, worst_abs_diff)`.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn check_gpu_gemv_determinism(ic: usize, oc: usize, iters: usize) -> (usize, f32) {
+    assert_eq!(oc % 256, 0); assert_eq!(ic % 2, 0);
+    let mut s = 0xA107_u64.wrapping_mul(0x9E37_79B9);
+    let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+    let w: Vec<f32> = (0..oc*ic).map(|_| r()*0.5).collect();
+    let x: Vec<f32> = (0..ic).map(|_| r()).collect();
+    let (packed, cb, _) = quantize_host(&w, oc, ic);
+    let q = QuantLinear::new(&packed, &cb, ic, oc);
+    let dx = DevHalf::from_host(&x);
+    let mut y = DevF32::zeros(oc);
+    q.forward_into(&dx, &mut y);
+    let base = y.to_host();
+    let (mut mism, mut worst) = (0usize, 0f32);
+    for _ in 0..iters {
+        let mut yy = DevF32::zeros(oc);
+        q.forward_into(&dx, &mut yy);
+        let cur = yy.to_host();
+        let mut diff = false;
+        for (a, b) in base.iter().zip(&cur) {
+            if a.to_bits() != b.to_bits() { diff = true; worst = worst.max((a - b).abs()); }
+        }
+        if diff { mism += 1; }
+    }
+    (mism, worst)
+}
+
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl Model {
     /// Plain greedy autoregressive decode (the reference the spec loop must match).

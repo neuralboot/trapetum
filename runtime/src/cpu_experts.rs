@@ -823,6 +823,20 @@ mod tests {
     }
 
     #[test]
+    fn gpu_gemv_determinism_probe() {
+        // DIAGNOSTIC (not a pass/fail gate): does the fused GPU codebook GEMV return bitwise-
+        // identical output run-to-run? If not, the base runtime is nondeterministic (atomic
+        // grid.y reduction), which is the real explanation for the flag-off vs main greedy
+        // divergence -- the branch's memory-layout change merely resampled it. Large IC forces
+        // multiple grid.y slices. Prints; asserts only that it ran.
+        let (mism, worst) = crate::check_gpu_gemv_determinism(8192, 512, 30);
+        eprintln!("[gpu_determinism_probe] ic=8192 oc=512 iters=30 -> {mism}/30 runs differ bitwise from run 0, worst_abs_diff={worst:e}");
+        // No determinism assertion: whether atomics reorder is GPU/scheduler dependent. The
+        // number is the evidence we report.
+        let _ = (mism, worst);
+    }
+
+    #[test]
     fn worksteal_is_thread_count_invariant() {
         // PROOF that the routed CPU reduction is bit-identical across worker counts: the
         // greedy-decode thread-dependence must NOT originate here. Uses the pod's V2-Lite dims

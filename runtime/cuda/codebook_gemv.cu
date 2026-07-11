@@ -14,6 +14,18 @@
 #define TY 8
 #define GS 20
 
+// grid.y IC-split for the fused codebook GEMVs. GS>1 blocks reduce their IC-slice partials
+// into Yacc with atomicAdd, whose float add-order is scheduler-dependent -> run-to-run
+// NONDETERMINISTIC output (near-tie logits flip between runs, and the greedy sequence with
+// them). TRAPETUM_DETERMINISTIC=1 forces grid.y=1: each output element is written by exactly
+// one block, no cross-block atomics -> bitwise-reproducible decode. Cost: less SM parallelism
+// on small-OC layers. Read once (cached), mirrors the Metal backend's gs().
+static int det_gs() {
+    static int g = -1;
+    if (g < 0) { const char* e = getenv("TRAPETUM_DETERMINISTIC"); g = (e && e[0] == '1' && e[1] == 0) ? 1 : GS; }
+    return g;
+}
+
 // per-column quantization dither table (precomputed) and reserved dither seeds.
 __device__ static const unsigned QZ_SEED0 = 0x33383838u, QZ_SEED1 = 0x44463341u;
 __device__ static const unsigned char qz_dither_tbl[148] = {
@@ -518,7 +530,7 @@ void qlinear_forward_dev(void* handle, const void* d_x, void* d_y) {
     ensure_stream();
     cudaMemsetAsync(d_y, 0, (size_t)q->OC*sizeof(float), g_stream);
     size_t smem = (size_t)K*CPB*sizeof(__half) + (size_t)TY*CPB*sizeof(float);
-    dim3 grid(q->OC/CPB, GS), block(32, TY);
+    dim3 grid(q->OC/CPB, det_gs()), block(32, TY); // det_gs()=1 under TRAPETUM_DETERMINISTIC -> no atomics
     gemv4<<<grid, block, smem, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, (float*)d_y, q->IC, q->OC);
 }
 
@@ -654,7 +666,7 @@ void qlinear_forward_m(void* handle, const void* d_x, void* d_y, int M) {
     ensure_stream();
     cudaMemsetAsync(d_y, 0, (size_t)M*q->OC*sizeof(float), g_stream);
     size_t smem = (size_t)K*CPB*sizeof(__half) + (size_t)M*TY*CPB*sizeof(float);
-    dim3 grid(q->OC/CPB, GS), block(32, TY);
+    dim3 grid(q->OC/CPB, det_gs()), block(32, TY); // deterministic mode: grid.y=1, no atomics
     const __half* X = (const __half*)d_x; float* Y = (float*)d_y;
     // compile-time-M kernels keep the accumulators in registers (see gemm_mtile_t)
     switch (M) {

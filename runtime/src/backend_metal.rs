@@ -22,9 +22,16 @@ const TY: usize = 8;
 // IC-split grid.y for the fused GEMV. 20 was tuned for Ampere's ~108 SMs; Apple
 // GPUs have far fewer cores, so fewer, fatter threadgroups (less atomic-reduce
 // contention) win. Overridable via TRAPETUM_GS for tuning; default 8.
+//
+// DETERMINISM: grid.y > 1 makes the kernel reduce IC-slices with an atomic_fetch_add whose
+// float add-order is scheduler-dependent -> run-to-run NONDETERMINISTIC output (proven: 30/30
+// identical-input GEMV runs differ bitwise at GS=16, 0/30 at GS=1). TRAPETUM_DETERMINISTIC=1
+// forces grid.y=1 (each output element written by exactly one threadgroup, no cross-block
+// atomics) -> bitwise-reproducible decode, at the cost of less SM parallelism on small-OC layers.
 fn gs() -> u64 {
     static G: OnceLock<u64> = OnceLock::new();
     *G.get_or_init(|| {
+        if std::env::var("TRAPETUM_DETERMINISTIC").map(|v| v == "1").unwrap_or(false) { return 1; }
         std::env::var("TRAPETUM_GS").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
     })
 }
