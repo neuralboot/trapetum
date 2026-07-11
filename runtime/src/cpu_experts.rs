@@ -743,6 +743,113 @@ pub fn routed_experts_worksteal_nt(x: &[f32], experts: &[RoutedExpert], hidden: 
     }
 }
 
+// ============================================================================
+// NATIVE-LAYOUT path (for the 671B offload / MoeBlockOffload). The 671B routed experts are
+// ~350 GB of mmap-backed packed indices in the artifact's NATIVE input-major layout
+// (`packed[i*(oc/2)+j]`, per quantize_host); re-tiling to output-major would DOUBLE that RAM,
+// so these kernels consume the mmap slices DIRECTLY. i-OUTER streams `packed` contiguously (the
+// increment-4 insight); the codebook is used in its NATIVE `cb[k*oc+o]` layout too (K*oc, L2-
+// resident -- no transpose copy). Determinism is thread-count-invariant via a FIXED input-chunk
+// decomposition (chunk count set by `ic`, not by the worker count) whose per-chunk partials are
+// summed in FIXED chunk-index order.
+// ============================================================================
+
+/// Input rows per fixed determinism chunk (independent of worker count).
+const NATIVE_CHUNK_I: usize = 256;
+
+/// i-outer decode-GEMV over an INPUT range `[i0,i1)`, native input-major `packed` + native
+/// codebook, ACCUMULATING into `y` (caller owns init). Streams `packed` contiguously; `cb` is
+/// gathered strided (`cb[id*oc+o]`) but is L2-resident. Sums i-ascending within the range.
+fn gemv_native_range(packed: &[u8], cb: &[f32], oc: usize, x: &[f32], y: &mut [f32], i0: usize, i1: usize) {
+    let half = oc / 2;
+    for i in i0..i1 {
+        let xi = x[i];
+        let row = &packed[i * half..i * half + half];
+        for j in 0..half {
+            let b = row[j];
+            y[2 * j]     += cb[((b & 0xF) as usize) * oc + 2 * j] * xi;
+            y[2 * j + 1] += cb[((b >> 4) as usize) * oc + 2 * j + 1] * xi;
+        }
+    }
+}
+
+/// Deterministic native decode-GEMV: `y[o] = sum_i cb[idx[o,i]*oc+o]*x[i]`, consuming the native
+/// input-major `packed` with NO re-tile. Multi-threaded over a FIXED input-chunk split (persistent
+/// pool); per-chunk partials (`oc` f32 each) are reduced in FIXED chunk-index order, so the bytes
+/// of `y` are identical for ANY worker count.
+pub fn gemv_cpu_native_det(packed: &[u8], cb: &[f32], oc: usize, ic: usize, x: &[f32], y: &mut [f32]) {
+    assert_eq!(packed.len(), ic * (oc / 2), "packed size");
+    assert_eq!(cb.len(), K * oc, "codebook size");
+    assert_eq!(x.len(), ic, "activation size");
+    assert!(y.len() >= oc, "output size");
+    let nchunks = (ic + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+    if nchunks <= 1 {
+        for v in y.iter_mut().take(oc) { *v = 0.0; }
+        gemv_native_range(packed, cb, oc, x, y, 0, ic);
+        return;
+    }
+    // Per-chunk partials (zeroed); each chunk owns a disjoint `oc`-slice.
+    let mut partials = vec![0f32; nchunks * oc];
+    let pp = RawF32(partials.as_mut_ptr());
+    let ctr = AtomicUsize::new(0);
+    // Capture the WHOLE RawF32 (Sync) by reference, not its raw-pointer field (disjoint capture
+    // of `*mut f32` would make the closure non-Sync).
+    let (packed, cb, x, pp) = (&packed, &cb, &x, &pp);
+    pool().run(&|| {
+        loop {
+            let c = ctr.fetch_add(1, Ordering::Relaxed);
+            if c >= nchunks { break; }
+            let (i0, i1) = (c * NATIVE_CHUNK_I, ((c + 1) * NATIVE_CHUNK_I).min(ic));
+            let pc = unsafe { std::slice::from_raw_parts_mut(pp.0.add(c * oc), oc) };
+            gemv_native_range(packed, cb, oc, x, pc, i0, i1);
+        }
+    });
+    // Fixed chunk-index-order reduction -> thread-count-invariant.
+    for v in y.iter_mut().take(oc) { *v = 0.0; }
+    for c in 0..nchunks {
+        let base = c * oc;
+        for o in 0..oc { y[o] += partials[base + o]; }
+    }
+}
+
+/// A routed expert for the native path: NATIVE input-major packed slices (mmap-backed, borrowed
+/// directly -- no copy) + native codebooks, plus the router weight.
+pub struct NativeExpert<'a> {
+    pub gp: &'a [u8], pub gc: &'a [f32],
+    pub up: &'a [u8], pub uc: &'a [f32],
+    pub dp: &'a [u8], pub dc: &'a [f32],
+    pub weight: f32,
+}
+
+/// Full SwiGLU expert forward on the native input-major layout: gate/up (`oc=inter, ic=hidden`)
+/// via [`gemv_cpu_native_det`], SiLU(g)*u, then down (`oc=hidden, ic=inter`). Deterministic.
+#[allow(clippy::too_many_arguments)]
+pub fn expert_forward_native(x: &[f32], gp: &[u8], gc: &[f32], up: &[u8], uc: &[f32], dp: &[u8], dc: &[f32],
+                             hidden: usize, inter: usize, y: &mut [f32]) {
+    assert_eq!(x.len(), hidden, "expert input width");
+    assert!(y.len() >= hidden, "expert output width");
+    let mut g = vec![0f32; inter];
+    let mut u = vec![0f32; inter];
+    gemv_cpu_native_det(gp, gc, inter, hidden, x, &mut g);
+    gemv_cpu_native_det(up, uc, inter, hidden, x, &mut u);
+    let mut act = vec![0f32; inter];
+    for i in 0..inter { act[i] = silu(g[i]) * u[i]; }
+    gemv_cpu_native_det(dp, dc, hidden, inter, &act, y);
+}
+
+/// Weighted routed MoE sum on the native path (for MoeBlockOffload / 671B): runs each picked
+/// expert with [`expert_forward_native`] and accumulates `sum_e w_e * expert_e(x)` in FIXED expert
+/// order. Deterministic (each GEMV is thread-invariant; the combine order is fixed). `acc_out`
+/// (len `hidden`) is overwritten. No re-tile, no per-expert copy -- the mmap slices are read directly.
+pub fn routed_experts_native(x: &[f32], experts: &[NativeExpert], hidden: usize, inter: usize, acc_out: &mut [f32]) {
+    for v in acc_out.iter_mut().take(hidden) { *v = 0.0; }
+    let mut y = vec![0f32; hidden];
+    for ex in experts {
+        expert_forward_native(x, ex.gp, ex.gc, ex.up, ex.uc, ex.dp, ex.dc, hidden, inter, &mut y);
+        for i in 0..hidden { acc_out[i] += ex.weight * y[i]; }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,6 +1145,67 @@ mod tests {
             let scope_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
             eprintln!("[pool_vs_scope {label}] hidden={hidden} inter={inter} k={k} threads={nt}: pool={pool_us:.1} us/call  scope={scope_us:.1} us/call  saved={:.1} us", scope_us - pool_us);
         }
+    }
+
+    // Single-thread replica of gemv_cpu_native_det's math (same fixed chunks + fixed-order
+    // reduction) -- the deterministic reference the pooled version must equal BITWISE.
+    fn native_det_ref(packed: &[u8], cb: &[f32], oc: usize, ic: usize, x: &[f32]) -> Vec<f32> {
+        let nchunks = (ic + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+        let mut y = vec![0f32; oc];
+        if nchunks <= 1 { gemv_native_range(packed, cb, oc, x, &mut y, 0, ic); return y; }
+        let mut parts = vec![vec![0f32; oc]; nchunks];
+        for c in 0..nchunks {
+            let (i0, i1) = (c * NATIVE_CHUNK_I, ((c + 1) * NATIVE_CHUNK_I).min(ic));
+            gemv_native_range(packed, cb, oc, x, &mut parts[c], i0, i1);
+        }
+        for c in 0..nchunks { for o in 0..oc { y[o] += parts[c][o]; } }
+        y
+    }
+
+    #[test]
+    fn native_matches_dequant_and_is_deterministic() {
+        // The native input-major GEMV (no re-tile) matches the dequant reference to summation
+        // tolerance, and its pooled result is BIT-identical to the single-thread deterministic
+        // reference (fixed chunks + fixed-order reduce) -> thread-count-invariant by construction.
+        for (oc, ic) in [(256usize, 512usize), (64, 300), (512, 2048), (128, 4096)] {
+            let mut r = Lcg(0x0FF10AD5u64 ^ ((oc as u64) << 12) ^ ic as u64);
+            let w: Vec<f32> = (0..oc * ic).map(|_| r.f32()).collect();
+            let x: Vec<f32> = (0..ic).map(|_| r.f32()).collect();
+            let (packed, cb, w_dq) = quantize_host(&w, oc, ic);
+            let mut y = vec![0f32; oc];
+            gemv_cpu_native_det(&packed, &cb, oc, ic, &x, &mut y);
+            // (a) correctness vs dequant matmul (L2: worst-elt rel err blows up on near-zero
+            // outputs from the chunked reassociation; the true agreement is the L2 metric)
+            let reference = naive_matmul(&w_dq, oc, ic, &x);
+            let e = l2_rel(&y, &reference);
+            assert!(e < 1e-4, "native vs dequant matmul L2 rel err {e:e} at oc={oc} ic={ic}");
+            // (b) determinism: pooled == single-thread chunked reference, BITWISE
+            let det = native_det_ref(&packed, &cb, oc, ic, &x);
+            assert!(y.iter().zip(&det).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "native GEMV not bit-identical to the fixed-chunk reference at oc={oc} ic={ic}");
+        }
+    }
+
+    #[test]
+    fn native_expert_matches_reference() {
+        // Full native expert (gate/up/silu/down) vs a dequant f32 reference.
+        let (hidden, inter) = (512usize, 256usize);
+        let mut r = Lcg(0xA71_5713u64);
+        let gw: Vec<f32> = (0..inter * hidden).map(|_| r.f32() * 0.5).collect();
+        let uw: Vec<f32> = (0..inter * hidden).map(|_| r.f32() * 0.5).collect();
+        let dw: Vec<f32> = (0..hidden * inter).map(|_| r.f32() * 0.5).collect();
+        let x: Vec<f32> = (0..hidden).map(|_| r.f32()).collect();
+        let (gp, gc, g_dq) = quantize_host(&gw, inter, hidden);
+        let (up, uc, u_dq) = quantize_host(&uw, inter, hidden);
+        let (dp, dc, d_dq) = quantize_host(&dw, hidden, inter);
+        let mut y = vec![0f32; hidden];
+        expert_forward_native(&x, &gp, &gc, &up, &uc, &dp, &dc, hidden, inter, &mut y);
+        let g = naive_matmul(&g_dq, inter, hidden, &x);
+        let u = naive_matmul(&u_dq, inter, hidden, &x);
+        let act: Vec<f32> = (0..inter).map(|i| silu(g[i]) * u[i]).collect();
+        let reference = naive_matmul(&d_dq, hidden, inter, &act);
+        let e = l2_rel(&y, &reference);
+        assert!(e < 1e-4, "native expert vs reference L2 rel err {e:e}");
     }
 
     #[test]

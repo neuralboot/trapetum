@@ -2351,6 +2351,16 @@ mod moe_cpu_tests {
     }
 
     #[test]
+    fn offload_cpu_experts_match_gpu() {
+        // 671B path: MoeBlockOffload routed experts on the CPU (native input-major, no re-tile)
+        // vs on the GPU. fp16-GPU vs f32-CPU -> small diff; gate on L2 (near-zero elts inflate
+        // worst-rel), same as the V2-Lite cpu_experts_match_gpu check.
+        let (worst, l2) = super::check_moe_offload_cpu();
+        eprintln!("[offload_cpu] worst_rel={worst:.3e} l2_rel={l2:.3e}");
+        assert!(worst < 1e-2 || l2 < 1e-3, "offload CPU vs GPU mismatch: worst_rel={worst:e} l2_rel={l2:e}");
+    }
+
+    #[test]
     fn overlap_bench_v2lite() {
         // V2-Lite dims: hidden=2048, moe_inter=1408, 64 routed experts, top_k=6, 2 shared
         // experts (shared_inter=2*1408=2816, a multiple of 256). Loaded M4, best of 5.
@@ -2527,6 +2537,8 @@ pub struct MoeBlockOffload {
     n_group: usize,
     topk_group: usize,
     sigmoid: bool,
+    // Some(_) overrides TRAPETUM_CPU_EXPERTS for this block (two-mode validation).
+    cpu_override: Option<bool>,
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -2552,11 +2564,16 @@ impl MoeBlockOffload {
             uploads: 0,
             rscale: 1.0,
             score_bias: None, n_group: 0, topk_group: 0, sigmoid: false,
+            cpu_override: None,
         }
     }
 
     /// Set the `routed_scaling_factor` combine-weight multiplier (default 1.0).
     pub fn set_rscale(&mut self, rscale: f32) { self.rscale = rscale; }
+
+    /// Force the routed-experts backend for this block (Some(true)=CPU native, Some(false)=GPU),
+    /// overriding `TRAPETUM_CPU_EXPERTS`. Used by the two-mode validation check.
+    pub fn set_cpu_experts(&mut self, on: bool) { self.cpu_override = Some(on); }
 
     /// Switch to DeepSeek-V3's sigmoid+bias grouped top-k router. See `MoeBlock::set_v3_scoring`.
     pub fn set_v3_scoring(&mut self, score_bias: Vec<f32>, n_group: usize, topk_group: usize) {
@@ -2642,6 +2659,28 @@ impl MoeBlockOffload {
                 let _ = writeln!(f, "{}", ids.join(","));
             }
         }
+        // TRAPETUM_CPU_EXPERTS=1: run the routed experts on the CPU straight from the mmap-backed
+        // native input-major packed (NO re-tile, NO GPU upload -- the 671B is ~350 GB and doubling
+        // it is impossible). Only scalar (CBKR) experts; AVQ is out of scope. Shared expert stays
+        // on the GPU. `resident()` (the GPU stream) is never called for routed experts in this mode.
+        static CPU_EXP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let cpu = self.cpu_override.unwrap_or_else(|| *CPU_EXP.get_or_init(|| std::env::var("TRAPETUM_CPU_EXPERTS").map(|v| v == "1").unwrap_or(false)));
+        if cpu {
+            let x = self.norm.to_host();
+            let refs: Vec<cpu_experts::NativeExpert> = picks.iter().map(|&(e, w)| match &self.hosts[e] {
+                ExpertHost::Scalar { gp, gc, up, uc, dp, dc } => cpu_experts::NativeExpert {
+                    gp: gp.as_slice(), gc, up: up.as_slice(), uc, dp: dp.as_slice(), dc, weight: w,
+                },
+                ExpertHost::Avq { .. } => panic!("TRAPETUM_CPU_EXPERTS: AVQ (additive-codebook) experts are out of scope; scalar CBKR only"),
+            }).collect();
+            let mut acc_host = vec![0f32; self.hidden];
+            cpu_experts::routed_experts_native(&x, &refs, self.hidden, self.inter, &mut acc_host);
+            let mut acc = DevF32::from_host(&acc_host);
+            let (sg, su, sd) = (self.shared.gate.as_ref(), self.shared.up.as_ref(), self.shared.down.as_ref());
+            self.run_ffn(sg, su, sd, &mut acc, 1.0); // shared expert on GPU, as in V2-Lite
+            residual_add(h, &acc);
+            return;
+        }
         // TRAPETUM_PREFETCH=1: kick off background reads for ALL picked experts not
         // yet GPU-resident before computing the first one, so the disk works on
         // experts 2..k while expert 1 streams and computes.
@@ -2713,6 +2752,35 @@ pub fn check_moe_offload() -> (f64, usize, usize, usize) {
         for i in 0..hidden { let den=(a[i] as f64).abs().max(1e-3); worst=worst.max(((a[i]-b[i]) as f64).abs()/den); }
     }
     (worst, cap, n_experts, off.uploads)
+}
+
+/// Two-mode validation of the 671B CPU-experts path: the SAME synthetic MoeBlockOffload run with
+/// routed experts on the GPU (streamed) vs on the CPU (native input-major, from the host slices, no
+/// re-tile). The GPU experts consume fp16 activations while the CPU path is f32, so a small diff is
+/// expected. Returns `(worst_rel, l2_rel)`; the shared expert runs on the GPU in both. No pod needed.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn check_moe_offload_cpu() -> (f64, f64) {
+    let (hidden, inter, n_experts, top_k, cap) = (256usize, 256usize, 64usize, 8usize, 16usize);
+    let eps = 1e-5f32; let seed = 0x0FF1_0AD5u64;
+    let (nw, rw, hosts, sh) = gen_moe(hidden, inter, n_experts, seed);
+    let sho = sh.scalar_slices();
+    let mut off = MoeBlockOffload::new(hidden, inter, n_experts, top_k, cap, eps, &nw, &rw, hosts, sho);
+    let mut s = 0x00C0_FFEEu64;
+    let mut rr = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+    let (mut worst, mut num, mut den) = (0f64, 0f64, 0f64);
+    for _ in 0..8 {
+        let h0: Vec<f32> = (0..hidden).map(|_| rr()*0.3).collect();
+        off.set_cpu_experts(false);
+        let mut hg = DevHalf::from_host(&h0); off.forward(&mut hg); let a = hg.to_host();
+        off.set_cpu_experts(true);
+        let mut hc = DevHalf::from_host(&h0); off.forward(&mut hc); let b = hc.to_host();
+        for i in 0..hidden {
+            let d = (a[i]-b[i]) as f64;
+            worst = worst.max(d.abs() / (a[i] as f64).abs().max(1e-3));
+            num += d*d; den += (a[i] as f64)*(a[i] as f64);
+        }
+    }
+    (worst, num.sqrt()/den.sqrt().max(1e-9))
 }
 
 /// Dense fp16 GEMV: `y = W x` (W is `[oc][ic]` fp16). `saxpy`-free helper for the MLA
