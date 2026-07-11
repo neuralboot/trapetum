@@ -3236,6 +3236,17 @@ pub enum DsFfn { Dense(MlpBlock), Moe(MoeBlock), MoeOffload(MoeBlockOffload) }
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct DsLayer { attn_norm: DevF32, attn: MlaAttn, ffn: DsFfn }
 #[cfg(any(feature = "cuda", feature = "metal"))]
+impl DsFfn {
+    /// The FFN sub-block's RMSNorm weight (DeepSeek `post_attention_layernorm`) on the host.
+    fn norm_w_host(&self) -> Vec<f32> {
+        match self {
+            DsFfn::Dense(m) => m.norm_w.to_host(),
+            DsFfn::Moe(m) => m.norm_w.to_host(),
+            DsFfn::MoeOffload(m) => m.norm_w.to_host(),
+        }
+    }
+}
+
 impl DsLayer {
     fn forward(&mut self, h: &mut DevHalf, pos: usize) {
         let mut normed = DevHalf::zeros(h.n);
@@ -3246,6 +3257,35 @@ impl DsLayer {
             DsFfn::Moe(m) => m.forward(h),
             DsFfn::MoeOffload(m) => m.forward(h),
         }
+    }
+
+    /// Same as [`forward`], but emits intra-layer `[ldump]` sub-stages for a layer-by-layer diff
+    /// (see `DeepSeekModel::forward_dump` / `model/dump_layers_hf.py --split`): the two RMSNorm
+    /// WEIGHT checksums (`norm1_w`/`norm2_w`, to catch a wrong eps or wrong-loaded norm instantly),
+    /// the attention output BEFORE its residual (`attn_out`), the stream after the first residual
+    /// (`post_attn`), the FFN output before its residual (`ffn_out`, recovered as post_ffn-post_attn),
+    /// and the stream after the second residual (`post_ffn`). All on the given position's state.
+    fn forward_split_dump(&mut self, h: &mut DevHalf, pos: usize, li: usize) {
+        dump_hidden("norm1_w", li, &self.attn_norm.to_host());
+        dump_hidden("norm2_w", li, &self.ffn.norm_w_host());
+        let mut normed = DevHalf::zeros(h.n);
+        rmsnorm(h, &self.attn_norm, &mut normed, self.attn.eps);
+        {
+            let o = self.attn.forward(&normed, pos);
+            dump_hidden("attn_out", li, &o.to_host());
+            residual_add(h, o);
+        }
+        let post_attn = h.to_host();
+        dump_hidden("post_attn", li, &post_attn);
+        match &mut self.ffn {
+            DsFfn::Dense(m) => m.forward(h),
+            DsFfn::Moe(m) => m.forward(h),
+            DsFfn::MoeOffload(m) => m.forward(h),
+        }
+        let post_ffn = h.to_host();
+        let ffn_out: Vec<f32> = post_ffn.iter().zip(&post_attn).map(|(a, b)| a - b).collect();
+        dump_hidden("ffn_out", li, &ffn_out);
+        dump_hidden("post_ffn", li, &post_ffn);
     }
 }
 
@@ -3286,11 +3326,18 @@ impl DeepSeekModel {
     /// (+ a `top5=` line). Call ONLY for the LAST prompt position (predicts token 1). Used only when
     /// `deepseek_run` sees `TRAPETUM_LAYER_DEBUG=1`, so it costs nothing otherwise.
     pub fn forward_dump(&mut self, token: usize, pos: usize) -> Vec<f32> {
+        // TRAPETUM_LAYER_DEBUG_SPLIT=<idx>: that layer also emits intra-layer sub-stages
+        // (norm1_w/norm2_w/attn_out/post_attn/ffn_out/post_ffn) to corner an in-layer divergence.
+        let split = std::env::var("TRAPETUM_LAYER_DEBUG_SPLIT").ok().and_then(|v| v.parse::<usize>().ok());
         let row = &self.embedding[token*self.hidden..(token+1)*self.hidden];
         self.h.upload(row);
         dump_hidden("embed", 0, &self.h.to_host());
         for i in 0..self.layers.len() {
-            self.layers[i].forward(&mut self.h, pos);
+            if Some(i) == split {
+                self.layers[i].forward_split_dump(&mut self.h, pos, i);
+            } else {
+                self.layers[i].forward(&mut self.h, pos);
+            }
             let hh = self.h.to_host();
             dump_hidden("block", i, &hh);
         }

@@ -89,6 +89,7 @@ def main():
     ap.add_argument("--model", default="deepseek-ai/DeepSeek-V2-Lite")
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--quantize", action="store_true", help="replace export-quantized tensors with dequant 4-bit (needs CUDA)")
+    ap.add_argument("--split", type=int, default=None, help="also emit intra-layer sub-stages for this layer index (mirror of TRAPETUM_LAYER_DEBUG_SPLIT)")
     ap.add_argument("--dry-run", action="store_true", help="CPU-only smoke test: exercise stats/ldump + import quantize, no model download")
     args = ap.parse_args()
 
@@ -100,10 +101,12 @@ def main():
         x = torch.randn(4096)
         ldump("embed", 0, x)
         ldump("block", 3, x * 2.0)
+        for st in ("norm1_w", "norm2_w", "attn_out", "post_attn", "ffn_out", "post_ffn"):
+            ldump(st, args.split if args.split is not None else 0, x)
         ldump("final", 0, x)
         top5(torch.randn(32))
         assert callable(quantize), "export_runtime.quantize import failed"
-        print("[dry-run] OK: dump format + quantize import validated on CPU", flush=True)
+        print("[dry-run] OK: dump format (incl split sub-stages) + quantize import validated on CPU", flush=True)
         return
 
     from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
@@ -136,6 +139,29 @@ def main():
     def final_hook(_m, _inp, out):
         ldump("final", 0, out[0, last])
     handles.append(model.model.norm.register_forward_hook(final_hook))
+
+    # intra-layer sub-stages for the split layer: attn_out (self_attn output, pre-residual),
+    # post_attn (input to post_attention_layernorm = after first residual), ffn_out (mlp output,
+    # pre-residual). post_ffn is the block hook above. Plus the two norm WEIGHT checksums.
+    if args.split is not None:
+        si = args.split
+        L = model.model.layers[si]
+        ldump("norm1_w", si, L.input_layernorm.weight)
+        ldump("norm2_w", si, L.post_attention_layernorm.weight)
+
+        def attn_hook(_m, _i, o):
+            hs = o[0] if isinstance(o, (tuple, list)) else o
+            ldump("attn_out", si, hs[0, last])
+        handles.append(L.self_attn.register_forward_hook(attn_hook))
+
+        def post_attn_pre(_m, inp):
+            ldump("post_attn", si, inp[0][0, last])
+        handles.append(L.post_attention_layernorm.register_forward_pre_hook(post_attn_pre))
+
+        def mlp_hook(_m, _i, o):
+            hs = o[0] if isinstance(o, (tuple, list)) else o
+            ldump("ffn_out", si, hs[0, last])
+        handles.append(L.mlp.register_forward_hook(mlp_hook))
 
     with torch.no_grad():
         out = model(ids)
