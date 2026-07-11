@@ -1652,11 +1652,21 @@ fn moe_route_v3(logits: &[f32], score_bias: &[f32], n_experts: usize, n_group: u
 /// At batch-1 decode only k of n_experts run, which is what makes huge MoE models cheap
 /// per token (and what the memory-offload path below exploits). Solves the "dense runtime"
 /// wall: the router + top-k + expert combine are the missing pieces.
+/// A routed expert kept HOST-side (never uploaded to the GPU) for the CPU-experts hybrid
+/// path (`TRAPETUM_CPU_EXPERTS=1`). Owns the exact six slices `ExpertHost::Scalar` stores;
+/// evaluated by [`cpu_experts::expert_forward_cpu`]. This is the VRAM-savings variant: the
+/// bulk of a MoE model's weights (the routed experts) stays in RAM.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+struct CpuExpert { gp: Vec<u8>, gc: Vec<f32>, up: Vec<u8>, uc: Vec<f32>, dp: Vec<u8>, dc: Vec<f32> }
+
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct MoeBlock {
     norm_w: DevF32,
     router: DenseLinear,
     experts: Vec<Expert>,
+    /// When `Some`, routed experts run on the CPU (weights host-resident, not on the GPU) and
+    /// `experts` is empty. `None` = today's all-on-GPU path (byte-identical when the flag is off).
+    cpu_experts: Option<Vec<CpuExpert>>,
     shared: Option<Expert>,
     top_k: usize,
     rscale: f32,
@@ -1684,23 +1694,53 @@ pub struct MoeBlock {
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl MoeBlock {
-    #[allow(clippy::too_many_arguments)]
+    /// `TRAPETUM_CPU_EXPERTS=1` -> routed experts run on the CPU (host-resident weights).
+    fn cpu_experts_flag() -> bool {
+        std::env::var("TRAPETUM_CPU_EXPERTS").map(|v| v == "1").unwrap_or(false)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(hidden: usize, inter: usize, n_experts: usize, top_k: usize, eps: f32,
                norm_w: &[f32], router_w: &[f32],
                experts: Vec<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
                shared: Option<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
                shared_inter: usize, rscale: f32) -> Self {
+        Self::new_mode(hidden, inter, n_experts, top_k, eps, norm_w, router_w, experts, shared,
+                       shared_inter, rscale, Self::cpu_experts_flag())
+    }
+
+    /// Like [`Self::new`], but the caller decides whether routed experts live on the CPU
+    /// (`cpu = true`, host-resident, not uploaded) or the GPU (`cpu = false`, today's path).
+    /// The public `new` picks `cpu` from `TRAPETUM_CPU_EXPERTS`; validation uses both.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_mode(hidden: usize, inter: usize, n_experts: usize, top_k: usize, eps: f32,
+                    norm_w: &[f32], router_w: &[f32],
+                    experts: Vec<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
+                    shared: Option<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
+                    shared_inter: usize, rscale: f32, cpu: bool) -> Self {
         assert_eq!(experts.len(), n_experts);
         let mk = |e: &(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32]), inter: usize| Expert {
             gate: QuantLinear::new(e.0, e.1, hidden, inter),
             up:   QuantLinear::new(e.2, e.3, hidden, inter),
             down: QuantLinear::new(e.4, e.5, inter, hidden),
         };
+        // Routed experts: host-side copies (CPU mode) or GPU-uploaded QuantLinears (GPU mode).
+        // The shared expert always stays on the GPU.
+        let (gpu_experts, cpu_experts) = if cpu {
+            let ce: Vec<CpuExpert> = experts.iter().map(|e| CpuExpert {
+                gp: e.0.to_vec(), gc: e.1.to_vec(),
+                up: e.2.to_vec(), uc: e.3.to_vec(),
+                dp: e.4.to_vec(), dc: e.5.to_vec(),
+            }).collect();
+            (Vec::new(), Some(ce))
+        } else {
+            (experts.iter().map(|e| mk(e, inter)).collect::<Vec<_>>(), None)
+        };
         Self {
             norm_w: DevF32::from_host(norm_w),
             router: DenseLinear::new(router_w, hidden, n_experts),
-            experts: experts.iter().map(|e| mk(e, inter)).collect(),
+            experts: gpu_experts,
+            cpu_experts,
             shared: shared.as_ref().map(|e| mk(e, shared_inter)),  // DeepSeek shared expert is bigger (n_shared*moe_inter)
             top_k, rscale, hidden, inter, shared_inter, n_experts, eps,
             norm: DevHalf::zeros(hidden),
@@ -1778,10 +1818,40 @@ impl MoeBlock {
         self.router.forward_into(&self.norm, &mut self.rlogits);
         let rl = self.rlogits.to_host();
         let picks = self.route(&rl);
-        let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
-        for (e, w) in picks { self.ffn(e, &mut acc, w); }
+        let mut acc = if self.cpu_experts.is_some() {
+            self.routed_cpu(&picks)
+        } else {
+            let mut acc = DevF32::from_host(&vec![0f32; self.hidden]);
+            for (e, w) in picks { self.ffn(e, &mut acc, w); }
+            acc
+        };
         if self.shared.is_some() { self.run_shared(&mut acc); }
         residual_add(h, &acc);
+    }
+
+    /// CPU-experts hybrid (`TRAPETUM_CPU_EXPERTS=1`): run the top-k routed experts on the CPU
+    /// over the fp16-rounded normed activation, accumulate `sum_e w_e * expert_e(x)`, and
+    /// return it as a device buffer so the shared expert + residual proceed on the GPU as
+    /// usual. `TRAPETUM_CPU_EXPERTS_TIMING=1` prints the wall time of this section.
+    fn routed_cpu(&mut self, picks: &[(usize, f32)]) -> DevF32 {
+        let t0 = std::time::Instant::now();
+        // The GPU experts consume fp16 activations; mirror that by reading the fp16 `norm`
+        // back to host (already rounded) so the CPU result tracks the GPU path's input.
+        let x = self.norm.to_host();
+        let cpu = self.cpu_experts.as_ref().expect("routed_cpu without cpu_experts");
+        let mut acc_host = vec![0f32; self.hidden];
+        let mut y = vec![0f32; self.hidden];
+        for &(e, w) in picks {
+            let ce = &cpu[e];
+            cpu_experts::expert_forward_cpu(&x, &ce.gp, &ce.gc, &ce.up, &ce.uc, &ce.dp, &ce.dc,
+                                            self.hidden, self.inter, &mut y);
+            for i in 0..self.hidden { acc_host[i] += w * y[i]; }
+        }
+        if std::env::var("TRAPETUM_CPU_EXPERTS_TIMING").map(|v| v == "1").unwrap_or(false) {
+            eprintln!("[cpu_experts] {} experts x (hidden={}, inter={}) in {:.3} ms",
+                      picks.len(), self.hidden, self.inter, t0.elapsed().as_secs_f64() * 1e3);
+        }
+        DevF32::from_host(&acc_host)
     }
 }
 
@@ -1839,6 +1909,67 @@ pub fn check_moe() -> f64 {
     let mut worst = 0f64;
     for i in 0..hidden { let den=(b[i] as f64).abs().max(1e-3); worst=worst.max(((a[i]-b[i]) as f64).abs()/den); }
     worst
+}
+
+/// Validate the CPU-experts hybrid path against the all-on-GPU path: build the SAME
+/// synthetic MoE both ways (`new_mode(cpu=false)` vs `new_mode(cpu=true)`) and compare the
+/// forward output over one token. The GPU experts consume fp16 activations while the CPU
+/// path is f32, so a small diff is expected. Returns `(worst_rel, l2_rel, cpu_ms)`; also
+/// prints them. No model artifact needed.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn check_moe_cpu_experts() -> (f64, f64, f64) {
+    let (hidden, inter, n_experts, top_k) = (256usize, 256usize, 256usize, 8usize);
+    let eps = 1e-5f32;
+    let mut s = 0x1234_0E0Fu64;
+    let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+    let packed = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<u8> { (0..n).map(|_| ((r()*0.5+0.5)*255.0) as u8).collect() };
+    let cbk = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<f32> { (0..n).map(|_| r()*0.05).collect() };
+    let nw: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
+    let rw: Vec<f32> = (0..n_experts*hidden).map(|_| r()*0.05).collect();
+    let mut exp_store: Vec<(Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>)> = Vec::new();
+    for _ in 0..n_experts {
+        exp_store.push((
+            packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+            packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+            packed(inter*(hidden/2),&mut r), cbk(K*hidden,&mut r)));
+    }
+    let experts: Vec<_> = exp_store.iter().map(|e| (e.0.as_slice(),e.1.as_slice(),e.2.as_slice(),e.3.as_slice(),e.4.as_slice(),e.5.as_slice())).collect();
+    let sh = (packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+              packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+              packed(inter*(hidden/2),&mut r), cbk(K*hidden,&mut r));
+    let shared = Some((sh.0.as_slice(),sh.1.as_slice(),sh.2.as_slice(),sh.3.as_slice(),sh.4.as_slice(),sh.5.as_slice()));
+    // Same weights, two backends for the routed experts.
+    let mut gpu = MoeBlock::new_mode(hidden, inter, n_experts, top_k, eps, &nw, &rw, experts.clone(), shared.clone(), inter, 1.0, false);
+    let mut cpu = MoeBlock::new_mode(hidden, inter, n_experts, top_k, eps, &nw, &rw, experts, shared, inter, 1.0, true);
+    let h0: Vec<f32> = (0..hidden).map(|_| r()*0.3).collect();
+    let mut hg = DevHalf::from_host(&h0); gpu.forward(&mut hg); let a = hg.to_host();
+    // Time only the CPU forward (routed section dominates); a couple of warm iters.
+    let mut hc = DevHalf::from_host(&h0); cpu.forward(&mut hc);
+    let t0 = std::time::Instant::now();
+    let mut hc2 = DevHalf::from_host(&h0); cpu.forward(&mut hc2);
+    let cpu_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let b = hc2.to_host();
+    let mut worst = 0f64; let (mut num, mut den) = (0f64, 0f64);
+    for i in 0..hidden {
+        let d = (a[i]-b[i]) as f64;
+        worst = worst.max(d.abs() / (a[i] as f64).abs().max(1e-3));
+        num += d*d; den += (a[i] as f64)*(a[i] as f64);
+    }
+    let l2 = (num.sqrt()) / (den.sqrt().max(1e-9));
+    eprintln!("[check_moe_cpu_experts] worst_rel={worst:.3e} l2_rel={l2:.3e} cpu_forward={cpu_ms:.3} ms (top_k={top_k}, hidden={hidden}, inter={inter})");
+    (worst, l2, cpu_ms)
+}
+
+#[cfg(all(test, any(feature = "cuda", feature = "metal")))]
+mod moe_cpu_tests {
+    #[test]
+    fn cpu_experts_match_gpu() {
+        let (worst, l2, _ms) = super::check_moe_cpu_experts();
+        // GPU experts consume fp16 activations, CPU path is f32: the worst-case elementwise
+        // rel err is dominated by a single near-zero output element (small denominator),
+        // while the L2 rel err reflects the true agreement. Pass on either (per spec).
+        assert!(worst < 1e-2 || l2 < 1e-3, "CPU vs GPU MoE mismatch: worst_rel={worst:e} l2_rel={l2:e}");
+    }
 }
 
 /// A packed (4-bit indices) tensor, either owned in RAM or a zero-copy byte range into a
