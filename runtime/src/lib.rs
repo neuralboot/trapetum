@@ -2110,6 +2110,43 @@ pub fn check_moe_cpu_experts() -> (f64, f64, f64) {
     (worst, l2, cpu_ms)
 }
 
+/// Diagnostic: run a synthetic all-GPU (`cpu=false`) MoE `forward` `iters` times on the SAME
+/// input and return the worst absolute element difference vs run 0. Under the default GS this
+/// measures how much ONE MoE block's atomic-reduction nondeterminism perturbs its output --
+/// i.e. how large the per-layer noise is, to judge whether it can compound to a ~1-logit
+/// end-to-end shift over ~26 layers or whether a systematic difference must be a real bug.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn moe_forward_run_to_run_spread(iters: usize) -> f32 {
+    let (hidden, inter, n_experts, top_k) = (2048usize, 1536usize, 64usize, 6usize);
+    let eps = 1e-5f32;
+    let mut s = 0x00C0_FFEEu64;
+    let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+    let packed = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<u8> { (0..n).map(|_| ((r()*0.5+0.5)*255.0) as u8).collect() };
+    let cbk = |n: usize, r: &mut dyn FnMut()->f32| -> Vec<f32> { (0..n).map(|_| r()*0.05).collect() };
+    let si = 3072usize; // 2 shared experts merged (matches V2-Lite)
+    let nw: Vec<f32> = (0..hidden).map(|_| r()*0.1+1.0).collect();
+    let rw: Vec<f32> = (0..n_experts*hidden).map(|_| r()*0.05).collect();
+    let mut es: Vec<(Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>,Vec<u8>,Vec<f32>)> = Vec::new();
+    for _ in 0..n_experts {
+        es.push((packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+                 packed(hidden*(inter/2),&mut r), cbk(K*inter,&mut r),
+                 packed(inter*(hidden/2),&mut r), cbk(K*hidden,&mut r)));
+    }
+    let experts: Vec<_> = es.iter().map(|e| (e.0.as_slice(),e.1.as_slice(),e.2.as_slice(),e.3.as_slice(),e.4.as_slice(),e.5.as_slice())).collect();
+    let sh = (packed(hidden*(si/2),&mut r), cbk(K*si,&mut r), packed(hidden*(si/2),&mut r), cbk(K*si,&mut r), packed(si*(hidden/2),&mut r), cbk(K*hidden,&mut r));
+    let shared = Some((sh.0.as_slice(),sh.1.as_slice(),sh.2.as_slice(),sh.3.as_slice(),sh.4.as_slice(),sh.5.as_slice()));
+    let mut moe = MoeBlock::new_mode(hidden, inter, n_experts, top_k, eps, &nw, &rw, experts, shared, si, 1.0, false);
+    let h0: Vec<f32> = (0..hidden).map(|_| r()*0.3).collect();
+    let mut hh = DevHalf::from_host(&h0); moe.forward(&mut hh); let base = hh.to_host();
+    let mut worst = 0f32;
+    for _ in 0..iters {
+        let mut h = DevHalf::from_host(&h0); moe.forward(&mut h); let cur = h.to_host();
+        for (a, b) in base.iter().zip(&cur) { worst = worst.max((a - b).abs()); }
+    }
+    eprintln!("[moe_forward_spread] {iters} runs, one V2-Lite MoE block -> worst abs elt diff vs run0 = {worst:e}");
+    worst
+}
+
 /// Build a CPU-experts MoE (with a shared expert) and run one token through it twice from
 /// the SAME input: once with the shared expert overlapped onto the GPU (`overlap_shared=on`)
 /// and once sequential. The two must agree -- overlap only reschedules the commutative sum,

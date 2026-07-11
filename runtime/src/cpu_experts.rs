@@ -823,6 +823,16 @@ mod tests {
     }
 
     #[test]
+    fn moe_block_run_to_run_spread_probe() {
+        // DIAGNOSTIC: how much does ONE V2-Lite MoE block's output vary run-to-run under the
+        // default (atomic) GS? Judges whether per-layer nondeterminism can compound to a ~1-logit
+        // end-to-end shift across ~26 layers, or whether a systematic ~1-logit diff must be a bug.
+        let worst = crate::moe_forward_run_to_run_spread(10);
+        eprintln!("[moe_block_spread] worst abs diff over 10 runs = {worst:e} (per MoE block; x26 layers rough upper bound = {:e})", worst * 26.0);
+        let _ = worst;
+    }
+
+    #[test]
     fn gpu_gemv_determinism_probe() {
         // DIAGNOSTIC (not a pass/fail gate): does the fused GPU codebook GEMV return bitwise-
         // identical output run-to-run? If not, the base runtime is nondeterministic (atomic
