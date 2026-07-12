@@ -2778,8 +2778,13 @@ impl MoeBlockOffload {
             let mut acc_host = vec![0f32; self.hidden];
             // ONE phased work-steal over all (expert, proj, input-chunk) tasks per MoE call, not a
             // pool dispatch per GEMV (deliverable B lever 2): at 671B this cuts ~1392 dispatches/token
-            // to ~58 and fills the workers (down-proj alone was 8 chunks for 48 cores). Bit-identical.
-            cpu_experts::routed_experts_native_worksteal(&x, &refs, self.hidden, self.inter, &mut acc_host);
+            // to ~58 and fills the workers. TRAPETUM_CPU_KERNEL=lut8 selects the int8 vpshufb decode
+            // (deliverable C, tolerance ~0.5%/GEMV); anything else uses the exact f32 gather decode.
+            if cpu_experts::cpu_kernel() == cpu_experts::CpuKernel::Lut8 {
+                cpu_experts::routed_experts_native_worksteal_lut8(&x, &refs, self.hidden, self.inter, &mut acc_host);
+            } else {
+                cpu_experts::routed_experts_native_worksteal(&x, &refs, self.hidden, self.inter, &mut acc_host);
+            }
             let mut acc = DevF32::from_host(&acc_host);
             let (sg, su, sd) = (self.shared.gate.as_ref(), self.shared.up.as_ref(), self.shared.down.as_ref());
             self.run_ffn(sg, su, sd, &mut acc, 1.0); // shared expert on GPU, as in V2-Lite

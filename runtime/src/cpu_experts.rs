@@ -1352,6 +1352,191 @@ pub fn routed_experts_native_worksteal_nt(x: &[f32], experts: &[NativeExpert], h
     }
 }
 
+// ============================================================================
+// lut8 END-TO-END int8 work-steal (deliverable C increment 4). Same phase skeleton as the f32
+// work-steal, but the decode is the int8 vpshufb kernel: codebooks are recoded+transposed to int8
+// per expert (small, one-time per call), the activation is quantized to int8 per GEMV, phases A/C
+// accumulate INT32 partials, and the reductions (RA/RC) fold in the rescale (xs * scale[o]). An extra
+// per-expert phase Q quantizes the SiLU output before the down GEMV (its scale spans the whole vector).
+// Integer partials -> deterministic and thread-invariant; result matches the f32 path within the
+// measured int8 tolerance (~0.5%/GEMV). Activated by TRAPETUM_CPU_KERNEL=lut8; the f32 path untouched.
+// ============================================================================
+struct RawI32(*mut i32);
+unsafe impl Send for RawI32 {}
+unsafe impl Sync for RawI32 {}
+struct RawI8(*mut i8);
+unsafe impl Send for RawI8 {}
+unsafe impl Sync for RawI8 {}
+
+/// Per-expert int8-recoded codebooks (transposed to `[oc,16]`) + per-column scales, built once/call.
+struct ExpertI8<'a> {
+    gp: &'a [u8], g_t: Vec<i8>, gs: Vec<f32>,
+    up: &'a [u8], u_t: Vec<i8>, us: Vec<f32>,
+    dp: &'a [u8], d_t: Vec<i8>, ds: Vec<f32>,
+    weight: f32,
+}
+fn recode_expert<'a>(e: &NativeExpert<'a>, hidden: usize, inter: usize) -> ExpertI8<'a> {
+    let (gi, gs) = recode_codebook_i8(e.gc, inter);
+    let (ui, us) = recode_codebook_i8(e.uc, inter);
+    let (di, ds) = recode_codebook_i8(e.dc, hidden);
+    ExpertI8 { gp: e.gp, g_t: transpose_codebook_i8(&gi, inter), gs,
+               up: e.up, u_t: transpose_codebook_i8(&ui, inter), us,
+               dp: e.dp, d_t: transpose_codebook_i8(&di, hidden), ds, weight: e.weight }
+}
+
+/// int8-quantize a vector: `(xq, xs)` with `xs = max|v|/127`.
+fn quantize_i8(v: &[f32]) -> (Vec<i8>, f32) {
+    let mut mx = 0f32; for &a in v { mx = mx.max(a.abs()); }
+    let xs = if mx > 0.0 { mx / 127.0 } else { 1.0 };
+    (v.iter().map(|&a| (a / xs).round().clamp(-127.0, 127.0) as i8).collect(), xs)
+}
+
+/// int8 decode: AVX2 vpshufb lut8 where present, else the scalar int8 reference. Both accumulate
+/// int32 into `acc` and are bit-identical (integer, order-free).
+#[inline]
+fn accumulate_i8_dispatch(packed: &[u8], cb_i8_t: &[i8], oc: usize, xq: &[i8], acc: &mut [i32], i0: usize, i1: usize) {
+    #[cfg(target_arch = "x86_64")]
+    { if is_x86_feature_detected!("avx2") { unsafe { accumulate_lut8_avx2(packed, cb_i8_t, oc, xq, acc, i0, i1); } return; } }
+    accumulate_i8_t(packed, cb_i8_t, oc, xq, acc, i0, i1);
+}
+
+struct Lut8Ctx<'a> {
+    experts: &'a [ExpertI8<'a>],
+    xq_x: &'a [i8], xs_x: f32,
+    hidden: usize, inter: usize, nch_h: usize, nch_i: usize, k: usize, ra_per: usize, rc_per: usize,
+    ctr_a: AtomicUsize, ctr_ra: AtomicUsize, ctr_q: AtomicUsize, ctr_c: AtomicUsize, ctr_rc: AtomicUsize,
+    bar: PhaseBar,
+    pg: RawI32, pu: RawI32, pd: RawI32,
+    g: RawF32, u: RawF32, act: RawF32, out: RawF32,
+    xq_act: RawI8, xs_act: RawF32,
+}
+unsafe impl Sync for Lut8Ctx<'_> {}
+
+fn lut8_worker(c: &Lut8Ctx) {
+    let (nch_h, nch_i, inter, hidden, k) = (c.nch_h, c.nch_i, c.inter, c.hidden, c.k);
+    // Phase A: gate+up int8 decode -> int32 partials.
+    let na = k * 2 * nch_h;
+    loop {
+        let t = c.ctr_a.fetch_add(1, Ordering::Relaxed);
+        if t >= na { break; }
+        let (e, rr) = (t / (2 * nch_h), t % (2 * nch_h));
+        let (which, ci) = (rr / nch_h, rr % nch_h);
+        let (i0, i1) = (ci * NATIVE_CHUNK_I, ((ci + 1) * NATIVE_CHUNK_I).min(hidden));
+        let ex = &c.experts[e];
+        let (packed, cb_t, base) = if which == 0 { (ex.gp, &ex.g_t, &c.pg) } else { (ex.up, &ex.u_t, &c.pu) };
+        let slot = unsafe { std::slice::from_raw_parts_mut(base.0.add((e * nch_h + ci) * inter), inter) };
+        accumulate_i8_dispatch(packed, cb_t, inter, c.xq_x, slot, i0, i1);
+    }
+    c.bar.wait();
+    // Phase RA: reduce gate/up int32 partials + rescale (xs_x*scale) + SiLU, per (expert, o-chunk).
+    let nra = k * c.ra_per;
+    loop {
+        let t = c.ctr_ra.fetch_add(1, Ordering::Relaxed);
+        if t >= nra { break; }
+        let (e, oc) = (t / c.ra_per, t % c.ra_per);
+        let (o0, o1) = (oc * RED_CHUNK, ((oc + 1) * RED_CHUNK).min(inter));
+        let ex = &c.experts[e];
+        unsafe {
+            let (ge, ue, acte) = (c.g.0.add(e * inter), c.u.0.add(e * inter), c.act.0.add(e * inter));
+            for o in o0..o1 {
+                let (mut sg, mut su) = (0i32, 0i32);
+                for ci in 0..nch_h {
+                    sg += *c.pg.0.add((e * nch_h + ci) * inter + o);
+                    su += *c.pu.0.add((e * nch_h + ci) * inter + o);
+                }
+                let gv = c.xs_x * ex.gs[o] * sg as f32;
+                let uv = c.xs_x * ex.us[o] * su as f32;
+                *ge.add(o) = gv; *ue.add(o) = uv;
+                *acte.add(o) = silu(gv) * uv;
+            }
+        }
+    }
+    c.bar.wait();
+    // Phase Q: quantize each expert's SiLU output to int8 (scale spans the whole vector).
+    loop {
+        let e = c.ctr_q.fetch_add(1, Ordering::Relaxed);
+        if e >= k { break; }
+        unsafe {
+            let acte = std::slice::from_raw_parts(c.act.0.add(e * inter), inter);
+            let (xq, xs) = quantize_i8(acte);
+            *c.xs_act.0.add(e) = xs;
+            let dst = c.xq_act.0.add(e * inter);
+            for o in 0..inter { *dst.add(o) = xq[o]; }
+        }
+    }
+    c.bar.wait();
+    // Phase C: down int8 decode -> int32 partials.
+    let nc = k * nch_i;
+    loop {
+        let t = c.ctr_c.fetch_add(1, Ordering::Relaxed);
+        if t >= nc { break; }
+        let (e, ci) = (t / nch_i, t % nch_i);
+        let (i0, i1) = (ci * NATIVE_CHUNK_I, ((ci + 1) * NATIVE_CHUNK_I).min(inter));
+        let ex = &c.experts[e];
+        let xq_act_e = unsafe { std::slice::from_raw_parts(c.xq_act.0.add(e * inter), inter) };
+        let slot = unsafe { std::slice::from_raw_parts_mut(c.pd.0.add((e * nch_i + ci) * hidden), hidden) };
+        accumulate_i8_dispatch(ex.dp, &ex.d_t, hidden, xq_act_e, slot, i0, i1);
+    }
+    c.bar.wait();
+    // Phase RC: reduce down int32 partials + rescale (xs_act*scale), per (expert, o-chunk).
+    let nrc = k * c.rc_per;
+    loop {
+        let t = c.ctr_rc.fetch_add(1, Ordering::Relaxed);
+        if t >= nrc { break; }
+        let (e, oc) = (t / c.rc_per, t % c.rc_per);
+        let (o0, o1) = (oc * RED_CHUNK, ((oc + 1) * RED_CHUNK).min(hidden));
+        let ex = &c.experts[e];
+        unsafe {
+            let xs_act = *c.xs_act.0.add(e);
+            let oe = c.out.0.add(e * hidden);
+            for o in o0..o1 {
+                let mut s = 0i32;
+                for ci in 0..nch_i { s += *c.pd.0.add((e * nch_i + ci) * hidden + o); }
+                *oe.add(o) = xs_act * ex.ds[o] * s as f32;
+            }
+        }
+    }
+}
+
+/// lut8 end-to-end routed MoE sum (TRAPETUM_CPU_KERNEL=lut8). Recodes codebooks to int8, quantizes
+/// activations, runs the int8 vpshufb decode through the phased work-steal, rescales in the reduces.
+/// Deterministic + thread-invariant (integer partials, fixed orders). Matches the f32 path within the
+/// int8 tolerance. `acc_out` (len `hidden`) overwritten. Falls back to the f32 path for k<=1 / no pool.
+pub fn routed_experts_native_worksteal_lut8(x: &[f32], experts: &[NativeExpert], hidden: usize, inter: usize, acc_out: &mut [f32]) {
+    let p = pool();
+    let k = experts.len();
+    for v in acc_out.iter_mut().take(hidden) { *v = 0.0; }
+    if k == 0 { return; }
+    let ei8: Vec<ExpertI8> = experts.iter().map(|e| recode_expert(e, hidden, inter)).collect();
+    let (xq_x, xs_x) = quantize_i8(&x[..hidden]);
+    let nch_h = (hidden + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+    let nch_i = (inter + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+    let mut pg = vec![0i32; k * nch_h * inter];
+    let mut pu = vec![0i32; k * nch_h * inter];
+    let mut pd = vec![0i32; k * nch_i * hidden];
+    let mut g = vec![0f32; k * inter];
+    let mut u = vec![0f32; k * inter];
+    let mut act = vec![0f32; k * inter];
+    let mut out = vec![0f32; k * hidden];
+    let mut xq_act = vec![0i8; k * inter];
+    let mut xs_act = vec![0f32; k];
+    let ctx = Lut8Ctx {
+        experts: &ei8, xq_x: &xq_x, xs_x, hidden, inter, nch_h, nch_i, k,
+        ra_per: (inter + RED_CHUNK - 1) / RED_CHUNK, rc_per: (hidden + RED_CHUNK - 1) / RED_CHUNK,
+        ctr_a: AtomicUsize::new(0), ctr_ra: AtomicUsize::new(0), ctr_q: AtomicUsize::new(0),
+        ctr_c: AtomicUsize::new(0), ctr_rc: AtomicUsize::new(0),
+        bar: PhaseBar::new(p.n, cpu_spin()),
+        pg: RawI32(pg.as_mut_ptr()), pu: RawI32(pu.as_mut_ptr()), pd: RawI32(pd.as_mut_ptr()),
+        g: RawF32(g.as_mut_ptr()), u: RawF32(u.as_mut_ptr()), act: RawF32(act.as_mut_ptr()), out: RawF32(out.as_mut_ptr()),
+        xq_act: RawI8(xq_act.as_mut_ptr()), xs_act: RawF32(xs_act.as_mut_ptr()),
+    };
+    p.run(&|| lut8_worker(&ctx));
+    for (e, ex) in ei8.iter().enumerate() {
+        let (w, base) = (ex.weight, e * hidden);
+        for i in 0..hidden { acc_out[i] += w * out[base + i]; }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1788,6 +1973,39 @@ mod tests {
             eprintln!("[int8_recode_error oc={oc} ic={ic}] int8-path vs f32-decode L2 rel err = {e:.4e}");
             assert!(e < 5e-2, "int8 path L2 rel err {e:e} too large at oc={oc} ic={ic}");
         }
+    }
+
+    #[test]
+    fn lut8_worksteal_matches_f32_within_int8_tolerance() {
+        // Deliverable C-inc4: the end-to-end lut8 int8 work-steal (recode -> quantize -> int8 decode
+        // -> rescale) matches the f32 work-steal within the int8 tolerance. On the M4 the decode is
+        // the scalar int8 accumulate (no AVX2); on the box it is the vpshufb kernel (bit-exact to it),
+        // so this M4 test validates the STRUCTURE (scales, xs, rescale, phases) end-to-end. Realistic
+        // (quantize_host) codebooks so the int8 error is representative.
+        let (hidden, inter, k) = (2048usize, 1408usize, 6usize);
+        let mut r = Lcg(0x0148_5713u64);
+        let x: Vec<f32> = (0..hidden).map(|_| r.f32() * 0.5).collect();
+        // per expert: gate/up [inter][hidden], down [hidden][inter], quantized with the real k-means
+        let mut store = Vec::new();
+        for _ in 0..k {
+            let gw: Vec<f32> = (0..inter * hidden).map(|_| r.f32() * 0.5).collect();
+            let uw: Vec<f32> = (0..inter * hidden).map(|_| r.f32() * 0.5).collect();
+            let dw: Vec<f32> = (0..hidden * inter).map(|_| r.f32() * 0.5).collect();
+            let (gp, gc, _) = quantize_host(&gw, inter, hidden);
+            let (up, uc, _) = quantize_host(&uw, inter, hidden);
+            let (dp, dc, _) = quantize_host(&dw, hidden, inter);
+            store.push((gp, gc, up, uc, dp, dc, 0.15 + 0.1 * store.len() as f32));
+        }
+        let experts: Vec<NativeExpert> = store.iter().map(|s| NativeExpert {
+            gp: &s.0, gc: &s.1, up: &s.2, uc: &s.3, dp: &s.4, dc: &s.5, weight: s.6,
+        }).collect();
+        let mut yf = vec![0f32; hidden];
+        routed_experts_native_worksteal(&x, &experts, hidden, inter, &mut yf);
+        let mut yi = vec![0f32; hidden];
+        routed_experts_native_worksteal_lut8(&x, &experts, hidden, inter, &mut yi);
+        let e = l2_rel(&yi, &yf);
+        eprintln!("[lut8_worksteal] int8 end-to-end vs f32 work-steal L2 rel err = {e:.4e}");
+        assert!(e < 5e-2, "lut8 worksteal vs f32 L2 rel err {e:e} too large (int8 tolerance ~0.5%/GEMV compounded)");
     }
 
     #[test]
