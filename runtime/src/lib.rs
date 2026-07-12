@@ -1937,6 +1937,18 @@ impl MoeBlock {
                        shared_inter, rscale, Self::cpu_experts_flag())
     }
 
+    /// Like [`Self::new`] but with the shared expert at `shared_k` entries/column (S19 mixed
+    /// precision: 256 for the 8-bit shared expert, 16 otherwise). Routed cpu/gpu mode from env.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_k(hidden: usize, inter: usize, n_experts: usize, top_k: usize, eps: f32,
+                 norm_w: &[f32], router_w: &[f32],
+                 experts: Vec<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
+                 shared: Option<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
+                 shared_inter: usize, rscale: f32, shared_k: usize) -> Self {
+        Self::new_mode_k(hidden, inter, n_experts, top_k, eps, norm_w, router_w, experts, shared,
+                       shared_inter, rscale, Self::cpu_experts_flag(), shared_k)
+    }
+
     /// Like [`Self::new`], but the caller decides whether routed experts live on the CPU
     /// (`cpu = true`, host-resident, not uploaded) or the GPU (`cpu = false`, today's path).
     /// The public `new` picks `cpu` from `TRAPETUM_CPU_EXPERTS`; validation uses both.
@@ -1946,11 +1958,28 @@ impl MoeBlock {
                     experts: Vec<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
                     shared: Option<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
                     shared_inter: usize, rscale: f32, cpu: bool) -> Self {
+        Self::new_mode_k(hidden, inter, n_experts, top_k, eps, norm_w, router_w, experts, shared, shared_inter, rscale, cpu, 16)
+    }
+
+    /// Like [`Self::new_mode`], but the shared expert is quantized at `shared_k` entries per column
+    /// (16 = 4-bit, 256 = 8-bit S19 mixed precision). Routed experts always stay 4-bit; the shared
+    /// expert always stays on the GPU, so K=256 is a plain `QuantLinear::new_k`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_mode_k(hidden: usize, inter: usize, n_experts: usize, top_k: usize, eps: f32,
+                    norm_w: &[f32], router_w: &[f32],
+                    experts: Vec<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
+                    shared: Option<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
+                    shared_inter: usize, rscale: f32, cpu: bool, shared_k: usize) -> Self {
         assert_eq!(experts.len(), n_experts);
         let mk = |e: &(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32]), inter: usize| Expert {
             gate: QuantLinear::new(e.0, e.1, hidden, inter),
             up:   QuantLinear::new(e.2, e.3, hidden, inter),
             down: QuantLinear::new(e.4, e.5, inter, hidden),
+        };
+        let mk_shared = |e: &(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])| Expert {
+            gate: QuantLinear::new_k(e.0, e.1, hidden, shared_inter, shared_k),
+            up:   QuantLinear::new_k(e.2, e.3, hidden, shared_inter, shared_k),
+            down: QuantLinear::new_k(e.4, e.5, shared_inter, hidden, shared_k),
         };
         // Routed experts: host-side copies (CPU mode) or GPU-uploaded QuantLinears (GPU mode).
         // The shared expert always stays on the GPU.
@@ -1971,7 +2000,7 @@ impl MoeBlock {
             router: DenseLinear::new(router_w, hidden, n_experts),
             experts: gpu_experts,
             cpu_experts,
-            shared: shared.as_ref().map(|e| mk(e, shared_inter)),  // DeepSeek shared expert is bigger (n_shared*moe_inter)
+            shared: shared.as_ref().map(|e| mk_shared(e)),  // DeepSeek shared expert (bigger; K per shared_k)
             top_k, rscale, hidden, inter, shared_inter, n_experts, eps,
             norm: DevHalf::zeros(hidden),
             rlogits: DevF32::zeros(n_experts),
@@ -2611,15 +2640,24 @@ impl MoeBlockOffload {
     pub fn new(hidden: usize, inter: usize, n_experts: usize, top_k: usize, cap: usize, eps: f32,
                norm_w: &[f32], router_w: &[f32], hosts: Vec<ExpertHost>,
                shared: (&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])) -> Self {
+        Self::new_k(hidden, inter, n_experts, top_k, cap, eps, norm_w, router_w, hosts, shared, 16)
+    }
+
+    /// Like [`Self::new`] but with the (GPU-resident) shared expert at `shared_k` entries/column
+    /// (S19: 256 = 8-bit shared expert, 16 otherwise). Routed experts stream from host, 4-bit only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_k(hidden: usize, inter: usize, n_experts: usize, top_k: usize, cap: usize, eps: f32,
+               norm_w: &[f32], router_w: &[f32], hosts: Vec<ExpertHost>,
+               shared: (&[u8],&[f32],&[u8],&[f32],&[u8],&[f32]), shared_k: usize) -> Self {
         assert_eq!(hosts.len(), n_experts);
         assert!(cap >= top_k, "cache must hold at least top_k experts");
         Self {
             norm_w: DevF32::from_host(norm_w),
             router: DenseLinear::new(router_w, hidden, n_experts),
             hosts,
-            shared: OffExpert { gate: Proj::Scalar(QuantLinear::new(shared.0,shared.1,hidden,inter)),
-                             up: Proj::Scalar(QuantLinear::new(shared.2,shared.3,hidden,inter)),
-                             down: Proj::Scalar(QuantLinear::new(shared.4,shared.5,inter,hidden)) },
+            shared: OffExpert { gate: Proj::Scalar(QuantLinear::new_k(shared.0,shared.1,hidden,inter,shared_k)),
+                             up: Proj::Scalar(QuantLinear::new_k(shared.2,shared.3,hidden,inter,shared_k)),
+                             down: Proj::Scalar(QuantLinear::new_k(shared.4,shared.5,inter,hidden,shared_k)) },
             cache: std::collections::HashMap::new(), lru: Vec::new(), cap,
             top_k, hidden, inter, n_experts, eps,
             norm: DevHalf::zeros(hidden), rlogits: DevF32::zeros(n_experts),
@@ -3118,6 +3156,35 @@ fn quantize_host(w: &[f32], oc: usize, ic: usize) -> (Vec<u8>, Vec<f32>, Vec<f32
     (packed, cb, w_dq)
 }
 
+/// Mean squared reconstruction error of a per-output-column `k`-entry codebook quantization of
+/// `w` (`[oc][ic]` row-major), i.e. `mean_(o,i) (w - dequant(w))^2`. Same 1-D per-column k-means as
+/// `quantize_host`/`export_runtime.quantize`, parametrized on `k` (16 or 256). Used to measure the
+/// 8-bit-vs-4-bit reconstruction gain that motivates S19 (k-means MSE ~ k^-2 for smooth densities).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn recon_mse_host(w: &[f32], oc: usize, ic: usize, k: usize) -> f64 {
+    assert_eq!(w.len(), oc * ic);
+    let mut se = 0f64;
+    for o in 0..oc {
+        let col: Vec<f32> = (0..ic).map(|i| w[o * ic + i]).collect();
+        let lo = col.iter().cloned().fold(f32::MAX, f32::min);
+        let hi = col.iter().cloned().fold(f32::MIN, f32::max);
+        let mut centroids: Vec<f32> = (0..k).map(|j| lo + (hi - lo) * (j as f32 / (k as f32 - 1.0))).collect();
+        let mut assign = vec![0usize; ic];
+        for _ in 0..12 {
+            for (i, &v) in col.iter().enumerate() {
+                let (mut best, mut bd) = (0usize, f32::MAX);
+                for (j, &c) in centroids.iter().enumerate() { let d = (v - c).powi(2); if d < bd { bd = d; best = j; } }
+                assign[i] = best;
+            }
+            let (mut sum, mut cnt) = (vec![0f32; k], vec![0f32; k]);
+            for (i, &v) in col.iter().enumerate() { sum[assign[i]] += v; cnt[assign[i]] += 1.0; }
+            for j in 0..k { if cnt[j] > 0.0 { centroids[j] = sum[j] / cnt[j]; } }
+        }
+        for (i, &v) in col.iter().enumerate() { let d = (v - centroids[assign[i]]) as f64; se += d * d; }
+    }
+    se / (oc * ic) as f64
+}
+
 /// Validate the DeepSeek-V3/R1 q_lora MLA path (`MlaAttn::new_qlora`): a tiny synthetic
 /// config with q_b/o 4-bit codebook-quantized (host k-means via `quantize_host`), compared
 /// against a CPU reference that uses the SAME dequantized q_b/o weights (so this isolates
@@ -3354,6 +3421,37 @@ mod mla_tests {
         // PLAIN inv_freq instead of the yarn-corrected one -- both fixed in model/export_deepseek.py.
         let e = super::check_mla_block();
         assert!(e < 3e-2, "MLA block rel err {e:e} vs reference (fp16 synthetic ~1.6e-2 expected)");
+    }
+
+    #[test]
+    fn k256_reconstruction_beats_k16() {
+        // S19 premise: 8-bit (K=256) reconstructs a weight column far better than 4-bit (K=16).
+        // Two densities: gaussian (smooth, k-means MSE ~ k^-2 -> ~256x) and heavy-tail (outliers,
+        // where extra codes help most). Synthetic [oc][ic]. Reports the MSE ratio; gates loosely
+        // (>=30x) to stay robust to the RNG while proving the order-of-magnitude premise.
+        let (oc, ic) = (16usize, 4096usize);
+        let mut s = 0x5192_0256u64;
+        let mut u = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (s>>40) as f32 / (1u64<<24) as f32 }; // [0,1)
+        // Box-Muller gaussian
+        let mut g = |u: &mut dyn FnMut()->f32| { let (a,b)=(u().max(1e-7), u()); (-2.0*a.ln()).sqrt()*(std::f32::consts::TAU*b).cos() };
+        let gauss: Vec<f32> = (0..oc*ic).map(|_| g(&mut u)).collect();
+        // heavy tail: gaussian cubed (fat outliers), the pattern K=16 struggles with
+        let heavy: Vec<f32> = (0..oc*ic).map(|_| { let x = g(&mut u); x*x*x }).collect();
+        for (name, w) in [("gaussian", &gauss), ("heavy-tail", &heavy)] {
+            let (m16, m256) = (super::recon_mse_host(w, oc, ic, 16), super::recon_mse_host(w, oc, ic, 256));
+            let ratio = m16 / m256.max(1e-30);
+            eprintln!("[k256_recon {name}] MSE K16={m16:.3e} K256={m256:.3e} -> {ratio:.0}x better at 8-bit");
+            assert!(ratio >= 30.0, "{name}: K256 only {ratio:.1}x better than K16 (premise expects ~100x)");
+        }
+        // Size math for the report: extra bytes from promoting a tensor [oc][ic] K16->K256 =
+        // index bytes ic*oc - ic*(oc/2) = ic*oc/2, plus codebook (256-16)*oc f32.
+        let added = |ic: usize, oc: usize| ic*oc/2 + (256-16)*oc*4;
+        let (hidden, vocab, moe_inter, n_shared, nlayers_moe) = (7168usize, 129280usize, 2048usize, 1usize, 58usize);
+        let si = ((n_shared*moe_inter + 255)/256)*256;
+        let lm = added(hidden, vocab);
+        let sh = 2*added(hidden, si) + added(si, hidden); // gate+up ([si][hidden]) + down ([hidden][si])
+        eprintln!("[k256_size] 671B projection: lm_head +{:.2} GB; shared/layer +{:.1} MB x{} = +{:.2} GB; total +{:.2} GB on ~350 GB",
+            lm as f64/1e9, sh as f64/1e6, nlayers_moe, (sh*nlayers_moe) as f64/1e9, (lm + sh*nlayers_moe) as f64/1e9);
     }
 
     #[test]
@@ -3617,7 +3715,6 @@ impl DeepSeekModel {
             (cfg[0],cfg[1],cfg[2],cfg[3],cfg[4],cfg[5],cfg[6],cfg[7],cfg[8],cfg[9],cfg[10],cfg[11],cfg[12],cfg[13]);
         // prec_flags i32 follows the base header ONLY for the mixed magic (CBKE); CBKD has none.
         let prec: u32 = if mixed { rd_i32(&mut r) as u32 } else { 0 };
-        assert!(prec & PREC_SHARED_K256 == 0, "shared-expert K256 not wired yet (increment 3); prec_flags={prec:#x}");
         let eps = rd_f32(&mut r); let softmax_scale = rd_f32(&mut r); let rscale = rd_f32(&mut r);
         let inv_freq = rd_f32_vec(&mut r, rope/2);
         let embedding = rd_f16_vec(&mut r, vocab*hidden);
@@ -3648,12 +3745,15 @@ impl DeepSeekModel {
                         rd_u8_vec(&mut r, moe_inter*(hidden/2)), rd_f32_vec(&mut r, K*hidden)));
                 }
                 let si = ((n_shared*moe_inter + 255)/256)*256; // shared expert inter is padded to %256 in export
-                let sh = (rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
-                          rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
-                          rd_u8_vec(&mut r, si*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
+                // shared expert K (16 or 256 per prec_flags): gate/up are [si][hidden], down [hidden][si].
+                let sk = role_k(prec, PREC_SHARED_K256);
+                let (gu_p, d_p) = (if sk==256 { hidden*si } else { hidden*(si/2) }, if sk==256 { si*hidden } else { si*(hidden/2) });
+                let sh = (rd_u8_vec(&mut r, gu_p), rd_f32_vec(&mut r, sk*si),
+                          rd_u8_vec(&mut r, gu_p), rd_f32_vec(&mut r, sk*si),
+                          rd_u8_vec(&mut r, d_p), rd_f32_vec(&mut r, sk*hidden));
                 let experts: Vec<_> = estore.iter().map(|e| (e.0.as_slice(),e.1.as_slice(),e.2.as_slice(),e.3.as_slice(),e.4.as_slice(),e.5.as_slice())).collect();
                 let shared = Some((sh.0.as_slice(),sh.1.as_slice(),sh.2.as_slice(),sh.3.as_slice(),sh.4.as_slice(),sh.5.as_slice()));
-                DsFfn::Moe(MoeBlock::new(hidden, moe_inter, n_routed, top_k, eps, &post_norm, &rw, experts, shared, si, rscale))
+                DsFfn::Moe(MoeBlock::new_k(hidden, moe_inter, n_routed, top_k, eps, &post_norm, &rw, experts, shared, si, rscale, sk))
             };
             layers.push(DsLayer { attn_norm: DevF32::from_host(&attn_norm), attn, ffn });
             eprintln!("  loaded layer {}/{}", li+1, n_layers);
@@ -3699,7 +3799,6 @@ impl DeepSeekModel {
         assert!(experts_avq == 0 || experts_avq == 2 || experts_avq == 3, "experts_avq must be 0, 2 or 3");
         // Mixed-precision prec_flags i32 follows the base header for the CBKS magic (mixed CBKR).
         let prec: u32 = if mixed { rd_i32(&mut r) as u32 } else { 0 };
-        assert!(prec & PREC_SHARED_K256 == 0, "shared-expert K256 not wired yet (increment 3); prec_flags={prec:#x}");
         let eps = rd_f32(&mut r); let softmax_scale = rd_f32(&mut r); let rscale = rd_f32(&mut r);
         let inv_freq = rd_f32_vec(&mut r, rope/2);
         let embedding = rd_f16_vec(&mut r, vocab*hidden);
@@ -3747,12 +3846,14 @@ impl DeepSeekModel {
                     }
                 }
                 let si = ((n_shared*moe_inter + 255)/256)*256; // shared expert inter, padded to %256
-                let sh = (rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
-                          rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
-                          rd_u8_vec(&mut r, si*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
+                let sk = role_k(prec, PREC_SHARED_K256); // shared expert K (16 or 256 per prec_flags)
+                let (gu_p, d_p) = (if sk==256 { hidden*si } else { hidden*(si/2) }, if sk==256 { si*hidden } else { si*(hidden/2) });
+                let sh = (rd_u8_vec(&mut r, gu_p), rd_f32_vec(&mut r, sk*si),
+                          rd_u8_vec(&mut r, gu_p), rd_f32_vec(&mut r, sk*si),
+                          rd_u8_vec(&mut r, d_p), rd_f32_vec(&mut r, sk*hidden));
                 let shared = (sh.0.as_slice(), sh.1.as_slice(), sh.2.as_slice(), sh.3.as_slice(), sh.4.as_slice(), sh.5.as_slice());
                 // cap = top_k: minimal GPU-resident expert cache, experts stream from host every token.
-                let mut off = MoeBlockOffload::new(hidden, moe_inter, n_routed, top_k, top_k, eps, &post_norm, &rw, hosts, shared);
+                let mut off = MoeBlockOffload::new_k(hidden, moe_inter, n_routed, top_k, top_k, eps, &post_norm, &rw, hosts, shared, sk);
                 off.set_rscale(rscale);
                 if sigmoid_flag != 0 { off.set_v3_scoring(score_bias, n_group, topk_group); }
                 DsFfn::MoeOffload(off)

@@ -93,12 +93,13 @@ def qw(f, w, k=16):   # quantize a raw [out][in] weight tensor at K=k (16=4-bit 
     packed, cb, _ = quantize(w, k=k)
     f.write(packed.tobytes()); f.write(cb.tobytes())
 
-def qffn(f, gate, up, down, inter_pad):   # gate/up padded on output, down padded on input; zeros are lossless (silu(0)=0)
-    qw(f, _pad_out(gate.weight, inter_pad)); qw(f, _pad_out(up.weight, inter_pad)); qw(f, _pad_in(down.weight, inter_pad))
+def qffn(f, gate, up, down, inter_pad, k=16):   # gate/up padded on output, down padded on input; zeros are lossless (silu(0)=0)
+    qw(f, _pad_out(gate.weight, inter_pad), k); qw(f, _pad_out(up.weight, inter_pad), k); qw(f, _pad_in(down.weight, inter_pad), k)
 
 
-def _write_ffn(f, L, li, first_k_dense, inter_dense_pad, moe_inter_pad, shared_inter_pad, n_group, topk_group, sigmoid_flag):
-    # MLP: dense (first_k_dense layers) or MoE. Shared by CBKD and CBKR.
+def _write_ffn(f, L, li, first_k_dense, inter_dense_pad, moe_inter_pad, shared_inter_pad, n_group, topk_group, sigmoid_flag, shared_k=16):
+    # MLP: dense (first_k_dense layers) or MoE. Shared by CBKD and CBKR. Routed + dense experts
+    # are always 4-bit; only the shared expert may be K=256 (shared_k) under S19 mixed precision.
     if li < first_k_dense:
         M = L.mlp
         qffn(f, M.gate_proj, M.up_proj, M.down_proj, inter_dense_pad)
@@ -110,7 +111,7 @@ def _write_ffn(f, L, li, first_k_dense, inter_dense_pad, moe_inter_pad, shared_i
         for e in M.experts:
             qffn(f, e.gate_proj, e.up_proj, e.down_proj, moe_inter_pad)
         S = M.shared_experts
-        qffn(f, S.gate_proj, S.up_proj, S.down_proj, shared_inter_pad)
+        qffn(f, S.gate_proj, S.up_proj, S.down_proj, shared_inter_pad, shared_k)
     return 'dense' if li < first_k_dense else 'moe'
 
 
@@ -122,8 +123,9 @@ def main():
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--gen", type=int, default=16)
     ap.add_argument("--mixed", action="store_true",
-                    help="S19 mixed precision: write lm_head at K=256 (8-bit) via the CBKE/CBKS magic + "
-                         "prec_flags header. Shared experts follow (PREC_SHARED_K256) once the loader wires them.")
+                    help="S19 mixed precision: write lm_head AND the shared expert at K=256 (8-bit) via the "
+                         "CBKE/CBKS magic + prec_flags header. Routed experts stay 4-bit. (S18: those are the "
+                         "worst-4bit-damaged tensors.)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -172,10 +174,12 @@ def main():
     # (CBKE for CBKD, CBKS for CBKR) and writes ONE prec_flags i32 right after the base header;
     # non-mixed files are byte-identical to before. Shared experts (PREC_SHARED_K256) are reserved
     # here and wired end-to-end in the next increment.
-    prec_flags = PREC_LMHEAD_K256 if args.mixed else 0
+    prec_flags = (PREC_LMHEAD_K256 | PREC_SHARED_K256) if args.mixed else 0
     lm_k = 256 if (prec_flags & PREC_LMHEAD_K256) else 16
+    shared_k = 256 if (prec_flags & PREC_SHARED_K256) else 16
     if args.mixed:
-        print(f"mixed precision ON: prec_flags={prec_flags:#x} (lm_head K=256); magic={'CBKS' if q_lora_rank else 'CBKE'}", flush=True)
+        print(f"mixed precision ON: prec_flags={prec_flags:#x} (lm_head + shared expert K=256); "
+              f"magic={'CBKS' if q_lora_rank else 'CBKE'}", flush=True)
     path = os.path.join(args.out, "model.cbk")
     f = open(path, "wb")
 
@@ -206,7 +210,7 @@ def main():
             qw(f, A.o_proj.weight)                            # [hidden][n_heads*vhd] 4-bit
             w_f32(f, L.post_attention_layernorm.weight)
             kind = _write_ffn(f, L, li, first_k_dense, inter_dense_pad, moe_inter_pad, shared_inter_pad,
-                               n_group, topk_group, sigmoid_flag)
+                               n_group, topk_group, sigmoid_flag, shared_k)
             print(f"  layer {li+1}/{n_layers} ({kind}) written", flush=True)
     else:
         # CBKD: no q_lora (DeepSeek-V2-Lite style); MLA projections stay dense fp16.
@@ -230,7 +234,7 @@ def main():
             w_f16(f, A.o_proj.weight)                         # [hidden][n_heads*vhd]
             w_f32(f, L.post_attention_layernorm.weight)
             kind = _write_ffn(f, L, li, first_k_dense, inter_dense_pad, moe_inter_pad, shared_inter_pad,
-                               n_group, topk_group, sigmoid_flag)
+                               n_group, topk_group, sigmoid_flag, shared_k)
             print(f"  layer {li+1}/{n_layers} ({kind}) written", flush=True)
 
     w_f32(f, model.model.norm.weight)
