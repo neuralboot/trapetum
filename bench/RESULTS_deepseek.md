@@ -400,3 +400,24 @@ Whole-forward instrumentation (G-inc1) at steady state (pos 17-18):
 - Next: G-inc3 = sub-split setup, then hoist the redundant per-expert work to
   per-layer. If setup 190->40 and attention later ->80: token ~450 = ~2.2 tok/s.
 - Session ~1h ~8 USD. Program: ~79 USD AWS + 4 RunPod. Milestone: 1.35 tok/s.
+
+## 671B session G3 (2026-07-12): prewarm confirmed -- 1.67 tok/s; attention is now the wall (49%)
+
+- Prewarm-at-first-forward (G-inc3): recode 185 -> 0.3 ms CONFIRMED (the cold
+  cache was exactly the 190ms "setup" wall; pos=15 was never steady-state).
+- RESULT: 598 ms/token = 1.67 tok/s steady. Chain 0.24 -> 0.44 -> 0.96 -> 1.31
+  -> 1.35 -> 1.67 = x7 from the disk-offload baseline.
+- New breakdown at 598: attention=291 (49%!), moe=298 = phases 148 + ws_entry
+  84 (setup 60 [recode 0.3, quant 1.2, PREP 58.8] + barrier 20 + combine 2) +
+  xcopy 1.4 + shared 6.6.
+- TWO TARGETS, cleanly isolated: (1) ATTENTION 291 ms is now the single biggest
+  chunk (49% of the token) -- the host W_UK/W_UV absorption was parallelized (E)
+  but still ~4 GB/token of host f32 matmul; the real fix is GPU-side absorption
+  (do the two absorptions as device GEMMs, keep them off the 32-core CPU that is
+  busy with MoE). (2) PREP 58.8 ms = the lut8 activation layout-prep in setup
+  (deinterleave/transpose of the shared x per layer) -- likely hoistable to
+  once-per-layer or fused into quant.
+- If attention 291->~80 (GPU absorption) and prep 58->~10: token ~330 = ~3 tok/s.
+  Attention is the big project; prep is a quick win.
+- Session ~1h ~8 USD. Program: ~87 USD AWS + 4 RunPod. Milestone: 1.67 tok/s,
+  full 671B lossless-4bit, ONE 64-vCPU box.
