@@ -381,3 +381,22 @@ Whole-forward instrumentation (G-inc1) at steady state (pos 17-18):
 - If ws_entry halves (~100) and attention drops to ~80: token ~460 ms = ~2.2
   tok/s. Both are orchestration/overhead, not physics: reachable.
 - Session ~1h ~8 USD. Program: ~71 USD AWS + 4 RunPod.
+
+## 671B session G2 (2026-07-12): ws_entry sub-split -- barriers NOT the wall, "setup" is ~182ms
+
+- Persistent lut8 scratch (G-inc2) barely moved ws_entry: 213 -> 204 ms. So the
+  per-call malloc theory was mostly wrong for lut8 (or the alloc wasn't the
+  bulk). Steady 742 ms = 1.35 tok/s (marginal vs 762).
+- moe_ws_sub split: setup=~190 | run=~168 (the phases) | barrier+handoff=19.7 |
+  combine=2.1. BOTH our bets REFUTED: barriers are 19.7 ms (not 70-115), combine
+  is 2.1 ms. THE WALL IS "setup" = ~182-236 ms/token.
+- setup = the pre-phase work in the lut8 work-steal: prime suspect = int8
+  activation quantization done PER EXPERT (8x/layer x 58 = 464 quantizations of
+  a 7168-vector/token) instead of ONCE per layer shared across the 8 picked
+  experts. If so, hoisting the activation quant to once-per-layer cuts setup ~8x.
+  Needs a sub-split of setup to confirm (quant vs layout-prep vs cache-resolve).
+- Token budget: attention 296 + moe 426 (phases 168 + setup 190 + barrier 20 +
+  misc). Decode (168) done; setup (190) and attention (296) are the targets.
+- Next: G-inc3 = sub-split setup, then hoist the redundant per-expert work to
+  per-layer. If setup 190->40 and attention later ->80: token ~450 = ~2.2 tok/s.
+- Session ~1h ~8 USD. Program: ~79 USD AWS + 4 RunPod. Milestone: 1.35 tok/s.
