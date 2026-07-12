@@ -1461,20 +1461,37 @@ struct RawI8(*mut i8);
 unsafe impl Send for RawI8 {}
 unsafe impl Sync for RawI8 {}
 
-/// Per-expert int8-recoded codebooks (transposed to `[oc,16]`) + per-column scales, built once/call.
+/// Per-expert int8 codebooks (transposed to `[oc,16]`) + per-column scales, borrowed from the cache.
 struct ExpertI8<'a> {
-    gp: &'a [u8], g_t: Vec<i8>, gs: Vec<f32>,
-    up: &'a [u8], u_t: Vec<i8>, us: Vec<f32>,
-    dp: &'a [u8], d_t: Vec<i8>, ds: Vec<f32>,
+    gp: &'a [u8], g_t: &'a [i8], gs: &'a [f32],
+    up: &'a [u8], u_t: &'a [i8], us: &'a [f32],
+    dp: &'a [u8], d_t: &'a [i8], ds: &'a [f32],
     weight: f32,
 }
-fn recode_expert<'a>(e: &NativeExpert<'a>, hidden: usize, inter: usize) -> ExpertI8<'a> {
+
+/// Owned int8-recoded+transposed codebooks for one routed expert. Cached ONCE (see `cached_recode`)
+/// and reused across every MoE call -- session 5 showed the transpose delivered (per-core atom
+/// 0.66 -> 3.3 GB/s) but the win was masked by re-doing this recode+transpose for all picked experts
+/// EVERY call (~464/token, ~710 ms). Hoisting it here (lazy-once) is the last increment to ~2 tok/s.
+struct ExpertI8Cb { g_t: Vec<i8>, gs: Vec<f32>, u_t: Vec<i8>, us: Vec<f32>, d_t: Vec<i8>, ds: Vec<f32> }
+
+/// Lazily recode+transpose an expert's int8 codebooks, cached by the (stable, model-lifetime) gate-
+/// codebook pointer. First touch per expert only; ~150 MB total at 671B (58*256*3 small mats).
+fn cached_recode(e: &NativeExpert, hidden: usize, inter: usize) -> std::sync::Arc<ExpertI8Cb> {
+    use std::collections::HashMap;
+    static CACHE: OnceLock<Mutex<HashMap<usize, std::sync::Arc<ExpertI8Cb>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = e.gc.as_ptr() as usize;
+    if let Some(a) = cache.lock().unwrap().get(&key) { return a.clone(); }
     let (gi, gs) = recode_codebook_i8(e.gc, inter);
     let (ui, us) = recode_codebook_i8(e.uc, inter);
     let (di, ds) = recode_codebook_i8(e.dc, hidden);
-    ExpertI8 { gp: e.gp, g_t: transpose_codebook_i8(&gi, inter), gs,
-               up: e.up, u_t: transpose_codebook_i8(&ui, inter), us,
-               dp: e.dp, d_t: transpose_codebook_i8(&di, hidden), ds, weight: e.weight }
+    let a = std::sync::Arc::new(ExpertI8Cb {
+        g_t: transpose_codebook_i8(&gi, inter), gs,
+        u_t: transpose_codebook_i8(&ui, inter), us,
+        d_t: transpose_codebook_i8(&di, hidden), ds });
+    cache.lock().unwrap().insert(key, a.clone());
+    a
 }
 
 /// int8-quantize a vector: `(xq, xs)` with `xs = max|v|/127`.
@@ -1521,7 +1538,7 @@ fn lut8_worker(c: &Lut8Ctx) {
         let (which, ci) = (rr / nch_h, rr % nch_h);
         let (i0, i1) = (ci * NATIVE_CHUNK_I, ((ci + 1) * NATIVE_CHUNK_I).min(hidden));
         let ex = &c.experts[e];
-        let (packed, cb_t, base) = if which == 0 { (ex.gp, &ex.g_t, &c.pg) } else { (ex.up, &ex.u_t, &c.pu) };
+        let (packed, cb_t, base) = if which == 0 { (ex.gp, ex.g_t, &c.pg) } else { (ex.up, ex.u_t, &c.pu) };
         let slot = unsafe { std::slice::from_raw_parts_mut(base.0.add((e * nch_h + ci) * inter), inter) };
         accumulate_i8_dispatch(packed, cb_t, inter, c.xq_x, slot, i0, i1);
     }
@@ -1576,7 +1593,7 @@ fn lut8_worker(c: &Lut8Ctx) {
         let ex = &c.experts[e];
         let xq_act_e = unsafe { std::slice::from_raw_parts(c.xq_act.0.add(e * inter), inter) };
         let slot = unsafe { std::slice::from_raw_parts_mut(c.pd.0.add((e * nch_i + ci) * hidden), hidden) };
-        accumulate_i8_dispatch(ex.dp, &ex.d_t, hidden, xq_act_e, slot, i0, i1);
+        accumulate_i8_dispatch(ex.dp, ex.d_t, hidden, xq_act_e, slot, i0, i1);
     }
     lap!(&moetime::C_US);
     c.bar.wait();
@@ -1610,7 +1627,13 @@ pub fn routed_experts_native_worksteal_lut8(x: &[f32], experts: &[NativeExpert],
     let k = experts.len();
     for v in acc_out.iter_mut().take(hidden) { *v = 0.0; }
     if k == 0 { return; }
-    let ei8: Vec<ExpertI8> = experts.iter().map(|e| recode_expert(e, hidden, inter)).collect();
+    // Recode is now CACHED per expert (lazy-once), not redone every call -- the session-5 fix.
+    let cbs: Vec<std::sync::Arc<ExpertI8Cb>> = experts.iter().map(|e| cached_recode(e, hidden, inter)).collect();
+    let ei8: Vec<ExpertI8> = experts.iter().zip(&cbs).map(|(e, cb)| ExpertI8 {
+        gp: e.gp, g_t: &cb.g_t, gs: &cb.gs,
+        up: e.up, u_t: &cb.u_t, us: &cb.us,
+        dp: e.dp, d_t: &cb.d_t, ds: &cb.ds, weight: e.weight,
+    }).collect();
     let (xq_x, xs_x) = quantize_i8(&x[..hidden]);
     let nch_h = (hidden + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
     let nch_i = (inter + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
