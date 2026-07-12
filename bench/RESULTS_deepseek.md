@@ -232,3 +232,25 @@ IDENTICAL dequantized 4-bit weights:
   top-16 SV rel err 1.28%, max 2.65%, no catastrophic tensor), but 13 of the
   15 worst tensors are SHARED experts -> cheap mixed-precision policy: shared
   experts + lm_head at 6-8 bit (52 tensors, negligible size, every token path).
+
+## 671B inversion, first real measure (AWS g6e.16xlarge, 2026-07-12): NEGATIVE, levers identified
+
+Setup: 64 vCPU Xeon, 497 GB RAM, L40S 48 GB, artifact RAM-resident (336 GB page
+cache verified), branch s19-mixed-precision (deliverable A CPU-experts path).
+- Baseline GPU-offload: 0.3 tok/s (2.9 s/token): consistent with history.
+- HYBRID TRAPETUM_CPU_EXPERTS=1: 0.24 tok/s (4.2 s/token) at 16/32/48 threads.
+  THE INVERSION DID NOT PAY ON x86 YET. Effective expert throughput ~2.4 GB/s
+  vs the 50-100 needed.
+- Root cause (diagnosed live): (1) the CPU decode kernel is SCALAR on x86: the
+  NEON tbl path is aarch64-only and the vpshufb x86 twin (probe S13's design)
+  was never written; scalar i-outer measured ~1.2 GB/s single-thread on M4 and
+  x86 is comparable; (2) per-GEMV pool dispatch grain: down-proj at ic=2048 has
+  only 8 chunks for 32-48 threads, and 1392 dispatches/token serialize; both
+  were explicitly flagged as deferred levers in deliverable A.
+- The physics still stands: the model IS RAM-resident and the GPU sits idle at
+  ~0-5% during hybrid decode: the bytes are in the right place, the compute
+  kernel is not. Next: deliverable B = AVX2/AVX-512 vpshufb kernel + one phased
+  work-steal over all (expert,chunk) tasks; validate on a cheap CPU-only spot
+  box, then redo the 671B session (fully scripted, ~40 min to reproduce).
+- Cost of the session: ~12 USD. Also noted: prompt.bin had a double BOS
+  (tokenizer auto-adds id 0); fix the generator next run.
