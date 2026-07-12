@@ -3732,6 +3732,13 @@ impl DeepSeekModel {
             eprintln!("[mla_timing pos={pos}] attention={:.1} moe={:.1} other={:.1} total={:.1} ms",
                       attn_us as f64/1e3, moe_us as f64/1e3, other_us as f64/1e3, tot_us as f64/1e3);
         }
+        if cpu_experts::moetime::on() {
+            // Per-token MoE phase split (summed over 58 layers), summed worker-us / n_threads ~ wall.
+            let (a, ra, c, rc) = cpu_experts::moetime::take();
+            let n = (cpu_experts::cpu_threads().max(1)) as f64;
+            eprintln!("[moe_timing pos={pos}] A(gate+up decode)={:.1} RA(reduce+silu)={:.1} C(down decode)={:.1} RC(reduce)={:.1} ms  (worker-us/{n} ~ wall)",
+                      a as f64/n/1e3, ra as f64/n/1e3, c as f64/n/1e3, rc as f64/n/1e3);
+        }
         out
     }
 

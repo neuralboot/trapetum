@@ -1173,6 +1173,27 @@ fn engage_debug() -> bool {
     *D.get_or_init(|| std::env::var("TRAPETUM_CPU_ENGAGE_DEBUG").map(|v| v == "1").unwrap_or(false))
 }
 
+/// TRAPETUM_MOE_TIMING=1: per-phase worker-microseconds (summed across workers) for the native MoE
+/// work-steal, so the box can see WHERE the MoE phase spends its ~1.4 s (phase A/C decode vs the
+/// reduce tails vs setup) without gdb. Summed worker-us / n_workers ~ the phase wall time.
+pub mod moetime {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    pub static A_US: AtomicU64 = AtomicU64::new(0);
+    pub static RA_US: AtomicU64 = AtomicU64::new(0);
+    pub static C_US: AtomicU64 = AtomicU64::new(0);
+    pub static RC_US: AtomicU64 = AtomicU64::new(0);
+    pub fn on() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var("TRAPETUM_MOE_TIMING").map(|v| v == "1").unwrap_or(false))
+    }
+    #[inline] pub fn add(a: &AtomicU64, us: u64) { a.fetch_add(us, Ordering::Relaxed); }
+    pub fn take() -> (u64, u64, u64, u64) {
+        (A_US.swap(0, Ordering::Relaxed), RA_US.swap(0, Ordering::Relaxed),
+         C_US.swap(0, Ordering::Relaxed), RC_US.swap(0, Ordering::Relaxed))
+    }
+}
+
 /// Shared state a set of pool workers cooperatively drains for ONE native-path MoE call. Unlike the
 /// re-tiled [`WorkstealCtx`], the native layout chunks over the INPUT dimension (streaming `packed`
 /// once), so each (expert, proj, input-chunk) task writes a disjoint per-chunk PARTIAL that a later
@@ -1205,6 +1226,9 @@ fn native_ws_worker(c: &NativeWsCtx) {
     let (nch_h, nch_i, inter, hidden, k) = (c.nch_h, c.nch_i, c.inter, c.hidden, c.k);
     let wid = WORKER_ID.with(|w| w.get());
     let mut done = 0usize;
+    let tm = moetime::on();
+    let mut ph = if tm { Some(std::time::Instant::now()) } else { None };
+    macro_rules! lap { ($a:expr) => { if let Some(t) = ph { moetime::add($a, t.elapsed().as_micros() as u64); ph = Some(std::time::Instant::now()); } }; }
     // Phase A: gate+up input-chunks (2*nch_h per expert).
     let na = k * 2 * nch_h;
     loop {
@@ -1219,6 +1243,7 @@ fn native_ws_worker(c: &NativeWsCtx) {
         gemv_native_range(packed, cb, inter, c.x, slot, i0, i1);
         done += 1;
     }
+    lap!(&moetime::A_US);
     c.bar.wait();
     // Phase RA: reduce gate/up partials (fixed chunk order) + SiLU, per (expert, output-chunk).
     let nra = k * c.ra_per;
@@ -1238,6 +1263,7 @@ fn native_ws_worker(c: &NativeWsCtx) {
         }
         done += 1;
     }
+    lap!(&moetime::RA_US);
     c.bar.wait();
     // Phase C: down input-chunks (nch_i per expert).
     let nc = k * nch_i;
@@ -1252,6 +1278,7 @@ fn native_ws_worker(c: &NativeWsCtx) {
         gemv_native_range(ex.dp, ex.dc, hidden, act_e, slot, i0, i1);
         done += 1;
     }
+    lap!(&moetime::C_US);
     c.bar.wait();
     // Phase RC: reduce down partials (fixed chunk order), per (expert, output-chunk).
     let nrc = k * c.rc_per;
@@ -1270,6 +1297,7 @@ fn native_ws_worker(c: &NativeWsCtx) {
         }
         done += 1;
     }
+    lap!(&moetime::RC_US);
     if let Some(eng) = c.eng { if wid < eng.len() { eng[wid].fetch_add(done, Ordering::Relaxed); } }
 }
 
