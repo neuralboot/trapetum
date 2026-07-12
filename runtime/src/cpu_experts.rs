@@ -848,14 +848,35 @@ unsafe fn gemv_native_range_avx512(packed: &[u8], cb: &[f32], oc: usize, x: &[f3
     }
 }
 
-/// Selected native decode kernel, resolved ONCE: 2=AVX-512, 1=AVX2, 0=scalar. `TRAPETUM_CPU_SCALAR=1`
-/// forces scalar (for the x86 scalar-vs-SIMD perf A/B).
-#[cfg(target_arch = "x86_64")]
-fn native_kernel() -> u8 {
-    static K: OnceLock<u8> = OnceLock::new();
+/// Native decode kernel selection (deliverable C). `TRAPETUM_CPU_KERNEL` picks explicitly, else auto
+/// (widest exact SIMD). `TRAPETUM_CPU_SCALAR=1` is a back-compat alias for `=scalar`.
+///   scalar          f32 reference (portable)
+///   gather / auto   f32 gather AVX2/AVX-512 (deliverable B; exact; gather-bound ~ the 671B ceiling)
+///   lut8            int8-recoded codebook + vpshufb value-LUT (deliverable C2; tolerance-gated)
+///   vpermps         f32 register-resident LUT (deliverable C1; exact) -- not yet built
+/// Values whose kernel is not yet implemented fall back to the best exact kernel with a one-time
+/// notice, so the box's A/B script can set the flag today without breaking.
+#[derive(Clone, Copy, PartialEq)]
+#[allow(dead_code)] // some variants only constructed under cfg(x86_64)
+pub(crate) enum CpuKernel { Scalar, GatherAvx2, GatherAvx512, Lut8 }
+
+pub(crate) fn cpu_kernel() -> CpuKernel {
+    static K: OnceLock<CpuKernel> = OnceLock::new();
     *K.get_or_init(|| {
-        if std::env::var("TRAPETUM_CPU_SCALAR").map(|v| v == "1").unwrap_or(false) { return 0; }
-        if is_x86_feature_detected!("avx512f") { 2 } else if is_x86_feature_detected!("avx2") { 1 } else { 0 }
+        let scalar_alias = std::env::var("TRAPETUM_CPU_SCALAR").map(|v| v == "1").unwrap_or(false);
+        let sel = std::env::var("TRAPETUM_CPU_KERNEL").ok().unwrap_or_default();
+        #[cfg(target_arch = "x86_64")]
+        let best = if is_x86_feature_detected!("avx512f") { CpuKernel::GatherAvx512 }
+                   else if is_x86_feature_detected!("avx2") { CpuKernel::GatherAvx2 } else { CpuKernel::Scalar };
+        #[cfg(not(target_arch = "x86_64"))]
+        let best = CpuKernel::Scalar;
+        if scalar_alias { return CpuKernel::Scalar; }
+        match sel.as_str() {
+            "scalar" => CpuKernel::Scalar,
+            "gather" | "auto" | "" => best,
+            "lut8" => CpuKernel::Lut8,
+            other => { eprintln!("[cpu_kernel] '{other}' not implemented yet -> falling back to the best exact kernel"); best }
+        }
     })
 }
 
@@ -864,11 +885,14 @@ fn native_kernel() -> u8 {
 /// (16-col) and AVX2 (8-col) tilings never leave a remainder; the guards keep it correct regardless.
 #[inline]
 fn gemv_native_range(packed: &[u8], cb: &[f32], oc: usize, x: &[f32], y: &mut [f32], i0: usize, i1: usize) {
+    // This is the f32-exact GEMV. The int8 lut8 path (C2) has a different signature (int8 cb + scale
+    // + int8 x) and is wired separately; here Lut8 maps to the best exact gather kernel.
     #[cfg(target_arch = "x86_64")]
     {
-        match native_kernel() {
-            2 if oc % 16 == 0 => return unsafe { gemv_native_range_avx512(packed, cb, oc, x, y, i0, i1) },
-            k if k >= 1 && oc % 8 == 0 => return unsafe { gemv_native_range_avx2(packed, cb, oc, x, y, i0, i1) },
+        match cpu_kernel() {
+            CpuKernel::GatherAvx512 if oc % 16 == 0 => return unsafe { gemv_native_range_avx512(packed, cb, oc, x, y, i0, i1) },
+            CpuKernel::Scalar => {}
+            _ if oc % 8 == 0 => return unsafe { gemv_native_range_avx2(packed, cb, oc, x, y, i0, i1) },
             _ => {}
         }
     }
@@ -950,6 +974,55 @@ pub fn routed_experts_native(x: &[f32], experts: &[NativeExpert], hidden: usize,
         expert_forward_native(x, ex.gp, ex.gc, ex.up, ex.uc, ex.dp, ex.dc, hidden, inter, &mut y);
         for i in 0..hidden { acc_out[i] += ex.weight * y[i]; }
     }
+}
+
+// ============================================================================
+// int8 codebook recode (deliverable C2). To reach the vpshufb/tbl 47 GB/s class the decode must be
+// a byte-LUT, which needs an int8 codebook. We recode each per-column f32 codebook to int8 + a
+// per-column f32 scale at LOAD time (a small one-time pass, no artifact change): cb_i8[k,o] =
+// round(cb[k,o] / scale[o]), scale[o] = max_k|cb[k,o]| / 127. The decode then quantizes the
+// activation to int8 too (per-vector scale), does an int32 dot, and rescales by (xs * scale[o]).
+// This adds codebook+activation int8 error -- comparable in scale to the fp16-vs-f32 path gap we
+// already accept; the tolerance is MEASURED and printed (int8_recode_error_probe), and the gate is
+// margins/PPL (the determinism campaign), not raw f32 equality. The SIMD kernel (C-inc3) implements
+// exactly this arithmetic, so its correctness test is "vpshufb == this scalar int8", bit-exact.
+// ============================================================================
+
+/// Recode a per-column f32 codebook `[K,oc]` to int8 `[K,oc]` + per-column f32 `scale[oc]`.
+pub fn recode_codebook_i8(cb: &[f32], oc: usize) -> (Vec<i8>, Vec<f32>) {
+    assert_eq!(cb.len(), K * oc);
+    let mut cb_i8 = vec![0i8; K * oc];
+    let mut scale = vec![0f32; oc];
+    for o in 0..oc {
+        let mut mx = 0f32;
+        for k in 0..K { mx = mx.max(cb[k * oc + o].abs()); }
+        let s = if mx > 0.0 { mx / 127.0 } else { 1.0 };
+        scale[o] = s;
+        for k in 0..K { cb_i8[k * oc + o] = (cb[k * oc + o] / s).round().clamp(-127.0, 127.0) as i8; }
+    }
+    (cb_i8, scale)
+}
+
+/// Full int8-path decode-GEMV (the arithmetic the lut8 SIMD kernel implements): quantize `x` to int8
+/// (per-vector scale `xs = max|x|/127`), int32 dot with the int8 codebook, rescale by `xs*scale[o]`.
+/// `y[o] = xs * scale[o] * sum_i cb_i8[idx[i,o], o] * round(x[i]/xs)`. Scalar reference for the probe
+/// and the SIMD correctness anchor. Overflow-safe: |cb_i8*xq| <= 127*127, summed over ic < 2^31.
+pub fn gemv_native_i8(packed: &[u8], cb_i8: &[i8], scale: &[f32], oc: usize, ic: usize, x: &[f32], y: &mut [f32]) {
+    let half = oc / 2;
+    let xs = { let mut mx = 0f32; for &v in &x[..ic] { mx = mx.max(v.abs()); } if mx > 0.0 { mx / 127.0 } else { 1.0 } };
+    let xq: Vec<i32> = x[..ic].iter().map(|&v| (v / xs).round().clamp(-127.0, 127.0) as i32).collect();
+    let mut acc = vec![0i32; oc];
+    for i in 0..ic {
+        let xi = xq[i];
+        if xi == 0 { continue; }
+        let row = &packed[i * half..i * half + half];
+        for j in 0..half {
+            let b = row[j];
+            acc[2 * j]     += cb_i8[((b & 0xF) as usize) * oc + 2 * j] as i32 * xi;
+            acc[2 * j + 1] += cb_i8[((b >> 4) as usize) * oc + 2 * j + 1] as i32 * xi;
+        }
+    }
+    for o in 0..oc { y[o] = xs * scale[o] * acc[o] as f32; }
 }
 
 // ============================================================================
@@ -1608,6 +1681,28 @@ mod tests {
             routed_experts_native_worksteal_nt(&x, &experts, hidden, inter, &mut got, nt);
             assert!(seq.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()),
                     "native worksteal not bit-identical to sequential at {nt} workers");
+        }
+    }
+
+    #[test]
+    fn int8_recode_error_probe() {
+        // Deliverable C2 precision gate: how much error does the int8 path (int8 codebook + int8
+        // activation) add vs the EXACT f32 decode? Reports L2 rel error. Reference scale: the
+        // fp16-vs-f32 path we already accept is ~1e-3..1e-2. If int8 lands in that ballpark, C2's
+        // 47 GB/s ceiling is worth the SIMD kernel; if it blows up, C1 (exact vpermps) is the path.
+        for (oc, ic) in [(2048usize, 2048usize), (7168, 2048), (2048, 7168)] {
+            let mut r = Lcg(0x0C2E_5713u64 ^ ((oc as u64) << 7) ^ ic as u64);
+            let w: Vec<f32> = (0..oc * ic).map(|_| r.f32() * 0.5).collect();
+            let x: Vec<f32> = (0..ic).map(|_| r.f32()).collect();
+            let (packed, cb, _) = quantize_host(&w, oc, ic);
+            let mut yf = vec![0f32; oc];
+            super::gemv_native_range_scalar(&packed, &cb, oc, &x, &mut yf, 0, ic); // exact f32 decode
+            let (cb_i8, scale) = super::recode_codebook_i8(&cb, oc);
+            let mut yi = vec![0f32; oc];
+            super::gemv_native_i8(&packed, &cb_i8, &scale, oc, ic, &x, &mut yi);
+            let e = l2_rel(&yi, &yf);
+            eprintln!("[int8_recode_error oc={oc} ic={ic}] int8-path vs f32-decode L2 rel err = {e:.4e}");
+            assert!(e < 5e-2, "int8 path L2 rel err {e:e} too large at oc={oc} ic={ic}");
         }
     }
 
