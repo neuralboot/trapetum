@@ -232,3 +232,214 @@ IDENTICAL dequantized 4-bit weights:
   top-16 SV rel err 1.28%, max 2.65%, no catastrophic tensor), but 13 of the
   15 worst tensors are SHARED experts -> cheap mixed-precision policy: shared
   experts + lm_head at 6-8 bit (52 tensors, negligible size, every token path).
+
+## 671B inversion, first real measure (AWS g6e.16xlarge, 2026-07-12): NEGATIVE, levers identified
+
+Setup: 64 vCPU Xeon, 497 GB RAM, L40S 48 GB, artifact RAM-resident (336 GB page
+cache verified), branch s19-mixed-precision (deliverable A CPU-experts path).
+- Baseline GPU-offload: 0.3 tok/s (2.9 s/token): consistent with history.
+- HYBRID TRAPETUM_CPU_EXPERTS=1: 0.24 tok/s (4.2 s/token) at 16/32/48 threads.
+  THE INVERSION DID NOT PAY ON x86 YET. Effective expert throughput ~2.4 GB/s
+  vs the 50-100 needed.
+- Root cause (diagnosed live): (1) the CPU decode kernel is SCALAR on x86: the
+  NEON tbl path is aarch64-only and the vpshufb x86 twin (probe S13's design)
+  was never written; scalar i-outer measured ~1.2 GB/s single-thread on M4 and
+  x86 is comparable; (2) per-GEMV pool dispatch grain: down-proj at ic=2048 has
+  only 8 chunks for 32-48 threads, and 1392 dispatches/token serialize; both
+  were explicitly flagged as deferred levers in deliverable A.
+- The physics still stands: the model IS RAM-resident and the GPU sits idle at
+  ~0-5% during hybrid decode: the bytes are in the right place, the compute
+  kernel is not. Next: deliverable B = AVX2/AVX-512 vpshufb kernel + one phased
+  work-steal over all (expert,chunk) tasks; validate on a cheap CPU-only spot
+  box, then redo the 671B session (fully scripted, ~40 min to reproduce).
+- Cost of the session: ~12 USD. Also noted: prompt.bin had a double BOS
+  (tokenizer auto-adds id 0); fix the generator next run.
+
+## 671B v3 rerun with deliverable B (AWS g6e.16xlarge, 2026-07-12): 0.44 tok/s, gather is the wall
+
+- HYBRID AVX: 2271 ms/token (0.44 tok/s), thread-insensitive (32/48/60 identical).
+- Scalar A/B: 2500 ms/token: the AVX gather kernel buys only 8%.
+- MAP_POPULATE experiment: no change (minor-fault hypothesis refuted cleanly;
+  populate verified working: load 26s -> 50.6s).
+- Live utilization sampling: ~460-1000% CPU of 6400% = only ~9-16 of 32 workers
+  effective; ~0.5-0.7 GB/s per core.
+- DIAGNOSIS: two compounding ceilings. (1) per-core: AVX2 gather decode of the
+  per-column f32 codebook is ~1 elem/cycle even L2-resident: ~0.7 GB/s/core;
+  even perfect 32-core engagement would cap at ~22 GB/s = ~2 tok/s. (2)
+  engagement: pool wake latency + phase barriers x58 calls/token + tail
+  imbalance keep half the workers idle.
+- Deliverable B improved 0.24 -> 0.44 tok/s (the work-steal grain paid x1.8);
+  the remaining wall is the DECODE ITSELF, exactly as the deliverable-B report
+  flagged: hardware gather cannot reach the tbl/pshufb 47 GB/s class.
+- Deliverable C scoped, two candidate kernels to MEASURE (not assume): (C1)
+  AVX-512 vpermps register-resident 16xf32 LUT with an (i-block x o-block)
+  register-transpose tiling: EXACT, no contract change, hardest engineering;
+  (C2) int8 codebook recode + vpshufb value-LUT (the C-probe design, 47 GB/s
+  class): adds quantization of the codebook itself (error scale comparable to
+  the already-accepted fp16-vs-f32 path difference; gates are margins/PPL since
+  the determinism campaign). Build both behind flags, measure, pick.
+- Session cost ~9 USD. All boxes terminated.
+
+## 671B session 3 (2026-07-12): the THIRD wall is MLA attention + both prior levers exonerated
+
+Deliverable C fully measured (engagement + lut8), and the floor did not move:
+- Engagement A/B: futex 2316 ms/token vs spin 2201 (5%); ENGAGE_DEBUG proves
+  workers=32 active=32, tasks balanced 13-26 -> ENGAGEMENT EXONERATED (the
+  earlier 9-16/32 top-sampling read memory-stalled threads as idle).
+- lut8 vs gather vs scalar: 2319 / 2210 / 2500 ms/token -> KERNEL EXONERATED.
+- Box raw memory: 11.0 GB/s page-cache read on ONE thread -> BOX EXONERATED
+  (and the sequential-TLB hypothesis with it).
+- gdb thread-stack sampling during decode (PMU is blocked on virtualized EC2;
+  stacks are not): main thread 2/5 samples inside MlaAttn::forward, 3/5 parked
+  in Pool::run waiting on workers -> per token roughly ~0.9 s of GPU MLA and
+  ~1.4 s of CPU-MoE phase.
+- MLA at ~0.9 s/token with VRAM-resident weights is the new prime suspect:
+  671B exercises the q_lora path (q_lora_rank=1536, absent on V2-Lite) and
+  128 heads x 61 layers of per-op launches/syncs can alone cost ~0.8 s. The
+  MoE-CPU phase at ~7 GB/s aggregate also has headroom (workers active but
+  memory-stalled; per-GEMV x-quantization and reduce tails to profile).
+- Next: deliverable E = (1) MLA batching/sync audit on the CUDA path for the
+  671B config (batch per-head ops, kill per-op drains, inspect q_lora), with
+  env-gated per-component timing (TRAPETUM_MLA_TIMING) so the box can split
+  attention vs MoE vs rest per token; (2) MoE-phase micro-profiling hooks.
+- Session ~2h ~15 USD. Boxes terminated. Cumulative finding chain:
+  disk -> RAM -> faults -> grain -> gather -> engagement -> MLA serial path.
+
+## 671B sessions 4+4b (2026-07-12): MLA fix pays x2.2 -> 0.96 tok/s; the per-core atom; F2 lesson
+
+- MLA host-absorption fix (deliverable E): attention 900 -> 290 ms/token; TOTAL
+  2271 -> 1046 ms/token = 0.96 tok/s. First time under 1.1 s.
+- Dissection (TRAPETUM_MLA_TIMING/MOE_TIMING): attention=290 moe=831 other=1.6;
+  moe split A(gate+up)=387 RA=21 C(down)=186 RC=101; decode dominates, ~140 ms
+  unaccounted per-call overhead.
+- THE ATOM: T=1 moe=15380 ms -> 0.66 GB/s per core on the gather kernel (warm
+  mmap). Thread scaling GOOD (T16 12.5x, T32 18.5x): the wall is PER-CORE
+  latency, not shared contention (the earlier thread-insensitivity was the
+  MLA-host floor masking everything).
+- F1 MADV_HUGEPAGE: -9% only. TLB/page-walk hypothesis largely refuted as the
+  main wall; 0.66 GB/s/core is gather-latency territory, and lut8 (no gather)
+  matching it suggests both kernels serialize ~equally for different reasons
+  (vpgatherdd latency vs per-byte-position nibble extraction).
+- F2 anon-THP arena: KILLED THE BOX: staging 350 GB anon while the page cache
+  still held ~336 GB wedged the kernel in direct reclaim (SSH dead, instance
+  terminated). LESSON: staging must fadvise(DONTNEED)/drop the model's page
+  cache BEFORE allocating the arena, with a staging progress print + free-RAM
+  guard. The scripted F2 run also failed silently earlier (empty output):
+  same cause.
+- lut8 correctness gate: cargo test output captured EMPTY twice; unresolved,
+  suspicious (filter name? test compilation?). To nail next session.
+- Next levers ranked: (1) per-core decode kernel: the in-register 16x16
+  transpose on lut8 (marked hotspot) OR a gather-free vpermps tile: target
+  2-4 GB/s/core = moe ~200-400 ms; (2) the ~140 ms per-call overhead gap;
+  (3) GPU-side absorption for the remaining 290 ms attention; (4) F2 retried
+  WITH cache-drop staging. Ceiling if (1)+(2) land: ~400-500 ms/token
+  (~2-2.5 tok/s) on this box class.
+- Session ~1.5 h ~11 USD. Program totals: ~55 USD AWS + 4 RunPod.
+
+## 671B session 5 (2026-07-12): the transpose lands -- 1.31 tok/s (x5.5 from 0.24)
+
+- lut8 16x16 in-register transpose (lever #1): per-core decode atom 0.66 ->
+  3.3 GB/s (x5), gate bit-exact on AVX2. But total was masked until:
+- recode+transpose HOISTED to a per-expert lazy cache (lever #2b): removed
+  ~710 ms/token of per-call codebook prep.
+- RESULT (T=32, steady, last 12): 762 ms/token = 1.31 tok/s. Chain:
+  0.24 -> 0.44 -> 0.96 -> 1.31. Best config T=32 (T=48/60 regress: the reduce
+  phase RC climbs 64->97->129 ms with threads = reduce contention/oversub).
+- Dissection at 1.31: attention=287 (38%), moe=613. But moe phases only sum to
+  A99+RA10+C54+RC64 = 227: ~386 ms/token STILL unaccounted inside the MoE
+  forward (not the 4 timed phases): candidates = host activation copy +
+  per-GEMV x-quantization + combine + pool handoff. This is the next lever, and
+  it is now the BIGGEST single chunk (bigger than attention).
+- Decode itself is essentially solved (A+C = 153 ms for 10 GB = ~67 GB/s
+  aggregate, near the read floor): the wall moved from compute to per-call
+  orchestration overhead + attention.
+- Next levers ranked: (1) the ~386 ms unaccounted MoE per-call overhead
+  (instrument the gap: activation quant, combine, handoff); (2) the 287 ms
+  attention (GPU-side absorption); (3) reduce-phase RC contention at high T.
+  If (1) halves and (2) drops to ~50: token ~ 480 ms = ~2 tok/s still in reach.
+- Session ~1h ~8 USD. Program: ~63 USD AWS + 4 RunPod. Milestone: the inversion
+  runs the full 671B at 1.31 tok/s lossless-4bit on ONE 64-vCPU box, no
+  datacenter -- interactive-adjacent, x5.5 the disk-offload baseline.
+
+## 671B session G (2026-07-12): the 386ms MoE gap SPLIT -- it is ws_entry (per-call overhead), NOT the shared expert
+
+Whole-forward instrumentation (G-inc1) at steady state (pos 17-18):
+- moe wall ~455 ms = phases(A98+RA10+C41+RC28 ~177) + ws_entry(~213) + xcopy(1.4)
+  + shared(6.6).
+- SHARED EXPERT = 6.6 ms: the residual-overlap prior is REFUTED, shared is already
+  trivial (VRAM-resident, fast); no overlap lever there.
+- XCOPY (device->host activation drain) = 1.4 ms: trivial.
+- ws_entry = ws_total - timed phases = ~213 ms = THE GAP. It is the per-call
+  work-steal overhead OUTSIDE decode/reduce: int8 activation x-quantization,
+  codebook-cache HashMap lookup (464/token), pool submit/handoff (spin x58),
+  and the routed combine/saxpy. ~3.7 ms/layer of pure orchestration.
+- Token budget now: attention 291 + moe 455 (phases 177 + ws_entry 213 + misc) =
+  ~776 ms = 1.29 tok/s steady.
+- THE TWO REAL TARGETS, cleanly isolated: (1) ws_entry ~213 ms (per-call
+  overhead, needs a sub-split: x-quant vs handoff vs lookup vs combine); (2)
+  attention 291 ms (GPU-side absorption). Decode itself (phases 177) is DONE.
+- If ws_entry halves (~100) and attention drops to ~80: token ~460 ms = ~2.2
+  tok/s. Both are orchestration/overhead, not physics: reachable.
+- Session ~1h ~8 USD. Program: ~71 USD AWS + 4 RunPod.
+
+## 671B session G2 (2026-07-12): ws_entry sub-split -- barriers NOT the wall, "setup" is ~182ms
+
+- Persistent lut8 scratch (G-inc2) barely moved ws_entry: 213 -> 204 ms. So the
+  per-call malloc theory was mostly wrong for lut8 (or the alloc wasn't the
+  bulk). Steady 742 ms = 1.35 tok/s (marginal vs 762).
+- moe_ws_sub split: setup=~190 | run=~168 (the phases) | barrier+handoff=19.7 |
+  combine=2.1. BOTH our bets REFUTED: barriers are 19.7 ms (not 70-115), combine
+  is 2.1 ms. THE WALL IS "setup" = ~182-236 ms/token.
+- setup = the pre-phase work in the lut8 work-steal: prime suspect = int8
+  activation quantization done PER EXPERT (8x/layer x 58 = 464 quantizations of
+  a 7168-vector/token) instead of ONCE per layer shared across the 8 picked
+  experts. If so, hoisting the activation quant to once-per-layer cuts setup ~8x.
+  Needs a sub-split of setup to confirm (quant vs layout-prep vs cache-resolve).
+- Token budget: attention 296 + moe 426 (phases 168 + setup 190 + barrier 20 +
+  misc). Decode (168) done; setup (190) and attention (296) are the targets.
+- Next: G-inc3 = sub-split setup, then hoist the redundant per-expert work to
+  per-layer. If setup 190->40 and attention later ->80: token ~450 = ~2.2 tok/s.
+- Session ~1h ~8 USD. Program: ~79 USD AWS + 4 RunPod. Milestone: 1.35 tok/s.
+
+## 671B session G3 (2026-07-12): prewarm confirmed -- 1.67 tok/s; attention is now the wall (49%)
+
+- Prewarm-at-first-forward (G-inc3): recode 185 -> 0.3 ms CONFIRMED (the cold
+  cache was exactly the 190ms "setup" wall; pos=15 was never steady-state).
+- RESULT: 598 ms/token = 1.67 tok/s steady. Chain 0.24 -> 0.44 -> 0.96 -> 1.31
+  -> 1.35 -> 1.67 = x7 from the disk-offload baseline.
+- New breakdown at 598: attention=291 (49%!), moe=298 = phases 148 + ws_entry
+  84 (setup 60 [recode 0.3, quant 1.2, PREP 58.8] + barrier 20 + combine 2) +
+  xcopy 1.4 + shared 6.6.
+- TWO TARGETS, cleanly isolated: (1) ATTENTION 291 ms is now the single biggest
+  chunk (49% of the token) -- the host W_UK/W_UV absorption was parallelized (E)
+  but still ~4 GB/token of host f32 matmul; the real fix is GPU-side absorption
+  (do the two absorptions as device GEMMs, keep them off the 32-core CPU that is
+  busy with MoE). (2) PREP 58.8 ms = the lut8 activation layout-prep in setup
+  (deinterleave/transpose of the shared x per layer) -- likely hoistable to
+  once-per-layer or fused into quant.
+- If attention 291->~80 (GPU absorption) and prep 58->~10: token ~330 = ~3 tok/s.
+  Attention is the big project; prep is a quick win.
+- Session ~1h ~8 USD. Program: ~87 USD AWS + 4 RunPod. Milestone: 1.67 tok/s,
+  full 671B lossless-4bit, ONE 64-vCPU box.
+
+## 671B session H (2026-07-12): attention on GPU -- 2.46 tok/s, TARGET HIT, x10 from baseline
+
+- GATE: mla_block_math_correct green (device MLA absorption numerically correct).
+- H-HOST control (PREP-fix only, absorption still on host): 542 ms = 1.84 tok/s
+  (the parallel-memset PREP fix alone lifted 1.67 -> 1.84; attention still 302).
+- H-DEVICE (W_UK/W_UV absorptions as device GEMVs): attention 302 -> 170 ms,
+  token 542 -> 416 = 2.40 tok/s. THE BIG WIN.
+- H-DEVICE-OVERLAP (dev_flush drops the redundant per-layer attn drain): 407 ms
+  = 2.46 tok/s. The residual-overlap saving is real but small (~9 ms): attention
+  is mostly serial before o_proj, little to hide. Honest.
+- FINAL: 2.46 tok/s. FULL CHAIN: 0.24 -> 0.44 -> 0.96 -> 1.31 -> 1.35 -> 1.67
+  -> 1.84 -> 2.46 tok/s = x10.2 from the disk-offload baseline, on ONE g6e.16xlarge
+  (64 vCPU + L40S), full DeepSeek-R1 671B, lossless 4-bit, pure Rust, no datacenter.
+- Remaining budget at 407 ms: attention 164 + moe 242 (decode ~150 + ws ~90) +
+  other. Both have more to give (attention GEMV batching, moe reduce tail) but
+  the stated 2-2.5 tok/s target is HIT.
+- Every wall in the chain, in order, each measured then killed: disk -> RAM ->
+  minor-faults -> dispatch-grain -> gather-latency -> worker-engagement ->
+  MLA-host-serial -> page-walks(refuted) -> per-core-decode -> recode-cache-cold
+  -> scratch-memset -> attention-on-host. Eleven diagnoses, ~$95 total.
+- Session ~1h ~8 USD. Program total: ~95 USD AWS + 4 RunPod.

@@ -19,7 +19,7 @@ use std::sync::Arc;
 mod backend {
     use std::os::raw::c_void;
     extern "C" {
-        pub fn qlinear_create(packed: *const u8, cb: *const f32, ic: i32, oc: i32) -> *mut c_void;
+        pub fn qlinear_create(packed: *const u8, cb: *const f32, ic: i32, oc: i32, k: i32) -> *mut c_void;
         pub fn qlinear_forward_dev(h: *mut c_void, d_x: *const c_void, d_y: *mut c_void);
         pub fn qlinear_free(h: *mut c_void);
         // AVQ (additive-codebook) linear for MoE routed experts (M in {2,3}); see AvqLinear.
@@ -67,6 +67,7 @@ mod backend {
 pub fn op_gelu_mul(gate_f32: *const c_void, up_f32: *const c_void, out_half: *mut c_void, n: i32);
                 pub fn op_gemv_fp16(w_half: *const c_void, x_half: *const c_void, y_f32: *mut c_void, ic: i32, oc: i32);
         pub fn op_mla_attn(q_half: *const c_void, qr_half: *const c_void, ckv_half: *const c_void, kr_half: *const c_void, out_half: *mut c_void, n_heads: i32, d_c: i32, d_rope: i32, seqlen: i32, scale: f32);
+        pub fn op_mla_absorb(x_half: *const c_void, w_half: *const c_void, out_half: *mut c_void, nh: i32, in_dim: i32, out_dim: i32, s: i32, dc: i32, roff: i32, co: i32, ci: i32);
         pub fn op_attn_m(
             q_half: *const c_void,
             ck_half: *const c_void,
@@ -179,21 +180,38 @@ pub struct QuantLinear {
     handle: *mut c_void,
     ic: usize,
     oc: usize,
+    k: usize,
 }
 
 impl QuantLinear {
+    /// 4-bit (K=16) scalar codebook linear.
     /// - `packed`: `(ic, oc/2)` bytes, two 4-bit indices per byte (low nibble first).
-    /// - `codebook`: `(K, oc)` f32, one per-output-channel table.
+    /// - `codebook`: `(16, oc)` f32, one per-output-channel table.
     pub fn new(packed: &[u8], codebook: &[f32], ic: usize, oc: usize) -> Self {
-        assert_eq!(packed.len(), ic * (oc / 2), "packed must be ic*(oc/2) bytes");
-        assert_eq!(codebook.len(), K * oc, "codebook must be K*oc floats");
-        assert_eq!(oc % 256, 0, "oc must be a multiple of 256 (kernel tiling)");
-        assert_eq!(ic % 2, 0, "ic must be even (packed nibbles)");
-        let handle =
-            unsafe { qlinear_create(packed.as_ptr(), codebook.as_ptr(), ic as i32, oc as i32) };
-        assert!(!handle.is_null(), "qlinear_create returned null (CUDA error?)");
-        Self { handle, ic, oc }
+        Self::new_k(packed, codebook, ic, oc, 16)
     }
+
+    /// Scalar codebook linear at `k` entries per output column. `k=16` is the nibble-packed
+    /// 4-bit path (`data` is `ic*(oc/2)` bytes, gemv4). `k=256` is the 8-bit path (S19 mixed
+    /// precision): `data` is `ic*oc` bytes, one uint8 index per element, decoded by gemv8.
+    /// `codebook` is `(k, oc)` f32 in both cases (one per-output-channel table).
+    pub fn new_k(data: &[u8], codebook: &[f32], ic: usize, oc: usize, k: usize) -> Self {
+        assert!(k == 16 || k == 256, "QuantLinear: only K=16 (4-bit) and K=256 (8-bit) are supported");
+        let want_bytes = if k == 256 { ic * oc } else { ic * (oc / 2) };
+        assert_eq!(data.len(), want_bytes, "data must be {} bytes for K={k}", want_bytes);
+        assert_eq!(codebook.len(), k * oc, "codebook must be k*oc floats");
+        // oc%128==0 covers both tilings: Metal gemv8 CPB8=32, CUDA gemv8 CPB=128, gemv4 CPB=256.
+        let div = if k == 256 { 128 } else { 256 };
+        assert_eq!(oc % div, 0, "oc must be a multiple of {div} (kernel tiling for K={k})");
+        assert_eq!(ic % 2, 0, "ic must be even (packed nibbles / uint32 index read)");
+        let handle =
+            unsafe { qlinear_create(data.as_ptr(), codebook.as_ptr(), ic as i32, oc as i32, k as i32) };
+        assert!(!handle.is_null(), "qlinear_create returned null (CUDA error?)");
+        Self { handle, ic, oc, k }
+    }
+
+    /// Codebook size (16 or 256).
+    pub fn k(&self) -> usize { self.k }
 
     /// `y` (device f32) = `x` (device fp16) W^T. Fully on-device, no host copies.
     pub fn forward_into(&self, x: &DevHalf, y: &mut DevF32) {
@@ -1122,6 +1140,61 @@ fn mmap_skip(r: &mut BufReader<File>, mmap: &Arc<memmap2::Mmap>, len: usize) -> 
     Ok(PackedBytes::Mmap(mmap.clone(), off, len))
 }
 
+/// Deliverable F2 (TRAPETUM_EXPERTS_ANON_THP=1): O_DIRECT-stage the routed experts' packed indices
+/// into ONE anonymous 2 MB-huge-page arena, bypassing the page cache (no double memory), so their
+/// address space is ~512x fewer PTEs than the 4 KB file mmap -- killing the page-walk pressure that
+/// is the suspected MoE wall. Pure storage relocation: same bytes, no arithmetic change.
+/// MemAvailable from /proc/meminfo (bytes) -- the kernel's own estimate of what can be allocated
+/// without reclaim/swap. Used by the F2 free-RAM guard so a too-big arena aborts instead of wedging.
+#[cfg(all(target_os = "linux", any(feature = "cuda", feature = "metal")))]
+fn mem_available_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+#[cfg(all(target_os = "linux", any(feature = "cuda", feature = "metal")))]
+struct AnonStager { arena: Arc<memmap2::MmapMut>, cursor: usize, od: File, bounce: memmap2::MmapMut, reported: usize }
+#[cfg(all(target_os = "linux", any(feature = "cuda", feature = "metal")))]
+impl AnonStager {
+    fn new(path: &str, total: usize) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_DIRECT: i32 = 0x4000; // Linux O_DIRECT
+        let arena = memmap2::MmapMut::map_anon(total)?;
+        let _ = arena.advise(memmap2::Advice::HugePage); // ask for 2 MB pages (advise takes &self)
+        let od = std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(path)?;
+        let bounce = memmap2::MmapMut::map_anon(16 << 20)?; // reusable page-aligned O_DIRECT bounce
+        Ok(Self { arena: Arc::new(arena), cursor: 0, od, bounce, reported: 0 })
+    }
+    /// O_DIRECT-read `len` bytes at `r`'s current position into the arena, advance `r` past them,
+    /// return an `Anon` slice. O_DIRECT needs 4 KB-aligned offset+len+buffer, so read the aligned
+    /// superset into the page-aligned bounce and copy the exact sub-range into the arena. (Routed
+    /// experts are never at EOF -- shared expert / lm_head follow -- so the aligned span is in-file.)
+    fn stage(&mut self, r: &mut BufReader<File>, len: usize) -> std::io::Result<PackedBytes> {
+        use std::os::unix::fs::FileExt;
+        let off = r.stream_position()?;
+        r.seek(SeekFrom::Current(len as i64))?;
+        let (a0, a1) = (off & !4095, (off + len as u64 + 4095) & !4095);
+        let span = (a1 - a0) as usize;
+        if span > self.bounce.len() { self.bounce = memmap2::MmapMut::map_anon(span)?; }
+        self.od.read_exact_at(&mut self.bounce[..span], a0)?;
+        let (skip, dst) = ((off - a0) as usize, self.cursor);
+        // Sound: single-threaded during load; the Arc<MmapMut> readers (as_slice) come strictly after.
+        unsafe { std::ptr::copy_nonoverlapping(self.bounce.as_ptr().add(skip), (self.arena.as_ptr() as *mut u8).add(dst), len); }
+        self.cursor += len;
+        if self.cursor - self.reported >= 32 << 30 { // progress every 32 GB so a slow stage isn't silent
+            eprintln!("[anon_thp] staged {} / {} GB", self.cursor >> 30, self.arena.len() >> 30);
+            self.reported = self.cursor;
+        }
+        Ok(PackedBytes::Anon(self.arena.clone(), dst, len))
+    }
+}
+
 /// Block until all queued GPU work completes (call before stopping a timer).
 pub fn sync() {
     unsafe { dev_sync() };
@@ -1416,6 +1489,53 @@ pub fn check_gpu_gemv_vs_fp16cb_ref(ic: usize, oc: usize) -> (f64, f64) {
         num += d*d; den += (yref[o] as f64)*(yref[o] as f64);
     }
     (worst, num.sqrt() / den.sqrt().max(1e-12))
+}
+
+/// K256 (8-bit) decode-correctness: compare the GPU `gemv8` fused decode against a CPU reference
+/// that uses the SAME fp16-rounded codebook + fp16 activations the GPU stores, so the only residual
+/// is float summation order (not fp16-vs-f32 codebook rounding). Synthetic: random uint8 indices
+/// `idx[ic*oc]` and a random `cb[256*oc]` codebook (one table per output column). Returns
+/// `(worst_rel, l2_rel)`. Also asserts the K256 path is bitwise run-to-run deterministic under the
+/// active mode (the two-stage default): `iters` extra runs must match the first bit-for-bit.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn check_gpu_gemv8_vs_ref(ic: usize, oc: usize, iters: usize) -> (f64, f64, usize) {
+    assert_eq!(oc % 128, 0, "K256 tiling needs oc % 128 == 0"); assert_eq!(ic % 2, 0);
+    let mut s = 0x8B00_0256u64;
+    let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+    // random per-column codebook (256 entries) and random uint8 indices [ic, oc] (input-major)
+    let cb: Vec<f32> = (0..256*oc).map(|_| r()*0.5).collect();
+    let idx: Vec<u8> = (0..ic*oc).map(|_| ((r()*0.5 + 0.5) * 255.0) as u8).collect();
+    let x: Vec<f32> = (0..ic).map(|_| r()).collect();
+    // CPU reference with the GPU's exact fp16 codebook + fp16-rounded X, f32 accumulate:
+    // y[o] = sum_i cb16[idx[i,o]*oc + o] * x16[i].
+    let cb16: Vec<f32> = cb.iter().map(|&c| f16::from_f32(c).to_f32()).collect();
+    let x16: Vec<f32> = x.iter().map(|&v| f16::from_f32(v).to_f32()).collect();
+    let mut yref = vec![0f32; oc];
+    for o in 0..oc {
+        let mut acc = 0f32;
+        for i in 0..ic { let id = idx[i*oc + o] as usize; acc += cb16[id*oc + o] * x16[i]; }
+        yref[o] = acc;
+    }
+    let q = QuantLinear::new_k(&idx, &cb, ic, oc, 256);
+    let dx = DevHalf::from_host(&x);
+    let mut y = DevF32::zeros(oc);
+    q.forward_into(&dx, &mut y);
+    let got = y.to_host();
+    let (mut worst, mut num, mut den) = (0f64, 0f64, 0f64);
+    for o in 0..oc {
+        let d = (got[o] - yref[o]) as f64;
+        worst = worst.max(d.abs() / (yref[o] as f64).abs().max(1e-3));
+        num += d*d; den += (yref[o] as f64)*(yref[o] as f64);
+    }
+    // determinism: extra runs must be bitwise identical to the first
+    let mut mism = 0usize;
+    for _ in 0..iters {
+        let mut yy = DevF32::zeros(oc);
+        q.forward_into(&dx, &mut yy);
+        let cur = yy.to_host();
+        if got.iter().zip(&cur).any(|(a, b)| a.to_bits() != b.to_bits()) { mism += 1; }
+    }
+    (worst, num.sqrt() / den.sqrt().max(1e-12), mism)
 }
 
 /// Wall time per fused GEMV call (ms), best-of, under whatever `TRAPETUM_DETERMINISTIC` mode is
@@ -1873,6 +1993,18 @@ impl MoeBlock {
                        shared_inter, rscale, Self::cpu_experts_flag())
     }
 
+    /// Like [`Self::new`] but with the shared expert at `shared_k` entries/column (S19 mixed
+    /// precision: 256 for the 8-bit shared expert, 16 otherwise). Routed cpu/gpu mode from env.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_k(hidden: usize, inter: usize, n_experts: usize, top_k: usize, eps: f32,
+                 norm_w: &[f32], router_w: &[f32],
+                 experts: Vec<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
+                 shared: Option<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
+                 shared_inter: usize, rscale: f32, shared_k: usize) -> Self {
+        Self::new_mode_k(hidden, inter, n_experts, top_k, eps, norm_w, router_w, experts, shared,
+                       shared_inter, rscale, Self::cpu_experts_flag(), shared_k)
+    }
+
     /// Like [`Self::new`], but the caller decides whether routed experts live on the CPU
     /// (`cpu = true`, host-resident, not uploaded) or the GPU (`cpu = false`, today's path).
     /// The public `new` picks `cpu` from `TRAPETUM_CPU_EXPERTS`; validation uses both.
@@ -1882,11 +2014,28 @@ impl MoeBlock {
                     experts: Vec<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
                     shared: Option<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
                     shared_inter: usize, rscale: f32, cpu: bool) -> Self {
+        Self::new_mode_k(hidden, inter, n_experts, top_k, eps, norm_w, router_w, experts, shared, shared_inter, rscale, cpu, 16)
+    }
+
+    /// Like [`Self::new_mode`], but the shared expert is quantized at `shared_k` entries per column
+    /// (16 = 4-bit, 256 = 8-bit S19 mixed precision). Routed experts always stay 4-bit; the shared
+    /// expert always stays on the GPU, so K=256 is a plain `QuantLinear::new_k`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_mode_k(hidden: usize, inter: usize, n_experts: usize, top_k: usize, eps: f32,
+                    norm_w: &[f32], router_w: &[f32],
+                    experts: Vec<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
+                    shared: Option<(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])>,
+                    shared_inter: usize, rscale: f32, cpu: bool, shared_k: usize) -> Self {
         assert_eq!(experts.len(), n_experts);
         let mk = |e: &(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32]), inter: usize| Expert {
             gate: QuantLinear::new(e.0, e.1, hidden, inter),
             up:   QuantLinear::new(e.2, e.3, hidden, inter),
             down: QuantLinear::new(e.4, e.5, inter, hidden),
+        };
+        let mk_shared = |e: &(&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])| Expert {
+            gate: QuantLinear::new_k(e.0, e.1, hidden, shared_inter, shared_k),
+            up:   QuantLinear::new_k(e.2, e.3, hidden, shared_inter, shared_k),
+            down: QuantLinear::new_k(e.4, e.5, shared_inter, hidden, shared_k),
         };
         // Routed experts: host-side copies (CPU mode) or GPU-uploaded QuantLinears (GPU mode).
         // The shared expert always stays on the GPU.
@@ -1907,7 +2056,7 @@ impl MoeBlock {
             router: DenseLinear::new(router_w, hidden, n_experts),
             experts: gpu_experts,
             cpu_experts,
-            shared: shared.as_ref().map(|e| mk(e, shared_inter)),  // DeepSeek shared expert is bigger (n_shared*moe_inter)
+            shared: shared.as_ref().map(|e| mk_shared(e)),  // DeepSeek shared expert (bigger; K per shared_k)
             top_k, rscale, hidden, inter, shared_inter, n_experts, eps,
             norm: DevHalf::zeros(hidden),
             rlogits: DevF32::zeros(n_experts),
@@ -2351,6 +2500,16 @@ mod moe_cpu_tests {
     }
 
     #[test]
+    fn offload_cpu_experts_match_gpu() {
+        // 671B path: MoeBlockOffload routed experts on the CPU (native input-major, no re-tile)
+        // vs on the GPU. fp16-GPU vs f32-CPU -> small diff; gate on L2 (near-zero elts inflate
+        // worst-rel), same as the V2-Lite cpu_experts_match_gpu check.
+        let (worst, l2) = super::check_moe_offload_cpu();
+        eprintln!("[offload_cpu] worst_rel={worst:.3e} l2_rel={l2:.3e}");
+        assert!(worst < 1e-2 || l2 < 1e-3, "offload CPU vs GPU mismatch: worst_rel={worst:e} l2_rel={l2:e}");
+    }
+
+    #[test]
     fn overlap_bench_v2lite() {
         // V2-Lite dims: hidden=2048, moe_inter=1408, 64 routed experts, top_k=6, 2 shared
         // experts (shared_inter=2*1408=2816, a multiple of 256). Loaded M4, best of 5.
@@ -2374,6 +2533,10 @@ mod moe_cpu_tests {
 pub enum PackedBytes {
     Owned(Vec<u8>),
     Mmap(Arc<memmap2::Mmap>, usize, usize), // (mmap, byte offset, byte length)
+    /// Deliverable F2: a slice of the shared anonymous huge-page arena the routed experts were
+    /// O_DIRECT-read into (TRAPETUM_EXPERTS_ANON_THP=1). 2 MB pages -> ~512x fewer PTEs than the
+    /// 4 KB file mmap, killing the page-walk pressure that is the suspected MoE wall. Same bytes.
+    Anon(Arc<memmap2::MmapMut>, usize, usize), // (arena, byte offset, byte length)
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -2382,6 +2545,7 @@ impl PackedBytes {
         match self {
             PackedBytes::Owned(v) => v.as_slice(),
             PackedBytes::Mmap(m, off, len) => &m[*off..*off + *len],
+            PackedBytes::Anon(m, off, len) => &m[*off..*off + *len],
         }
     }
 
@@ -2527,6 +2691,10 @@ pub struct MoeBlockOffload {
     n_group: usize,
     topk_group: usize,
     sigmoid: bool,
+    // Some(_) overrides TRAPETUM_CPU_EXPERTS for this block (two-mode validation).
+    cpu_override: Option<bool>,
+    // lut8: whether this block's routed codebooks have been pre-warmed into the int8 cache (once).
+    lut8_warmed: bool,
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -2535,15 +2703,24 @@ impl MoeBlockOffload {
     pub fn new(hidden: usize, inter: usize, n_experts: usize, top_k: usize, cap: usize, eps: f32,
                norm_w: &[f32], router_w: &[f32], hosts: Vec<ExpertHost>,
                shared: (&[u8],&[f32],&[u8],&[f32],&[u8],&[f32])) -> Self {
+        Self::new_k(hidden, inter, n_experts, top_k, cap, eps, norm_w, router_w, hosts, shared, 16)
+    }
+
+    /// Like [`Self::new`] but with the (GPU-resident) shared expert at `shared_k` entries/column
+    /// (S19: 256 = 8-bit shared expert, 16 otherwise). Routed experts stream from host, 4-bit only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_k(hidden: usize, inter: usize, n_experts: usize, top_k: usize, cap: usize, eps: f32,
+               norm_w: &[f32], router_w: &[f32], hosts: Vec<ExpertHost>,
+               shared: (&[u8],&[f32],&[u8],&[f32],&[u8],&[f32]), shared_k: usize) -> Self {
         assert_eq!(hosts.len(), n_experts);
         assert!(cap >= top_k, "cache must hold at least top_k experts");
         Self {
             norm_w: DevF32::from_host(norm_w),
             router: DenseLinear::new(router_w, hidden, n_experts),
             hosts,
-            shared: OffExpert { gate: Proj::Scalar(QuantLinear::new(shared.0,shared.1,hidden,inter)),
-                             up: Proj::Scalar(QuantLinear::new(shared.2,shared.3,hidden,inter)),
-                             down: Proj::Scalar(QuantLinear::new(shared.4,shared.5,inter,hidden)) },
+            shared: OffExpert { gate: Proj::Scalar(QuantLinear::new_k(shared.0,shared.1,hidden,inter,shared_k)),
+                             up: Proj::Scalar(QuantLinear::new_k(shared.2,shared.3,hidden,inter,shared_k)),
+                             down: Proj::Scalar(QuantLinear::new_k(shared.4,shared.5,inter,hidden,shared_k)) },
             cache: std::collections::HashMap::new(), lru: Vec::new(), cap,
             top_k, hidden, inter, n_experts, eps,
             norm: DevHalf::zeros(hidden), rlogits: DevF32::zeros(n_experts),
@@ -2552,11 +2729,17 @@ impl MoeBlockOffload {
             uploads: 0,
             rscale: 1.0,
             score_bias: None, n_group: 0, topk_group: 0, sigmoid: false,
+            cpu_override: None,
+            lut8_warmed: false,
         }
     }
 
     /// Set the `routed_scaling_factor` combine-weight multiplier (default 1.0).
     pub fn set_rscale(&mut self, rscale: f32) { self.rscale = rscale; }
+
+    /// Force the routed-experts backend for this block (Some(true)=CPU native, Some(false)=GPU),
+    /// overriding `TRAPETUM_CPU_EXPERTS`. Used by the two-mode validation check.
+    pub fn set_cpu_experts(&mut self, on: bool) { self.cpu_override = Some(on); }
 
     /// Switch to DeepSeek-V3's sigmoid+bias grouped top-k router. See `MoeBlock::set_v3_scoring`.
     pub fn set_v3_scoring(&mut self, score_bias: Vec<f32>, n_group: usize, topk_group: usize) {
@@ -2642,6 +2825,56 @@ impl MoeBlockOffload {
                 let _ = writeln!(f, "{}", ids.join(","));
             }
         }
+        // TRAPETUM_CPU_EXPERTS=1: run the routed experts on the CPU straight from the mmap-backed
+        // native input-major packed (NO re-tile, NO GPU upload -- the 671B is ~350 GB and doubling
+        // it is impossible). Only scalar (CBKR) experts; AVQ is out of scope. Shared expert stays
+        // on the GPU. `resident()` (the GPU stream) is never called for routed experts in this mode.
+        static CPU_EXP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let cpu = self.cpu_override.unwrap_or_else(|| *CPU_EXP.get_or_init(|| std::env::var("TRAPETUM_CPU_EXPERTS").map(|v| v == "1").unwrap_or(false)));
+        if cpu {
+            // G-inc1 whole-forward split: time the stages OUTSIDE the work-steal phases so the box can
+            // dissect the ~386 ms/token gap (xcopy drain, work-steal entry overhead, GPU shared expert).
+            let tm = cpu_experts::moetime::on();
+            let t = std::time::Instant::now();
+            let x = self.norm.to_host();
+            if tm { cpu_experts::moetime::add(&cpu_experts::moetime::XCOPY_US, t.elapsed().as_micros() as u64); }
+            let refs: Vec<cpu_experts::NativeExpert> = picks.iter().map(|&(e, w)| match &self.hosts[e] {
+                ExpertHost::Scalar { gp, gc, up, uc, dp, dc } => cpu_experts::NativeExpert {
+                    gp: gp.as_slice(), gc, up: up.as_slice(), uc, dp: dp.as_slice(), dc, weight: w,
+                },
+                ExpertHost::Avq { .. } => panic!("TRAPETUM_CPU_EXPERTS: AVQ (additive-codebook) experts are out of scope; scalar CBKR only"),
+            }).collect();
+            let mut acc_host = vec![0f32; self.hidden];
+            // lut8: pre-warm this block's ENTIRE routed codebook cache once (parallel), so no decode
+            // ever pays a recode miss (the ~190 ms/token "setup" wall was the lazy cache warming).
+            if cpu_experts::cpu_kernel() == cpu_experts::CpuKernel::Lut8 && !self.lut8_warmed {
+                let all: Vec<cpu_experts::NativeExpert> = self.hosts.iter().filter_map(|h| match h {
+                    ExpertHost::Scalar { gp, gc, up, uc, dp, dc } => Some(cpu_experts::NativeExpert {
+                        gp: gp.as_slice(), gc, up: up.as_slice(), uc, dp: dp.as_slice(), dc, weight: 0.0 }),
+                    ExpertHost::Avq { .. } => None,
+                }).collect();
+                cpu_experts::prewarm_lut8_cache(&all, self.hidden, self.inter);
+                self.lut8_warmed = true;
+            }
+            // ONE phased work-steal over all (expert, proj, input-chunk) tasks per MoE call, not a
+            // pool dispatch per GEMV (deliverable B lever 2): at 671B this cuts ~1392 dispatches/token
+            // to ~58 and fills the workers. TRAPETUM_CPU_KERNEL=lut8 selects the int8 vpshufb decode
+            // (deliverable C, tolerance ~0.5%/GEMV); anything else uses the exact f32 gather decode.
+            let t = std::time::Instant::now();
+            if cpu_experts::cpu_kernel() == cpu_experts::CpuKernel::Lut8 {
+                cpu_experts::routed_experts_native_worksteal_lut8(&x, &refs, self.hidden, self.inter, &mut acc_host);
+            } else {
+                cpu_experts::routed_experts_native_worksteal(&x, &refs, self.hidden, self.inter, &mut acc_host);
+            }
+            if tm { cpu_experts::moetime::add(&cpu_experts::moetime::WS_US, t.elapsed().as_micros() as u64); }
+            let t = std::time::Instant::now();
+            let mut acc = DevF32::from_host(&acc_host);
+            let (sg, su, sd) = (self.shared.gate.as_ref(), self.shared.up.as_ref(), self.shared.down.as_ref());
+            self.run_ffn(sg, su, sd, &mut acc, 1.0); // shared expert on GPU, as in V2-Lite
+            residual_add(h, &acc);
+            if tm { unsafe { dev_sync(); } cpu_experts::moetime::add(&cpu_experts::moetime::SHARED_US, t.elapsed().as_micros() as u64); }
+            return;
+        }
         // TRAPETUM_PREFETCH=1: kick off background reads for ALL picked experts not
         // yet GPU-resident before computing the first one, so the disk works on
         // experts 2..k while expert 1 streams and computes.
@@ -2715,12 +2948,52 @@ pub fn check_moe_offload() -> (f64, usize, usize, usize) {
     (worst, cap, n_experts, off.uploads)
 }
 
+/// Two-mode validation of the 671B CPU-experts path: the SAME synthetic MoeBlockOffload run with
+/// routed experts on the GPU (streamed) vs on the CPU (native input-major, from the host slices, no
+/// re-tile). The GPU experts consume fp16 activations while the CPU path is f32, so a small diff is
+/// expected. Returns `(worst_rel, l2_rel)`; the shared expert runs on the GPU in both. No pod needed.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn check_moe_offload_cpu() -> (f64, f64) {
+    let (hidden, inter, n_experts, top_k, cap) = (256usize, 256usize, 64usize, 8usize, 16usize);
+    let eps = 1e-5f32; let seed = 0x0FF1_0AD5u64;
+    let (nw, rw, hosts, sh) = gen_moe(hidden, inter, n_experts, seed);
+    let sho = sh.scalar_slices();
+    let mut off = MoeBlockOffload::new(hidden, inter, n_experts, top_k, cap, eps, &nw, &rw, hosts, sho);
+    let mut s = 0x00C0_FFEEu64;
+    let mut rr = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+    let (mut worst, mut num, mut den) = (0f64, 0f64, 0f64);
+    for _ in 0..8 {
+        let h0: Vec<f32> = (0..hidden).map(|_| rr()*0.3).collect();
+        off.set_cpu_experts(false);
+        let mut hg = DevHalf::from_host(&h0); off.forward(&mut hg); let a = hg.to_host();
+        off.set_cpu_experts(true);
+        let mut hc = DevHalf::from_host(&h0); off.forward(&mut hc); let b = hc.to_host();
+        for i in 0..hidden {
+            let d = (a[i]-b[i]) as f64;
+            worst = worst.max(d.abs() / (a[i] as f64).abs().max(1e-3));
+            num += d*d; den += (a[i] as f64)*(a[i] as f64);
+        }
+    }
+    (worst, num.sqrt()/den.sqrt().max(1e-9))
+}
+
 /// Dense fp16 GEMV: `y = W x` (W is `[oc][ic]` fp16). `saxpy`-free helper for the MLA
 /// projection matrices, which are small and kept dense rather than codebook-quantized.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn gemv_fp16(w: &DevHalf, x: &DevHalf, y: &mut DevF32, ic: usize, oc: usize) {
     assert_eq!(w.n, ic*oc); assert_eq!(x.n, ic); assert_eq!(y.n, oc);
     unsafe { op_gemv_fp16(w.ptr, x.ptr, y.ptr, ic as i32, oc as i32) };
+}
+
+/// Batched per-head MLA absorption on the GPU (deliverable H): `out[h][o] = sum_i x[h][i] *
+/// W[(h*S+roff)*dc + o*co + i*ci]`, `W` the resident fp16 `kv_b`. aq (W_UK): in=nope, out=d_c,
+/// roff=0, co=1, ci=d_c. attn (W_UV): in=d_c, out=v_head_dim, roff=nope, co=d_c, ci=1.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+#[allow(clippy::too_many_arguments)]
+pub fn mla_absorb(x: &DevHalf, w: &DevHalf, out: &mut DevHalf,
+                  nh: usize, in_dim: usize, out_dim: usize, s: usize, dc: usize, roff: usize, co: usize, ci: usize) {
+    assert_eq!(x.n, nh * in_dim); assert_eq!(out.n, nh * out_dim);
+    unsafe { op_mla_absorb(x.ptr, w.ptr, out.ptr, nh as i32, in_dim as i32, out_dim as i32, s as i32, dc as i32, roff as i32, co as i32, ci as i32) };
 }
 
 /// A dense fp16 linear `y = W x`, weights resident on the GPU (`[oc][ic]` row-major).
@@ -2765,11 +3038,13 @@ pub struct MlaAttn {
     o_proj: Option<DenseLinear>,
     kv_a_norm: Vec<f32>,          // [d_c]
     kv_b: Vec<f32>,               // [n_heads*(nope+v_head_dim)][d_c]  (W_UK ++ W_UV per head)
+    kv_b_dev: DevHalf,            // resident fp16 copy of kv_b for the device `mla_absorb` GEMV (H)
     inv_freq: Vec<f32>,           // [d_rope/2]
     cache_ckv: DevHalf,           // [max_seq][d_c]
     cache_kr: DevHalf,            // [max_seq][d_rope]
     n_heads: usize, d_c: usize, d_rope: usize, nope: usize, v_head_dim: usize, hidden: usize,
     pub eps: f32, softmax_scale: f32,
+    qnope_dev: DevHalf,           // [n_heads*nope] fp16 scratch: q_nope extracted for the aq GEMV
     aq_dev: DevHalf, qr_dev: DevHalf, outl_dev: DevHalf,
     ckv_h: DevHalf, kr_h: DevHalf,
     qf: DevF32, kvf: DevF32, attn_dev: DevHalf, o_out: DevF32,
@@ -2810,6 +3085,39 @@ pub(crate) fn mla_rope_interleaved(v: &mut [f32], pos: usize, inv_freq: &[f32]) 
     }
 }
 
+/// `TRAPETUM_MLA_HOST=1`: run the two MLA absorptions (W_UK for `aq`, W_UV for `attn`) on the CPU
+/// pool (the deliverable-E path) instead of the device `mla_absorb` GEMV (deliverable H). Kept as
+/// the A/B lever and the fallback; the device path is the default. The device path uses a resident
+/// fp16 `kv_b_dev`, so it also drops the ~n_heads*(nope+vhd)*d_c host kv_b streaming per token.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn mla_host() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("TRAPETUM_MLA_HOST").map(|v| v == "1").unwrap_or(false))
+}
+
+/// `TRAPETUM_MLA_OVERLAP=1` (device absorption path only): skip mirroring `attn_dev` back to the
+/// host `last_attn` on the hot path. The device path never needs `attn` on host -- o_proj consumes
+/// `attn_dev` directly and the in-order queue guarantees the absorb kernel finishes first -- so that
+/// download is a REDUNDANT second per-layer device drain (the first, unavoidable one is the
+/// qf/kvf read-back for host ckv/krope). Dropping it lets the absorb+o_proj+residual+rmsnorm tail
+/// stay in one command buffer, drained once when the MoE downloads `h`. Off by default so the gate
+/// and the box layer-0 sub-dump still see `last_attn`; on = the A/B perf lever.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn mla_overlap() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("TRAPETUM_MLA_OVERLAP").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Raw `*mut f32` wrapped Send+Sync so a `parallel_for` closure can write DISJOINT regions (one per
+/// head) without a borrow. Sound only because each parallel index writes a non-overlapping slice.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+#[derive(Clone, Copy)]
+struct SyncMutPtr(*mut f32);
+#[cfg(any(feature = "cuda", feature = "metal"))]
+unsafe impl Sync for SyncMutPtr {}
+
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl MlaAttn {
     #[allow(clippy::too_many_arguments)]
@@ -2821,9 +3129,11 @@ impl MlaAttn {
             q_proj: Some(DenseLinear::new(q_w, hidden, qdim)),
             kv_a: DenseLinear::new(kv_a_w, hidden, d_c + d_rope),
             o_proj: Some(DenseLinear::new(o_w, n_heads*v_head_dim, hidden)),
-            kv_a_norm: kv_a_norm.to_vec(), kv_b: kv_b.to_vec(), inv_freq: inv_freq.to_vec(),
+            kv_a_norm: kv_a_norm.to_vec(), kv_b: kv_b.to_vec(),
+            kv_b_dev: DevHalf::from_host(kv_b), inv_freq: inv_freq.to_vec(),
             cache_ckv: DevHalf::zeros(max_seq*d_c), cache_kr: DevHalf::zeros(max_seq*d_rope),
             n_heads, d_c, d_rope, nope, v_head_dim, hidden, eps, softmax_scale,
+            qnope_dev: DevHalf::zeros(n_heads*nope),
             aq_dev: DevHalf::zeros(n_heads*d_c), qr_dev: DevHalf::zeros(n_heads*d_rope),
             outl_dev: DevHalf::zeros(n_heads*d_c),
             ckv_h: DevHalf::zeros(d_c), kr_h: DevHalf::zeros(d_rope),
@@ -2847,9 +3157,11 @@ impl MlaAttn {
             q_proj: None,
             kv_a: DenseLinear::new(kv_a_w, hidden, d_c + d_rope),
             o_proj: None,
-            kv_a_norm: kv_a_norm.to_vec(), kv_b: kv_b.to_vec(), inv_freq: inv_freq.to_vec(),
+            kv_a_norm: kv_a_norm.to_vec(), kv_b: kv_b.to_vec(),
+            kv_b_dev: DevHalf::from_host(kv_b), inv_freq: inv_freq.to_vec(),
             cache_ckv: DevHalf::zeros(max_seq*d_c), cache_kr: DevHalf::zeros(max_seq*d_rope),
             n_heads, d_c, d_rope, nope, v_head_dim, hidden, eps, softmax_scale,
+            qnope_dev: DevHalf::zeros(n_heads*nope),
             aq_dev: DevHalf::zeros(n_heads*d_c), qr_dev: DevHalf::zeros(n_heads*d_rope),
             outl_dev: DevHalf::zeros(n_heads*d_c),
             ckv_h: DevHalf::zeros(d_c), kr_h: DevHalf::zeros(d_rope),
@@ -2896,26 +3208,53 @@ impl MlaAttn {
         for (i, x) in ckv.iter_mut().enumerate() { *x = *x * sc * self.kv_a_norm[i]; }
         let mut krope: Vec<f32> = kv[dc..dc+dr].to_vec();
         self.rope(&mut krope, pos);
-        // per-head absorbed query + rope query
-        let mut aq = vec![0f32; nh*dc];
+        // rope query (host, cheap): rotate the d_rope tail of each head's q. Always host -- the
+        // kv_b streaming, not this, was the wall.
         let mut qr = vec![0f32; nh*dr];
         let hd = nope + dr;
-        for h in 0..nh {
-            let mut qn = q[h*hd..h*hd+nope].to_vec();
-            let mut qrope = q[h*hd+nope..h*hd+hd].to_vec();
-            self.rope(&mut qrope, pos);
-            qr[h*dr..(h+1)*dr].copy_from_slice(&qrope);
-            // absorbed_q[h][j] = sum_i qn[i] * W_UK[h][i][j] ; W_UK[h] rows = kv_b[h*(nope+vhd)+i]
-            let base = h*(nope+vhd);
-            for j in 0..dc {
-                let mut acc = 0f32;
-                for i in 0..nope { acc += qn[i] * self.kv_b[(base+i)*dc + j]; }
-                aq[h*dc + j] = acc;
-            }
-            let _ = &mut qn;
+        {
+            let qrp = SyncMutPtr(qr.as_mut_ptr());
+            // Capture the WHOLE wrapper by reference (Rust 2021 disjoint capture would otherwise grab
+            // the raw `*mut f32` field, which is not Sync). Sound: disjoint per-head writes.
+            let qrp = &qrp;
+            let (q_ref, invf) = (&q, &self.inv_freq);
+            cpu_experts::parallel_for(nh, &|h| {
+                let mut qrope = q_ref[h*hd+nope..h*hd+hd].to_vec();
+                mla_rope_interleaved(&mut qrope, pos, invf);
+                unsafe { for r in 0..dr { *qrp.0.add(h*dr + r) = qrope[r]; } }
+            });
         }
-        // upload + append cache
-        self.aq_dev.upload(&aq); self.qr_dev.upload(&qr);
+        self.qr_dev.upload(&qr);
+        // absorbed query aq[h][j] = sum_i q_nope[h][i] * W_UK[h][i][j] (W_UK[h] rows =
+        // kv_b[h*(nope+vhd)+i]). Deliverable H: device `mla_absorb` GEMV over the resident fp16
+        // kv_b_dev (no host kv_b streaming). Host pool path (deliverable E) behind TRAPETUM_MLA_HOST
+        // as the A/B lever + fallback.
+        if mla_host() {
+            let mut aq = vec![0f32; nh*dc];
+            {
+                let aqp = SyncMutPtr(aq.as_mut_ptr());
+                let aqp = &aqp;
+                let (q_ref, kvb) = (&q, &self.kv_b);
+                cpu_experts::parallel_for(nh, &|h| {
+                    let base = h*(nope+vhd);
+                    for j in 0..dc {
+                        let mut acc = 0f32;
+                        for i in 0..nope { acc += q_ref[h*hd + i] * kvb[(base+i)*dc + j]; }
+                        unsafe { *aqp.0.add(h*dc + j) = acc; }
+                    }
+                });
+            }
+            self.aq_dev.upload(&aq);
+        } else {
+            // extract q_nope [nh][nope] (cheap host slice), upload fp16, GEMV -> aq_dev.
+            // config: in=nope, out=d_c, S=nope+vhd, roff=0, co=1, ci=d_c (matches the host formula).
+            let mut qnope = vec![0f32; nh*nope];
+            for h in 0..nh { qnope[h*nope..h*nope+nope].copy_from_slice(&q[h*hd..h*hd+nope]); }
+            self.qnope_dev.upload(&qnope);
+            mla_absorb(&self.qnope_dev, &self.kv_b_dev, &mut self.aq_dev,
+                       nh, nope, dc, nope+vhd, dc, 0, 1, dc);
+        }
+        // append cache
         self.ckv_h.upload(&ckv); self.kr_h.upload(&krope);
         unsafe {
             op_cache_append(self.cache_ckv.ptr, self.ckv_h.ptr, pos as i32, dc as i32);
@@ -2924,17 +3263,36 @@ impl MlaAttn {
         // MLA attention on device (DeepSeek softmax_scale = qk_head_dim^-0.5 * mscale^2)
         let scale = self.softmax_scale;
         mla_attention(&self.aq_dev, &self.qr_dev, &self.cache_ckv, &self.cache_kr, &mut self.outl_dev, nh, dc, dr, pos+1, scale);
-        let outl = self.outl_dev.to_host();
-        // per-head value: attn[h][v] = sum_j outl[h][j] * W_UV[h][v][j] ; W_UV[h] rows = kv_b[h*(nope+vhd)+nope+v]
-        for h in 0..nh {
-            let base = h*(nope+vhd) + nope;
-            for v in 0..vhd {
-                let mut acc = 0f32;
-                for j in 0..dc { acc += outl[h*dc + j] * self.kv_b[(base+v)*dc + j]; }
-                self.last_attn[h*vhd + v] = acc;
+        // per-head value: attn[h][v] = sum_j outl[h][j] * W_UV[h][v][j] ; W_UV[h] rows =
+        // kv_b[h*(nope+vhd)+nope+v]. Deliverable H: outl is ALREADY on device (from mla_attention),
+        // so this is a pure device GEMV -- no host round-trip. Host pool path (E) behind the flag.
+        if mla_host() {
+            let outl = self.outl_dev.to_host();
+            {
+                let atp = SyncMutPtr(self.last_attn.as_mut_ptr());
+                let atp = &atp; // whole-wrapper capture (see aq block)
+                let (outl_ref, kvb) = (&outl, &self.kv_b);
+                cpu_experts::parallel_for(nh, &|h| {
+                    let base = h*(nope+vhd) + nope;
+                    for v in 0..vhd {
+                        let mut acc = 0f32;
+                        for j in 0..dc { acc += outl_ref[h*dc + j] * kvb[(base+v)*dc + j]; }
+                        unsafe { *atp.0.add(h*vhd + v) = acc; }
+                    }
+                });
+            }
+            self.attn_dev.upload(&self.last_attn);
+        } else {
+            // config: in=d_c, out=v_head_dim, S=nope+vhd, roff=nope, co=d_c, ci=1 (matches host).
+            mla_absorb(&self.outl_dev, &self.kv_b_dev, &mut self.attn_dev,
+                       nh, dc, vhd, nope+vhd, dc, nope, dc, 1);
+            if !mla_overlap() {
+                // mirror attn_dev into last_attn for the validation gate + box layer-0 sub-dump.
+                // This forces a device drain; TRAPETUM_MLA_OVERLAP=1 skips it (o_proj reads
+                // attn_dev on-device, in-order queue) -- one fewer per-layer drain (H-inc3).
+                self.last_attn.copy_from_slice(&self.attn_dev.to_host());
             }
         }
-        self.attn_dev.upload(&self.last_attn);
         if let Some(oq) = self.o_quant.as_ref() {
             oq.forward_into(&self.attn_dev, &mut self.o_out);
         } else {
@@ -2984,6 +3342,35 @@ fn quantize_host(w: &[f32], oc: usize, ic: usize) -> (Vec<u8>, Vec<f32>, Vec<f32
     let mut w_dq = vec![0f32; oc * ic];
     for o in 0..oc { for i in 0..ic { w_dq[o * ic + i] = cb[(idx[o * ic + i] as usize) * oc + o]; } }
     (packed, cb, w_dq)
+}
+
+/// Mean squared reconstruction error of a per-output-column `k`-entry codebook quantization of
+/// `w` (`[oc][ic]` row-major), i.e. `mean_(o,i) (w - dequant(w))^2`. Same 1-D per-column k-means as
+/// `quantize_host`/`export_runtime.quantize`, parametrized on `k` (16 or 256). Used to measure the
+/// 8-bit-vs-4-bit reconstruction gain that motivates S19 (k-means MSE ~ k^-2 for smooth densities).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn recon_mse_host(w: &[f32], oc: usize, ic: usize, k: usize) -> f64 {
+    assert_eq!(w.len(), oc * ic);
+    let mut se = 0f64;
+    for o in 0..oc {
+        let col: Vec<f32> = (0..ic).map(|i| w[o * ic + i]).collect();
+        let lo = col.iter().cloned().fold(f32::MAX, f32::min);
+        let hi = col.iter().cloned().fold(f32::MIN, f32::max);
+        let mut centroids: Vec<f32> = (0..k).map(|j| lo + (hi - lo) * (j as f32 / (k as f32 - 1.0))).collect();
+        let mut assign = vec![0usize; ic];
+        for _ in 0..12 {
+            for (i, &v) in col.iter().enumerate() {
+                let (mut best, mut bd) = (0usize, f32::MAX);
+                for (j, &c) in centroids.iter().enumerate() { let d = (v - c).powi(2); if d < bd { bd = d; best = j; } }
+                assign[i] = best;
+            }
+            let (mut sum, mut cnt) = (vec![0f32; k], vec![0f32; k]);
+            for (i, &v) in col.iter().enumerate() { sum[assign[i]] += v; cnt[assign[i]] += 1.0; }
+            for j in 0..k { if cnt[j] > 0.0 { centroids[j] = sum[j] / cnt[j]; } }
+        }
+        for (i, &v) in col.iter().enumerate() { let d = (v - centroids[assign[i]]) as f64; se += d * d; }
+    }
+    se / (oc * ic) as f64
 }
 
 /// Validate the DeepSeek-V3/R1 q_lora MLA path (`MlaAttn::new_qlora`): a tiny synthetic
@@ -3214,6 +3601,37 @@ pub fn check_mla_block() -> f64 {
 #[cfg(all(test, any(feature = "cuda", feature = "metal")))]
 mod mla_tests {
     #[test]
+    fn mla_absorb_matches_host() {
+        // Deliverable H: the batched GPU absorption kernel matches the host reference (fp16 device
+        // GEMV vs fp16-rounded host, f32 accumulate) for BOTH configs -- aq (W_UK) and attn (W_UV).
+        use super::{DevHalf, mla_absorb};
+        let h16 = |x: f32| half::f16::from_f32(x).to_f32();
+        let (nh, nope, vhd, dc) = (8usize, 64usize, 64usize, 128usize);
+        let s = nope + vhd;
+        let mut st = 0x0A_B50_2BE_u64;
+        let mut r = move || { st ^= st<<13; st ^= st>>7; st ^= st<<17; ((st>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+        let kv_b: Vec<f32> = (0..nh*s*dc).map(|_| r()*0.1).collect();
+        let w = DevHalf::from_host(&kv_b);
+        let l2 = |a: &[f32], b: &[f32]| { let (mut n, mut d)=(0f64,0f64); for (x,y) in a.iter().zip(b){ let e=(x-y) as f64; n+=e*e; d+=(*x as f64)*(*x as f64);} n.sqrt()/d.sqrt().max(1e-12) };
+        // aq: x=q_nope[nh][nope] -> out=aq[nh][dc]; roff=0, co=1, ci=dc
+        let qn: Vec<f32> = (0..nh*nope).map(|_| r()).collect();
+        let mut aq = DevHalf::zeros(nh*dc);
+        mla_absorb(&DevHalf::from_host(&qn), &w, &mut aq, nh, nope, dc, s, dc, 0, 1, dc);
+        let aq_ref: Vec<f32> = (0..nh*dc).map(|g| { let (h,j)=(g/dc,g%dc);
+            (0..nope).map(|i| h16(qn[h*nope+i])*h16(kv_b[(h*s+i)*dc+j])).sum() }).collect();
+        let e1 = l2(&aq_ref, &aq.to_host());
+        // attn: x=outl[nh][dc] -> out=attn[nh][vhd]; roff=nope, co=dc, ci=1
+        let ol: Vec<f32> = (0..nh*dc).map(|_| r()).collect();
+        let mut at = DevHalf::zeros(nh*vhd);
+        mla_absorb(&DevHalf::from_host(&ol), &w, &mut at, nh, dc, vhd, s, dc, nope, dc, 1);
+        let at_ref: Vec<f32> = (0..nh*vhd).map(|g| { let (h,v)=(g/vhd,g%vhd);
+            (0..dc).map(|j| h16(ol[h*dc+j])*h16(kv_b[(h*s+nope+v)*dc+j])).sum() }).collect();
+        let e2 = l2(&at_ref, &at.to_host());
+        eprintln!("[mla_absorb] aq L2={e1:e} attn L2={e2:e} (fp16 device vs fp16-rounded host)");
+        assert!(e1 < 5e-3 && e2 < 5e-3, "mla_absorb mismatch aq={e1:e} attn={e2:e}");
+    }
+
+    #[test]
     fn mla_block_math_correct() {
         // The Rust MLA (interleaved rope + W_UK/W_UV absorption + softmax_scale used as-is)
         // matches the full-reconstruction CPU reference. This is the proof that the block-0
@@ -3222,6 +3640,54 @@ mod mla_tests {
         // PLAIN inv_freq instead of the yarn-corrected one -- both fixed in model/export_deepseek.py.
         let e = super::check_mla_block();
         assert!(e < 3e-2, "MLA block rel err {e:e} vs reference (fp16 synthetic ~1.6e-2 expected)");
+    }
+
+    #[test]
+    fn k256_reconstruction_beats_k16() {
+        // S19 premise: 8-bit (K=256) reconstructs a weight column far better than 4-bit (K=16).
+        // Two densities: gaussian (smooth, k-means MSE ~ k^-2 -> ~256x) and heavy-tail (outliers,
+        // where extra codes help most). Synthetic [oc][ic]. Reports the MSE ratio; gates loosely
+        // (>=30x) to stay robust to the RNG while proving the order-of-magnitude premise.
+        let (oc, ic) = (16usize, 4096usize);
+        let mut s = 0x5192_0256u64;
+        let mut u = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (s>>40) as f32 / (1u64<<24) as f32 }; // [0,1)
+        // Box-Muller gaussian
+        let mut g = |u: &mut dyn FnMut()->f32| { let (a,b)=(u().max(1e-7), u()); (-2.0*a.ln()).sqrt()*(std::f32::consts::TAU*b).cos() };
+        let gauss: Vec<f32> = (0..oc*ic).map(|_| g(&mut u)).collect();
+        // heavy tail: gaussian cubed (fat outliers), the pattern K=16 struggles with
+        let heavy: Vec<f32> = (0..oc*ic).map(|_| { let x = g(&mut u); x*x*x }).collect();
+        for (name, w) in [("gaussian", &gauss), ("heavy-tail", &heavy)] {
+            let (m16, m256) = (super::recon_mse_host(w, oc, ic, 16), super::recon_mse_host(w, oc, ic, 256));
+            let ratio = m16 / m256.max(1e-30);
+            eprintln!("[k256_recon {name}] MSE K16={m16:.3e} K256={m256:.3e} -> {ratio:.0}x better at 8-bit");
+            assert!(ratio >= 30.0, "{name}: K256 only {ratio:.1}x better than K16 (premise expects ~100x)");
+        }
+        // Size math for the report: extra bytes from promoting a tensor [oc][ic] K16->K256 =
+        // index bytes ic*oc - ic*(oc/2) = ic*oc/2, plus codebook (256-16)*oc f32.
+        let added = |ic: usize, oc: usize| ic*oc/2 + (256-16)*oc*4;
+        let (hidden, vocab, moe_inter, n_shared, nlayers_moe) = (7168usize, 129280usize, 2048usize, 1usize, 58usize);
+        let si = ((n_shared*moe_inter + 255)/256)*256;
+        let lm = added(hidden, vocab);
+        let sh = 2*added(hidden, si) + added(si, hidden); // gate+up ([si][hidden]) + down ([hidden][si])
+        eprintln!("[k256_size] 671B projection: lm_head +{:.2} GB; shared/layer +{:.1} MB x{} = +{:.2} GB; total +{:.2} GB on ~350 GB",
+            lm as f64/1e9, sh as f64/1e6, nlayers_moe, (sh*nlayers_moe) as f64/1e9, (lm + sh*nlayers_moe) as f64/1e9);
+    }
+
+    #[test]
+    fn mixed_precision_prec_flags_contract() {
+        // Lock the S19 mixed-precision format contract the loader and export_deepseek.py share.
+        assert_eq!(super::PREC_SHARED_K256, 1); assert_eq!(super::PREC_LMHEAD_K256, 2);
+        // role_k promotes exactly the roles whose bit is set; everything else stays K=16.
+        assert_eq!(super::role_k(0, super::PREC_LMHEAD_K256), 16, "no flags -> all K16 (backward compat)");
+        assert_eq!(super::role_k(super::PREC_LMHEAD_K256, super::PREC_LMHEAD_K256), 256);
+        assert_eq!(super::role_k(super::PREC_LMHEAD_K256, super::PREC_SHARED_K256), 16, "unset bit stays K16");
+        // lm_head packed-byte size the loader reads must match the export: K16 = hidden*(vocab/2)
+        // nibble bytes, K256 = hidden*vocab uint8 indices; codebook = k*vocab f32 in both.
+        let (hidden, vocab) = (2048usize, 102400usize); // V2-Lite
+        for (k, want_packed, want_cb) in [(16usize, hidden*(vocab/2), 16*vocab), (256, hidden*vocab, 256*vocab)] {
+            let packed = if k == 256 { hidden*vocab } else { hidden*(vocab/2) };
+            assert_eq!(packed, want_packed); assert_eq!(k*vocab, want_cb);
+        }
     }
 
     #[test]
@@ -3330,10 +3796,44 @@ impl DsFfn {
     }
 }
 
+/// `TRAPETUM_MLA_TIMING=1`: split the DeepSeek decode into MLA-attention vs MoE-FFN wall time per
+/// token, so the box can locate the serial wall without gdb. When on, each phase drains the GPU so
+/// the split is real (a small extra sync; off by default so it costs nothing).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub mod dstime {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    pub static ATTN_US: AtomicU64 = AtomicU64::new(0);
+    pub static MOE_US: AtomicU64 = AtomicU64::new(0);
+    pub fn on() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var("TRAPETUM_MLA_TIMING").map(|v| v == "1").unwrap_or(false))
+    }
+    pub fn add_attn(us: u64) { ATTN_US.fetch_add(us, Ordering::Relaxed); }
+    pub fn add_moe(us: u64) { MOE_US.fetch_add(us, Ordering::Relaxed); }
+    pub fn take() -> (u64, u64) { (ATTN_US.swap(0, Ordering::Relaxed), MOE_US.swap(0, Ordering::Relaxed)) }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl DsLayer {
     fn forward(&mut self, h: &mut DevHalf, pos: usize) {
         let mut normed = DevHalf::zeros(h.n);
         rmsnorm(h, &self.attn_norm, &mut normed, self.attn.eps);
+        if dstime::on() {
+            let t = std::time::Instant::now();
+            { let o = self.attn.forward(&normed, pos); residual_add(h, o); }
+            unsafe { dev_sync(); }
+            dstime::add_attn(t.elapsed().as_micros() as u64);
+            let t = std::time::Instant::now();
+            match &mut self.ffn {
+                DsFfn::Dense(m) => m.forward(h),
+                DsFfn::Moe(m) => m.forward(h),
+                DsFfn::MoeOffload(m) => m.forward(h),
+            }
+            unsafe { dev_sync(); }
+            dstime::add_moe(t.elapsed().as_micros() as u64);
+            return;
+        }
         { let o = self.attn.forward(&normed, pos); residual_add(h, o); }
         match &mut self.ffn {
             DsFfn::Dense(m) => m.forward(h),
@@ -3388,6 +3888,18 @@ pub struct DeepSeekModel {
     eps: f32,
 }
 
+// Mixed-precision (S19) header `prec_flags` bits. A mixed file uses a bumped magic (CBKE for the
+// CBKD family, CBKS for the CBKR family) and writes ONE extra i32 -- this bitmask -- right after the
+// base header. Old magics (CBKD/CBKR/CBKV) carry no such field and load as all-K16 (prec_flags=0),
+// so every existing artifact is byte-for-byte backward compatible. Each set bit promotes a tensor
+// ROLE from 4-bit (K=16) to 8-bit (K=256), driven by the S18 spectral finding (lm_head is the worst
+// per-layer aggregate; shared experts are 13/15 of the worst-damaged tensors). Reserved bits stay 0.
+const PREC_SHARED_K256: u32 = 1 << 0; // shared-expert gate/up/down at K=256 (wired in increment 3)
+const PREC_LMHEAD_K256: u32 = 1 << 1; // lm_head at K=256
+/// K for a tensor role given the mixed-precision flags: 256 if its bit is set, else 16.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn role_k(prec: u32, bit: u32) -> usize { if prec & bit != 0 { 256 } else { 16 } }
+
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl DeepSeekModel {
     pub fn vocab(&self) -> usize { self.vocab }
@@ -3396,10 +3908,36 @@ impl DeepSeekModel {
     pub fn forward(&mut self, token: usize, pos: usize) -> Vec<f32> {
         let row = &self.embedding[token*self.hidden..(token+1)*self.hidden];
         self.h.upload(row);
+        let tstart = if dstime::on() { Some(std::time::Instant::now()) } else { None };
         for l in &mut self.layers { l.forward(&mut self.h, pos); }
         rmsnorm(&self.h, &self.final_norm, &mut self.normed, self.eps);
         self.lm_head.forward_into(&self.normed, &mut self.logits);
-        self.logits.to_host()
+        let out = self.logits.to_host();
+        if let Some(t) = tstart {
+            let (attn_us, moe_us) = dstime::take();
+            let tot_us = t.elapsed().as_micros() as u64;
+            let other_us = tot_us.saturating_sub(attn_us + moe_us);
+            eprintln!("[mla_timing pos={pos}] attention={:.1} moe={:.1} other={:.1} total={:.1} ms",
+                      attn_us as f64/1e3, moe_us as f64/1e3, other_us as f64/1e3, tot_us as f64/1e3);
+        }
+        if cpu_experts::moetime::on() {
+            // Per-token MoE split (summed over 58 layers). A/RA/C/RC are worker-us (/n_threads ~ wall);
+            // XCOPY/WS/SHARED are single-thread wall (measured on the main thread in the forward). The
+            // work-steal ENTRY overhead = WS - (A+RA+C+RC)/n. The gap = moe_wall - XCOPY - WS - SHARED.
+            let (a, ra, c, rc, xcopy, ws, shared) = cpu_experts::moetime::take();
+            let (setup, run, combine, recode, quant) = cpu_experts::moetime::take_ws_sub();
+            let n = (cpu_experts::cpu_threads().max(1)) as f64;
+            let ph = (a as f64 + ra as f64 + c as f64 + rc as f64) / n / 1e3;
+            eprintln!("[moe_timing pos={pos}] A={:.1} RA={:.1} C={:.1} RC={:.1} (phases~{:.1}) | xcopy={:.1} ws_total={:.1} ws_entry={:.1} shared={:.1} ms",
+                      a as f64/n/1e3, ra as f64/n/1e3, c as f64/n/1e3, rc as f64/n/1e3, ph,
+                      xcopy as f64/1e3, ws as f64/1e3, ws as f64/1e3 - ph, shared as f64/1e3);
+            // ws_entry sub-split: setup (recode+quant+prep) | barrier+handoff (run - phases) | combine.
+            // setup itself splits: recode (cache-miss codebook prep), quant (x int8), prep (ei8+scratch).
+            eprintln!("[moe_ws_sub pos={pos}] setup={:.1} [recode={:.1} quant={:.1} prep={:.1}] barrier+handoff={:.1} combine={:.1} ms",
+                      setup as f64/1e3, recode as f64/1e3, quant as f64/1e3,
+                      (setup as f64 - recode as f64 - quant as f64)/1e3, run as f64/1e3 - ph, combine as f64/1e3);
+        }
+        out
     }
 
     /// Like [`forward`], but dumps per-layer hidden-state statistics (l2/absmax/mean) for a
@@ -3443,13 +3981,19 @@ impl DeepSeekModel {
         // artifacts). CBKV = 19-i32 header with a trailing `experts_avq` field (0/2/3) for
         // additive-codebook routed experts. Old scalar files keep the CBKR magic and load
         // unchanged; only avq exports use CBKV.
-        if &magic == b"CBKR" { return Self::load_deepseek_qlora(path, r, max_seq, false); }
-        if &magic == b"CBKV" { return Self::load_deepseek_qlora(path, r, max_seq, true); }
-        assert_eq!(&magic, b"CBKD", "not a DeepSeek .cbk (expected CBKD, CBKR or CBKV)");
+        if &magic == b"CBKR" { return Self::load_deepseek_qlora(path, r, max_seq, false, false); }
+        if &magic == b"CBKV" { return Self::load_deepseek_qlora(path, r, max_seq, true, false); }
+        if &magic == b"CBKS" { return Self::load_deepseek_qlora(path, r, max_seq, false, true); } // mixed CBKR
+        // CBKD = all-K16 (14-i32 header). CBKE = mixed-precision CBKD (S19): same header + one
+        // trailing prec_flags i32 promoting lm_head/shared to K=256 (see PREC_* bits).
+        let mixed = &magic == b"CBKE";
+        assert!(&magic == b"CBKD" || mixed, "not a DeepSeek .cbk (expected CBKD, CBKE, CBKR, CBKS or CBKV)");
         let cfg: Vec<usize> = (0..14).map(|_| rd_i32(&mut r) as usize).collect();
         let (n_layers, hidden, n_heads, kv_lora, nope, rope, vhd, inter_dense, moe_inter,
              n_routed, n_shared, top_k, vocab, first_k_dense) =
             (cfg[0],cfg[1],cfg[2],cfg[3],cfg[4],cfg[5],cfg[6],cfg[7],cfg[8],cfg[9],cfg[10],cfg[11],cfg[12],cfg[13]);
+        // prec_flags i32 follows the base header ONLY for the mixed magic (CBKE); CBKD has none.
+        let prec: u32 = if mixed { rd_i32(&mut r) as u32 } else { 0 };
         let eps = rd_f32(&mut r); let softmax_scale = rd_f32(&mut r); let rscale = rd_f32(&mut r);
         let inv_freq = rd_f32_vec(&mut r, rope/2);
         let embedding = rd_f16_vec(&mut r, vocab*hidden);
@@ -3480,22 +4024,27 @@ impl DeepSeekModel {
                         rd_u8_vec(&mut r, moe_inter*(hidden/2)), rd_f32_vec(&mut r, K*hidden)));
                 }
                 let si = ((n_shared*moe_inter + 255)/256)*256; // shared expert inter is padded to %256 in export
-                let sh = (rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
-                          rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
-                          rd_u8_vec(&mut r, si*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
+                // shared expert K (16 or 256 per prec_flags): gate/up are [si][hidden], down [hidden][si].
+                let sk = role_k(prec, PREC_SHARED_K256);
+                let (gu_p, d_p) = (if sk==256 { hidden*si } else { hidden*(si/2) }, if sk==256 { si*hidden } else { si*(hidden/2) });
+                let sh = (rd_u8_vec(&mut r, gu_p), rd_f32_vec(&mut r, sk*si),
+                          rd_u8_vec(&mut r, gu_p), rd_f32_vec(&mut r, sk*si),
+                          rd_u8_vec(&mut r, d_p), rd_f32_vec(&mut r, sk*hidden));
                 let experts: Vec<_> = estore.iter().map(|e| (e.0.as_slice(),e.1.as_slice(),e.2.as_slice(),e.3.as_slice(),e.4.as_slice(),e.5.as_slice())).collect();
                 let shared = Some((sh.0.as_slice(),sh.1.as_slice(),sh.2.as_slice(),sh.3.as_slice(),sh.4.as_slice(),sh.5.as_slice()));
-                DsFfn::Moe(MoeBlock::new(hidden, moe_inter, n_routed, top_k, eps, &post_norm, &rw, experts, shared, si, rscale))
+                DsFfn::Moe(MoeBlock::new_k(hidden, moe_inter, n_routed, top_k, eps, &post_norm, &rw, experts, shared, si, rscale, sk))
             };
             layers.push(DsLayer { attn_norm: DevF32::from_host(&attn_norm), attn, ffn });
             eprintln!("  loaded layer {}/{}", li+1, n_layers);
         }
         let final_norm = rd_f32_vec(&mut r, hidden);
-        let (lp, lc) = (rd_u8_vec(&mut r, hidden*(vocab/2)), rd_f32_vec(&mut r, K*vocab));
+        let lmk = role_k(prec, PREC_LMHEAD_K256);
+        let lp = rd_u8_vec(&mut r, if lmk == 256 { hidden*vocab } else { hidden*(vocab/2) });
+        let lc = rd_f32_vec(&mut r, lmk*vocab);
         Ok(DeepSeekModel {
             embedding, layers,
             final_norm: DevF32::from_host(&final_norm),
-            lm_head: QuantLinear::new(&lp, &lc, hidden, vocab),
+            lm_head: QuantLinear::new_k(&lp, &lc, hidden, vocab, lmk),
             h: DevHalf::zeros(hidden), normed: DevHalf::zeros(hidden), logits: DevF32::zeros(vocab),
             hidden, vocab, eps,
         })
@@ -3509,13 +4058,30 @@ impl DeepSeekModel {
     /// o (4-bit), post_norm, then the dense-or-MoE FFN (MoE layers read `e_score_bias`
     /// BEFORE the router). Routed experts are NOT uploaded to the GPU here — they stay in
     /// host `ExpertHost`s and stream through `MoeBlockOffload` (the memory wall at 671B).
-    fn load_deepseek_qlora(path: &str, mut r: BufReader<File>, max_seq: usize, avq_header: bool) -> std::io::Result<DeepSeekModel> {
+    fn load_deepseek_qlora(path: &str, mut r: BufReader<File>, max_seq: usize, avq_header: bool, mixed: bool) -> std::io::Result<DeepSeekModel> {
         // mmap the whole file once: the routed experts' packed indices (the ~300GB bulk at
         // 671B) are handed to ExpertHost as zero-copy byte ranges into this, instead of being
         // read into owned Vecs -- the OS pages them in from disk on demand (and can evict
         // under memory pressure), which is the actual "stream experts from storage" behavior.
         // Safety: the file is a static export artifact, not mutated while the model is loaded.
         let mmap = Arc::new(unsafe { memmap2::Mmap::map(&File::open(path)?)? });
+        // Deliverable F1 (opportunistic huge pages): the routed experts are scattered ~22 MB regions
+        // across a ~350 GB mapping, so page-walks over the ~90 M-PTE 4 KB-page table are the suspected
+        // MoE wall. TRAPETUM_MMAP_ADVISE={hugepage,random,sequential} madvises the whole mapping;
+        // hugepage asks khugepaged to collapse to 2 MB pages (cuts PTEs ~512x) IF the kernel supports
+        // read-only file-THP -- purely a paging hint, no arithmetic change. The GUARANTEED variant is
+        // TRAPETUM_EXPERTS_ANON_THP=1 (see below). Linux-only; a no-op elsewhere.
+        #[cfg(target_os = "linux")]
+        {
+            let adv = std::env::var("TRAPETUM_MMAP_ADVISE").unwrap_or_default();
+            let a = match adv.as_str() {
+                "hugepage" => Some(memmap2::Advice::HugePage),
+                "random" => Some(memmap2::Advice::Random),
+                "sequential" => Some(memmap2::Advice::Sequential),
+                _ => None,
+            };
+            if let Some(a) = a { let _ = mmap.advise(a); eprintln!("[mmap_advise] applied MADV {adv} to the {}-byte mapping", mmap.len()); }
+        }
         // Header is 18 i32 for CBKR (byte-identical to the original scalar format) or 19 i32 for
         // CBKV, where the trailing field is `experts_avq` (2 or 3 = additive CBKA routed experts
         // at that M). Everything else (attention, dense FFN, shared expert, router, lm_head) stays
@@ -3527,10 +4093,45 @@ impl DeepSeekModel {
             (cfg[0],cfg[1],cfg[2],cfg[3],cfg[4],cfg[5],cfg[6],cfg[7],cfg[8],cfg[9],cfg[10],cfg[11],cfg[12],cfg[13],cfg[14],cfg[15],cfg[16],cfg[17]);
         let experts_avq = if avq_header { cfg[18] } else { 0 };
         assert!(experts_avq == 0 || experts_avq == 2 || experts_avq == 3, "experts_avq must be 0, 2 or 3");
+        // Mixed-precision prec_flags i32 follows the base header for the CBKS magic (mixed CBKR).
+        let prec: u32 = if mixed { rd_i32(&mut r) as u32 } else { 0 };
         let eps = rd_f32(&mut r); let softmax_scale = rd_f32(&mut r); let rscale = rd_f32(&mut r);
         let inv_freq = rd_f32_vec(&mut r, rope/2);
         let embedding = rd_f16_vec(&mut r, vocab*hidden);
         let qdim = n_heads*(nope+rope);
+        // Deliverable F2: optionally O_DIRECT-stage all routed-expert packed indices into one anon
+        // huge-page arena (TRAPETUM_EXPERTS_ANON_THP=1; scalar CBKR only). Sized to the exact routed
+        // packed footprint so there is no double memory. `rp!(len)` below routes each packed read
+        // through the stager when present, else the zero-copy mmap_skip.
+        #[cfg(target_os = "linux")]
+        let mut stager: Option<AnonStager> = None;
+        #[cfg(target_os = "linux")]
+        if experts_avq == 0 && std::env::var("TRAPETUM_EXPERTS_ANON_THP").map(|v| v == "1").unwrap_or(false) {
+            let per = 2 * (hidden * (moe_inter / 2)) + moe_inter * (hidden / 2);
+            let total = n_layers.saturating_sub(first_k_dense) * n_routed * per;
+            // SAFETY (F2 killed a box): allocating the arena while the file's ~336 GB is still cached
+            // wedges the kernel in direct reclaim. Drop the mapping's page cache FIRST, then guard on
+            // MemAvailable and abort LOUDLY rather than wedge if the arena + headroom won't fit.
+            // unchecked_advise(DontNeed) is sound here: the mapping is read-only + file-backed, so
+            // dropped pages simply re-fault from disk on any later access (no dirty data to lose).
+            let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+            if let Some(avail) = mem_available_bytes() {
+                let need = total as u64 + (16u64 << 30); // 16 GB headroom for the pool/GPU/rest
+                assert!(need <= avail,
+                    "TRAPETUM_EXPERTS_ANON_THP: arena needs ~{} GB + headroom but only {} GB available \
+                     after dropping the file cache -- refusing to wedge the box. Use a bigger host, or \
+                     `echo 1 > /proc/sys/vm/drop_caches` first, or leave anon-THP off (mmap path is safe).",
+                    total >> 30, avail >> 30);
+            }
+            eprintln!("[anon_thp] cache dropped; staging {} GB routed experts into an anon huge-page arena via O_DIRECT...", total >> 30);
+            stager = Some(AnonStager::new(path, total)?);
+        }
+        macro_rules! rp { ($len:expr) => {{
+            #[cfg(target_os = "linux")]
+            { match stager.as_mut() { Some(s) => s.stage(&mut r, $len)?, None => mmap_skip(&mut r, &mmap, $len)? } }
+            #[cfg(not(target_os = "linux"))]
+            { mmap_skip(&mut r, &mmap, $len)? }
+        }}; }
         let mut layers = Vec::with_capacity(n_layers);
         for li in 0..n_layers {
             let attn_norm = rd_f32_vec(&mut r, hidden);
@@ -3555,13 +4156,13 @@ impl DeepSeekModel {
                 let mut hosts: Vec<ExpertHost> = Vec::with_capacity(n_routed);
                 for _ in 0..n_routed {
                     if experts_avq == 0 {
-                        // 4-bit scalar: packed indices SKIP (seek past, record the mmap byte
-                        // range); the tiny codebooks are read into RAM as before.
-                        let gp = mmap_skip(&mut r, &mmap, hidden * (moe_inter / 2))?;
+                        // 4-bit scalar: packed indices are mmap-skipped (zero copy) OR O_DIRECT-staged
+                        // into the anon huge-page arena (F2); the tiny codebooks are read into RAM.
+                        let gp = rp!(hidden * (moe_inter / 2));
                         let gc = rd_f32_vec(&mut r, K * moe_inter);
-                        let up = mmap_skip(&mut r, &mmap, hidden * (moe_inter / 2))?;
+                        let up = rp!(hidden * (moe_inter / 2));
                         let uc = rd_f32_vec(&mut r, K * moe_inter);
-                        let dp = mmap_skip(&mut r, &mmap, moe_inter * (hidden / 2))?;
+                        let dp = rp!(moe_inter * (hidden / 2));
                         let dc = rd_f32_vec(&mut r, K * hidden);
                         hosts.push(ExpertHost::Scalar { gp, gc, up, uc, dp, dc });
                     } else {
@@ -3574,12 +4175,14 @@ impl DeepSeekModel {
                     }
                 }
                 let si = ((n_shared*moe_inter + 255)/256)*256; // shared expert inter, padded to %256
-                let sh = (rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
-                          rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
-                          rd_u8_vec(&mut r, si*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
+                let sk = role_k(prec, PREC_SHARED_K256); // shared expert K (16 or 256 per prec_flags)
+                let (gu_p, d_p) = (if sk==256 { hidden*si } else { hidden*(si/2) }, if sk==256 { si*hidden } else { si*(hidden/2) });
+                let sh = (rd_u8_vec(&mut r, gu_p), rd_f32_vec(&mut r, sk*si),
+                          rd_u8_vec(&mut r, gu_p), rd_f32_vec(&mut r, sk*si),
+                          rd_u8_vec(&mut r, d_p), rd_f32_vec(&mut r, sk*hidden));
                 let shared = (sh.0.as_slice(), sh.1.as_slice(), sh.2.as_slice(), sh.3.as_slice(), sh.4.as_slice(), sh.5.as_slice());
                 // cap = top_k: minimal GPU-resident expert cache, experts stream from host every token.
-                let mut off = MoeBlockOffload::new(hidden, moe_inter, n_routed, top_k, top_k, eps, &post_norm, &rw, hosts, shared);
+                let mut off = MoeBlockOffload::new_k(hidden, moe_inter, n_routed, top_k, top_k, eps, &post_norm, &rw, hosts, shared, sk);
                 off.set_rscale(rscale);
                 if sigmoid_flag != 0 { off.set_v3_scoring(score_bias, n_group, topk_group); }
                 DsFfn::MoeOffload(off)
@@ -3588,11 +4191,13 @@ impl DeepSeekModel {
             eprintln!("  loaded layer {}/{} (q_lora)", li+1, n_layers);
         }
         let final_norm = rd_f32_vec(&mut r, hidden);
-        let (lp, lc) = (rd_u8_vec(&mut r, hidden*(vocab/2)), rd_f32_vec(&mut r, K*vocab));
+        let lmk = role_k(prec, PREC_LMHEAD_K256);
+        let lp = rd_u8_vec(&mut r, if lmk == 256 { hidden*vocab } else { hidden*(vocab/2) });
+        let lc = rd_f32_vec(&mut r, lmk*vocab);
         Ok(DeepSeekModel {
             embedding, layers,
             final_norm: DevF32::from_host(&final_norm),
-            lm_head: QuantLinear::new(&lp, &lc, hidden, vocab),
+            lm_head: QuantLinear::new_k(&lp, &lc, hidden, vocab, lmk),
             h: DevHalf::zeros(hidden), normed: DevHalf::zeros(hidden), logits: DevF32::zeros(vocab),
             hidden, vocab, eps,
         })

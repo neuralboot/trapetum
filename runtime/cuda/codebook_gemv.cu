@@ -13,6 +13,13 @@
 #define CPB 256
 #define TY 8
 #define GS 20
+// K256 8-bit codebook path (S19 mixed precision): 256 entries, uint8 indices [IC,OC],
+// CPB8=128 columns/block with a vectorized uint32 index read (4 indices/thread, a full
+// cache line/warp). Codebook staged in 64 KB opt-in shared (K8*CPB8 halves). GS8=2 grid.y
+// (the prototype's sweet spot: more grid.y re-stages the big codebook and loses).
+#define K8 256
+#define CPB8 128
+#define GS8 2
 
 // grid.y IC-split for the fused codebook GEMVs. GS>1 blocks reduce IC-slice partials with
 // atomicAdd (scheduler-order-dependent -> run-to-run NONDETERMINISTIC). The two-stage fixed-order
@@ -28,6 +35,7 @@ static int det_mode() {
     return m;
 }
 static int det_gs() { return det_mode() == 1 ? 1 : GS; } // mode 1 collapses grid.y; modes 0/2 keep GS
+static int det_gs8() { return det_mode() == 1 ? 1 : GS8; } // K256 twin
 
 // per-column quantization dither table (precomputed) and reserved dither seeds.
 __device__ static const unsigned QZ_SEED0 = 0x33383838u, QZ_SEED1 = 0x44463341u;
@@ -102,6 +110,67 @@ gemv4_partial(const __half* __restrict__ X, const unsigned char* __restrict__ pa
     if (ty == 0) {
         #pragma unroll
         for (int c = 0; c < 8; c++) { float s = 0; for (int y = 0; y < TY; y++) s += red[y*CPB+tx*8+c]; Ypart[(size_t)blockIdx.y*OC + (j0+tx*8+c)] = s; }
+    }
+}
+
+// ============================================================================
+// K256 8-bit codebook GEMV (S19 mixed precision). idx[IC,OC] uint8 (one index per
+// element), cb[K8,OC] half. Each thread reads 4 contiguous indices as one uint32
+// (a warp reads a full 128 B cache line) and looks up the codebook staged in 64 KB
+// opt-in shared. Ported from kernels/gemv_codebook.cu (BEAT cuBLAS fp16 x1.09 on A40).
+__global__ void __launch_bounds__(32*TY)
+gemv8(const __half* __restrict__ X, const unsigned char* __restrict__ idx,
+      const __half* __restrict__ cb, float* __restrict__ Yacc, int IC, int OC) {
+    extern __shared__ char sm[];
+    __half* s_cb = (__half*)sm; float* red = (float*)(s_cb + K8*CPB8);
+    int tx = threadIdx.x, ty = threadIdx.y, tid = ty*32+tx, nth = 32*TY;
+    int j0 = blockIdx.x*CPB8;
+    for (int t = tid; t < K8*CPB8; t += nth) { int k = t/CPB8, jj = j0 + (t%CPB8); s_cb[t] = __ldg(&cb[(size_t)k*OC+jj]); }
+    __syncthreads();
+    int per = (IC+gridDim.y-1)/gridDim.y, ic0 = blockIdx.y*per, ic1 = min(IC, ic0+per);
+    int jbase = j0 + tx*4;
+    float acc[4] = {0,0,0,0};
+    for (int ic = ic0+ty; ic < ic1; ic += TY) {
+        unsigned f = __ldg((const unsigned*)&idx[(size_t)ic*OC + jbase]);
+        float xx = __half2float(__ldg(&X[ic]));
+        #pragma unroll
+        for (int c = 0; c < 4; c++) { unsigned char id = (f>>(8*c))&0xFF; acc[c] += xx*__half2float(s_cb[id*CPB8+tx*4+c]); }
+    }
+    #pragma unroll
+    for (int c = 0; c < 4; c++) red[ty*CPB8+tx*4+c] = acc[c];
+    __syncthreads();
+    if (ty == 0) {
+        #pragma unroll
+        for (int c = 0; c < 4; c++) { float s = 0; for (int y = 0; y < TY; y++) s += red[y*CPB8+tx*4+c]; atomicAdd(&Yacc[j0+tx*4+c], s); }
+    }
+}
+
+// Deterministic two-stage twin of gemv8: each grid.y block writes its IC-slice partial to
+// its own row of Ypart (disjoint, no atomics); gemv_reduce sums the GS8 rows in fixed order.
+__global__ void __launch_bounds__(32*TY)
+gemv8_partial(const __half* __restrict__ X, const unsigned char* __restrict__ idx,
+              const __half* __restrict__ cb, float* __restrict__ Ypart, int IC, int OC) {
+    extern __shared__ char sm[];
+    __half* s_cb = (__half*)sm; float* red = (float*)(s_cb + K8*CPB8);
+    int tx = threadIdx.x, ty = threadIdx.y, tid = ty*32+tx, nth = 32*TY;
+    int j0 = blockIdx.x*CPB8;
+    for (int t = tid; t < K8*CPB8; t += nth) { int k = t/CPB8, jj = j0 + (t%CPB8); s_cb[t] = __ldg(&cb[(size_t)k*OC+jj]); }
+    __syncthreads();
+    int per = (IC+gridDim.y-1)/gridDim.y, ic0 = blockIdx.y*per, ic1 = min(IC, ic0+per);
+    int jbase = j0 + tx*4;
+    float acc[4] = {0,0,0,0};
+    for (int ic = ic0+ty; ic < ic1; ic += TY) {
+        unsigned f = __ldg((const unsigned*)&idx[(size_t)ic*OC + jbase]);
+        float xx = __half2float(__ldg(&X[ic]));
+        #pragma unroll
+        for (int c = 0; c < 4; c++) { unsigned char id = (f>>(8*c))&0xFF; acc[c] += xx*__half2float(s_cb[id*CPB8+tx*4+c]); }
+    }
+    #pragma unroll
+    for (int c = 0; c < 4; c++) red[ty*CPB8+tx*4+c] = acc[c];
+    __syncthreads();
+    if (ty == 0) {
+        #pragma unroll
+        for (int c = 0; c < 4; c++) { float s = 0; for (int y = 0; y < TY; y++) s += red[y*CPB8+tx*4+c]; Ypart[(size_t)blockIdx.y*OC + (j0+tx*4+c)] = s; }
     }
 }
 
@@ -418,6 +487,18 @@ __global__ void gemv_fp16_k(const __half* __restrict__ W, const __half* __restri
     Y[o] = acc;
 }
 
+// Batched per-head MLA absorption (deliverable H). out[h][o] = sum_i x[h][i]*W[(h*S+roff)*dc + o*co + i*ci].
+__global__ void mla_absorb_k(const __half* __restrict__ x, const __half* __restrict__ W, __half* __restrict__ out,
+                             int nh, int in_dim, int out_dim, int S, int dc, int roff, int co, int ci) {
+    int gid = blockIdx.x*blockDim.x + threadIdx.x;
+    if (gid >= nh*out_dim) return;
+    int h = gid / out_dim, o = gid % out_dim;
+    size_t wbase = (size_t)(h*S + roff)*dc + (size_t)o*co, xbase = (size_t)h*in_dim;
+    float acc = 0.f;
+    for (int i = 0; i < in_dim; i++) acc += __half2float(x[xbase + i]) * __half2float(W[wbase + (size_t)i*ci]);
+    out[gid] = __float2half(acc);
+}
+
 __global__ void gelu_mul_k(const float* __restrict__ gate, const float* __restrict__ up, __half* __restrict__ out, int n) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -550,24 +631,37 @@ __global__ void avq_gemv_t(const __half* __restrict__ X, const unsigned char* __
 
 struct AvqLin { unsigned char* d_codes; __half* d_cb; __half* d_scale; int M, IC, OC; };
 
-struct QLinear { unsigned char* d_packed; __half* d_cb; int IC, OC; };
+struct QLinear { unsigned char* d_packed; __half* d_cb; int IC, OC, K_; };
 
 extern "C" {
 
-// upload the quantized weights once; activations are external device buffers
-void* qlinear_create(const unsigned char* packed, const float* cb_f32, int IC, int OC) {
+// upload the quantized weights once; activations are external device buffers.
+// k=16: nibble-packed 4-bit (IC*(OC/2) bytes, gemv4). k=256: 8-bit uint8 indices (IC*OC bytes, gemv8).
+void* qlinear_create(const unsigned char* packed, const float* cb_f32, int IC, int OC, int k) {
     QLinear* q = (QLinear*)malloc(sizeof(QLinear));
-    q->IC = IC; q->OC = OC;
-    size_t np = (size_t)IC * (OC/2);
+    q->IC = IC; q->OC = OC; q->K_ = k;
+    size_t np = (k == 256) ? (size_t)IC * OC : (size_t)IC * (OC/2);
     cudaMalloc(&q->d_packed, np);
     cudaMemcpy(q->d_packed, packed, np, cudaMemcpyHostToDevice);
-    size_t ncb = (size_t)K * OC;
+    size_t ncb = (size_t)k * OC;
     __half* cb_h = (__half*)malloc(ncb*sizeof(__half));
     for (size_t i = 0; i < ncb; i++) cb_h[i] = __float2half(cb_f32[i]);
     cudaMalloc(&q->d_cb, ncb*sizeof(__half));
     cudaMemcpy(q->d_cb, cb_h, ncb*sizeof(__half), cudaMemcpyHostToDevice);
     free(cb_h);
     return q;
+}
+
+// The K256 codebook (K8*CPB8 halves) + red exceeds the 48 KB default dynamic-shared cap, so
+// opt in to the larger limit once per kernel (idempotent; the attribute is per-function global).
+static size_t gemv8_smem() { return (size_t)K8*CPB8*sizeof(__half) + (size_t)TY*CPB8*sizeof(float); }
+static void ensure_gemv8_smem() {
+    static bool once = false;
+    if (once) return;
+    int sm = (int)gemv8_smem();
+    cudaFuncSetAttribute(gemv8, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    cudaFuncSetAttribute(gemv8_partial, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    once = true;
 }
 
 // Reusable GS*OC f32 Ypart scratch for the deterministic two-stage GEMV (mode 2), grown on demand.
@@ -586,6 +680,25 @@ static float* ypart(size_t need_floats) {
 void qlinear_forward_dev(void* handle, const void* d_x, void* d_y) {
     QLinear* q = (QLinear*)handle;
     ensure_stream();
+    if (q->K_ == 256) {
+        // K256 8-bit path: gemv8 (uint8 indices, CPB8=128, vectorized uint32 read). Same
+        // determinism knob as gemv4: two-stage fixed-order by default, atomic under DET=0.
+        ensure_gemv8_smem();
+        size_t smem8 = gemv8_smem();
+        int gy8 = det_gs8();
+        if (det_mode() == 2 && gy8 > 1) {
+            float* yp = ypart((size_t)gy8 * q->OC);
+            dim3 grid(q->OC/CPB8, gy8), block(32, TY);
+            gemv8_partial<<<grid, block, smem8, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, yp, q->IC, q->OC);
+            int tpb = 256;
+            gemv_reduce<<<(q->OC + tpb - 1)/tpb, tpb, 0, g_stream>>>(yp, (float*)d_y, q->OC, gy8);
+            return;
+        }
+        cudaMemsetAsync(d_y, 0, (size_t)q->OC*sizeof(float), g_stream);
+        dim3 grid(q->OC/CPB8, gy8), block(32, TY);
+        gemv8<<<grid, block, smem8, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, (float*)d_y, q->IC, q->OC);
+        return;
+    }
     size_t smem = (size_t)K*CPB*sizeof(__half) + (size_t)TY*CPB*sizeof(float);
     int gy = det_gs();
     if (det_mode() == 2 && gy > 1) {
@@ -784,6 +897,14 @@ void op_saxpy(void* acc_f32, const void* y_f32, float alpha, int n) {
 void op_gemv_fp16(const void* w_half, const void* x_half, void* y_f32, int ic, int oc) {
     ensure_stream();
     gemv_fp16_k<<<(oc+255)/256, 256, 0, g_stream>>>((const __half*)w_half, (const __half*)x_half, (float*)y_f32, ic, oc);
+}
+
+void op_mla_absorb(const void* x_half, const void* w_half, void* out_half,
+                   int nh, int in_dim, int out_dim, int S, int dc, int roff, int co, int ci) {
+    ensure_stream();
+    int total = nh*out_dim;
+    mla_absorb_k<<<(total+255)/256, 256, 0, g_stream>>>((const __half*)x_half, (const __half*)w_half, (__half*)out_half,
+        nh, in_dim, out_dim, S, dc, roff, co, ci);
 }
 
 void op_gelu_mul(const void* gate_f32, const void* up_f32, void* out_half, int n) {

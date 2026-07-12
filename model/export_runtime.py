@@ -20,49 +20,55 @@ K = 16
 
 
 @torch.no_grad()
-def kmeans_cols(Wt, iters=12):
-    # Wt: [in, out] float on cuda. Cluster each column into K centroids (1-D k-means).
+def kmeans_cols(Wt, k=K, iters=12):
+    # Wt: [in, out] float on cuda. Cluster each column into `k` centroids (1-D k-means).
     inn, out = Wt.shape
     lo = Wt.min(0).values
     hi = Wt.max(0).values
-    centroids = torch.stack([lo + (hi - lo) * (k / (K - 1)) for k in range(K)], 0)  # [K, out]
+    centroids = torch.stack([lo + (hi - lo) * (j / (k - 1)) for j in range(k)], 0)  # [k, out]
     best_k = torch.zeros(inn, out, dtype=torch.long, device=Wt.device)
     for _ in range(iters):
         best_d = torch.full((inn, out), float("inf"), device=Wt.device)
-        for k in range(K):
-            d = (Wt - centroids[k:k + 1, :]) ** 2
+        for j in range(k):
+            d = (Wt - centroids[j:j + 1, :]) ** 2
             better = d < best_d
-            best_k = torch.where(better, torch.full_like(best_k, k), best_k)
+            best_k = torch.where(better, torch.full_like(best_k, j), best_k)
             best_d = torch.where(better, d, best_d)
-        for k in range(K):
-            msk = (best_k == k).float()
+        for j in range(k):
+            msk = (best_k == j).float()
             cnt = msk.sum(0)
             newc = (Wt * msk).sum(0) / cnt.clamp_min(1.0)
-            centroids[k] = torch.where(cnt > 0, newc, centroids[k])
-    return centroids, best_k  # [K,out], [in,out]
+            centroids[j] = torch.where(cnt > 0, newc, centroids[j])
+    return centroids, best_k  # [k,out], [in,out]
 
 
-def _quant_block(Wt):
-    # Wt: [in, c] f32 on cuda. Returns packed [in,c/2] u8, cb [K,c] f32, Wt_dq [c,in] half (cpu).
-    cb, idx = kmeans_cols(Wt)                               # [K,c], [in,c]
+def _quant_block(Wt, k=K):
+    # Wt: [in, c] f32 on cuda. Returns packed u8, cb [k,c] f32, Wt_dq [c,in] half (cpu).
+    # k=16 -> nibble-packed [in, c/2] (two indices/byte). k=256 -> uint8 indices [in, c] (one/byte).
+    cb, idx = kmeans_cols(Wt, k)                            # [k,c], [in,c]
     Wt_dq = torch.gather(cb, 0, idx)                        # [in,c]
     idxu = idx.to(torch.uint8)
-    packed = (idxu[:, 0::2] | (idxu[:, 1::2] << 4)).contiguous()  # [in, c/2]
+    if k == 256:
+        packed = idxu.contiguous()                         # [in, c] one uint8 index per element
+    else:
+        packed = (idxu[:, 0::2] | (idxu[:, 1::2] << 4)).contiguous()  # [in, c/2] nibble pairs
     return packed.cpu().numpy(), cb.cpu().numpy().astype(np.float32), Wt_dq.t().contiguous().half().cpu()
 
 
 @torch.no_grad()
-def quantize(weight, chunk=16384):
-    # weight: nn.Linear.weight [out, in]. Returns packed [in,out/2] u8, cb [K,out] f32, W_dq [out,in].
+def quantize(weight, chunk=16384, k=K):
+    # weight: nn.Linear.weight [out, in]. Returns packed u8, cb [k,out] f32, W_dq [out,in].
+    # k=16: packed [in,out/2] (gemv4). k=256: packed [in,out] uint8 indices (gemv8, S19 mixed precision).
+    assert k in (16, 256), "quantize supports K=16 (4-bit) and K=256 (8-bit)"
     out_dim = weight.shape[0]
     if out_dim <= 20000:                                   # transformer layers: fast single-shot GPU path
-        return _quant_block(weight.t().contiguous().float().cuda())
+        return _quant_block(weight.t().contiguous().float().cuda(), k)
     # large LM head (big vocab): chunk over output columns so the k-means workspace stays bounded.
-    # chunk must be even so the nibble-pairing (cols 2k, 2k+1) never straddles a boundary.
+    # chunk must be even so the K=16 nibble-pairing (cols 2j, 2j+1) never straddles a boundary.
     Wt_full = weight.t().contiguous().float().cpu()        # [in, out] on CPU, fed to GPU per chunk
     packs, cbs, dqs = [], [], []
     for s in range(0, out_dim, chunk):
-        p, c, d = _quant_block(Wt_full[:, s:s + chunk].cuda())
+        p, c, d = _quant_block(Wt_full[:, s:s + chunk].cuda(), k)
         packs.append(p); cbs.append(c); dqs.append(d)
         torch.cuda.empty_cache()
     return (np.concatenate(packs, axis=1), np.concatenate(cbs, axis=1), torch.cat(dqs, 0))

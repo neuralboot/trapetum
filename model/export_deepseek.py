@@ -85,16 +85,21 @@ def _pad_in(w, ic):   # pad input cols (dim 1) with zeros to ic (down-proj input
     if w.shape[1] >= ic: return w
     return torch.cat([w, torch.zeros(w.shape[0], ic - w.shape[1], dtype=w.dtype, device=w.device)], 1)
 
-def qw(f, w):         # quantize a raw [out][in] weight tensor
-    packed, cb, _ = quantize(w)
+# Mixed-precision (S19) prec_flags bits -- must match the Rust loader (lib.rs PREC_*).
+PREC_SHARED_K256 = 1 << 0   # shared-expert gate/up/down at K=256 (loader support lands in increment 3)
+PREC_LMHEAD_K256 = 1 << 1   # lm_head at K=256
+
+def qw(f, w, k=16):   # quantize a raw [out][in] weight tensor at K=k (16=4-bit nibble, 256=8-bit uint8)
+    packed, cb, _ = quantize(w, k=k)
     f.write(packed.tobytes()); f.write(cb.tobytes())
 
-def qffn(f, gate, up, down, inter_pad):   # gate/up padded on output, down padded on input; zeros are lossless (silu(0)=0)
-    qw(f, _pad_out(gate.weight, inter_pad)); qw(f, _pad_out(up.weight, inter_pad)); qw(f, _pad_in(down.weight, inter_pad))
+def qffn(f, gate, up, down, inter_pad, k=16):   # gate/up padded on output, down padded on input; zeros are lossless (silu(0)=0)
+    qw(f, _pad_out(gate.weight, inter_pad), k); qw(f, _pad_out(up.weight, inter_pad), k); qw(f, _pad_in(down.weight, inter_pad), k)
 
 
-def _write_ffn(f, L, li, first_k_dense, inter_dense_pad, moe_inter_pad, shared_inter_pad, n_group, topk_group, sigmoid_flag):
-    # MLP: dense (first_k_dense layers) or MoE. Shared by CBKD and CBKR.
+def _write_ffn(f, L, li, first_k_dense, inter_dense_pad, moe_inter_pad, shared_inter_pad, n_group, topk_group, sigmoid_flag, shared_k=16):
+    # MLP: dense (first_k_dense layers) or MoE. Shared by CBKD and CBKR. Routed + dense experts
+    # are always 4-bit; only the shared expert may be K=256 (shared_k) under S19 mixed precision.
     if li < first_k_dense:
         M = L.mlp
         qffn(f, M.gate_proj, M.up_proj, M.down_proj, inter_dense_pad)
@@ -106,7 +111,7 @@ def _write_ffn(f, L, li, first_k_dense, inter_dense_pad, moe_inter_pad, shared_i
         for e in M.experts:
             qffn(f, e.gate_proj, e.up_proj, e.down_proj, moe_inter_pad)
         S = M.shared_experts
-        qffn(f, S.gate_proj, S.up_proj, S.down_proj, shared_inter_pad)
+        qffn(f, S.gate_proj, S.up_proj, S.down_proj, shared_inter_pad, shared_k)
     return 'dense' if li < first_k_dense else 'moe'
 
 
@@ -117,6 +122,10 @@ def main():
     ap.add_argument("--out", default="/workspace/ds")
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--gen", type=int, default=16)
+    ap.add_argument("--mixed", action="store_true",
+                    help="S19 mixed precision: write lm_head AND the shared expert at K=256 (8-bit) via the "
+                         "CBKE/CBKS magic + prec_flags header. Routed experts stay 4-bit. (S18: those are the "
+                         "worst-4bit-damaged tensors.)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -161,6 +170,16 @@ def main():
     softmax_scale, inv_freq = mla_scale_and_inv_freq(c, nope + rope, rope, rope_theta)
     print(f"mla: q_head_dim={nope + rope} softmax_scale={softmax_scale:.6f} (was rope_theta={rope_theta}); "
           f"inv_freq[{inv_freq.numel()}] yarn={getattr(c, 'rope_scaling', None) is not None}", flush=True)
+    # S19 mixed precision: promote lm_head to K=256 (8-bit). A mixed file uses a bumped magic
+    # (CBKE for CBKD, CBKS for CBKR) and writes ONE prec_flags i32 right after the base header;
+    # non-mixed files are byte-identical to before. Shared experts (PREC_SHARED_K256) are reserved
+    # here and wired end-to-end in the next increment.
+    prec_flags = (PREC_LMHEAD_K256 | PREC_SHARED_K256) if args.mixed else 0
+    lm_k = 256 if (prec_flags & PREC_LMHEAD_K256) else 16
+    shared_k = 256 if (prec_flags & PREC_SHARED_K256) else 16
+    if args.mixed:
+        print(f"mixed precision ON: prec_flags={prec_flags:#x} (lm_head + shared expert K=256); "
+              f"magic={'CBKS' if q_lora_rank else 'CBKE'}", flush=True)
     path = os.path.join(args.out, "model.cbk")
     f = open(path, "wb")
 
@@ -169,10 +188,11 @@ def main():
         qdim = n_heads * (nope + rope)
         assert qdim % 256 == 0, f"n_heads*(nope+rope)={qdim} must be %256 for the quantized q_b"
         assert hidden % 256 == 0, f"hidden={hidden} must be %256 for the quantized o_proj"
-        f.write(b"CBKR")
+        f.write(b"CBKS" if args.mixed else b"CBKR")
         f.write(struct.pack("<18i", n_layers, hidden, n_heads, kv_lora, nope, rope, vhd,
                             inter_dense_pad, moe_inter_pad, n_routed, n_shared, top_k, vocab, first_k_dense,
                             q_lora_rank, n_group, topk_group, sigmoid_flag))
+        if args.mixed: f.write(struct.pack("<i", prec_flags))
         f.write(struct.pack("<3f", eps, softmax_scale, rscale))
         f.write(inv_freq.numpy().astype("<f4").tobytes())
         w_f16(f, model.model.embed_tokens.weight)   # [vocab][hidden] fp16
@@ -190,13 +210,14 @@ def main():
             qw(f, A.o_proj.weight)                            # [hidden][n_heads*vhd] 4-bit
             w_f32(f, L.post_attention_layernorm.weight)
             kind = _write_ffn(f, L, li, first_k_dense, inter_dense_pad, moe_inter_pad, shared_inter_pad,
-                               n_group, topk_group, sigmoid_flag)
+                               n_group, topk_group, sigmoid_flag, shared_k)
             print(f"  layer {li+1}/{n_layers} ({kind}) written", flush=True)
     else:
         # CBKD: no q_lora (DeepSeek-V2-Lite style); MLA projections stay dense fp16.
-        f.write(b"CBKD")
+        f.write(b"CBKE" if args.mixed else b"CBKD")
         f.write(struct.pack("<14i", n_layers, hidden, n_heads, kv_lora, nope, rope, vhd,
                             inter_dense_pad, moe_inter_pad, n_routed, n_shared, top_k, vocab, first_k_dense))
+        if args.mixed: f.write(struct.pack("<i", prec_flags))
         f.write(struct.pack("<3f", eps, softmax_scale, rscale))
         f.write(inv_freq.numpy().astype("<f4").tobytes())
         w_f16(f, model.model.embed_tokens.weight)   # [vocab][hidden] fp16
@@ -213,11 +234,11 @@ def main():
             w_f16(f, A.o_proj.weight)                         # [hidden][n_heads*vhd]
             w_f32(f, L.post_attention_layernorm.weight)
             kind = _write_ffn(f, L, li, first_k_dense, inter_dense_pad, moe_inter_pad, shared_inter_pad,
-                               n_group, topk_group, sigmoid_flag)
+                               n_group, topk_group, sigmoid_flag, shared_k)
             print(f"  layer {li+1}/{n_layers} ({kind}) written", flush=True)
 
     w_f32(f, model.model.norm.weight)
-    qw(f, model.lm_head.weight)
+    qw(f, model.lm_head.weight, k=lm_k)   # S19: K=256 under --mixed (lm_head = S18's worst per-layer aggregate)
     f.close()
     print("wrote", path, os.path.getsize(path)//(1024*1024), "MB", flush=True)
 

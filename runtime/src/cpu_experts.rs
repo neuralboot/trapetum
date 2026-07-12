@@ -601,8 +601,9 @@ impl Pool {
         let p: &'static Pool = Box::leak(Box::new(Pool {
             n, st: Mutex::new(PoolState { gen: 0, job: None, done: 0 }), cv_work: Condvar::new(), cv_done: Condvar::new(),
         }));
-        for _ in 0..n {
+        for w in 0..n {
             thread::spawn(move || {
+                WORKER_ID.with(|c| c.set(w));
                 let mut last_gen = 0u64;
                 loop {
                     let jobptr = {
@@ -636,6 +637,17 @@ impl Pool {
         while st.done < self.n { st = self.cv_done.wait(st).unwrap(); }
         st.job = None;
     }
+}
+
+/// Run `f(i)` for every `i` in `0..n` across the persistent pool (each `i` independent; the caller
+/// writes disjoint regions). Sequential fallback for a 1-thread pool or tiny `n`. Used to parallelize
+/// the MLA per-head W_UK/W_UV absorption -- the single-threaded host wall found in deliverable E.
+pub fn parallel_for(n: usize, f: &(dyn Fn(usize) + Sync)) {
+    let p = pool();
+    if p.n <= 1 || n <= 1 { for i in 0..n { f(i); } return; }
+    let ctr = AtomicUsize::new(0);
+    let ctr = &ctr;
+    p.run(&|| loop { let i = ctr.fetch_add(1, Ordering::Relaxed); if i >= n { break; } f(i); });
 }
 
 /// Global persistent pool, sized `TRAPETUM_CPU_THREADS` (default 8), created on first use.
@@ -741,6 +753,977 @@ pub fn routed_experts_worksteal_nt(x: &[f32], experts: &[RoutedExpert], hidden: 
         let (w, base) = (ex.weight, e * hidden);
         for i in 0..hidden { acc_out[i] += w * out[base + i]; }
     }
+}
+
+// ============================================================================
+// NATIVE-LAYOUT path (for the 671B offload / MoeBlockOffload). The 671B routed experts are
+// ~350 GB of mmap-backed packed indices in the artifact's NATIVE input-major layout
+// (`packed[i*(oc/2)+j]`, per quantize_host); re-tiling to output-major would DOUBLE that RAM,
+// so these kernels consume the mmap slices DIRECTLY. i-OUTER streams `packed` contiguously (the
+// increment-4 insight); the codebook is used in its NATIVE `cb[k*oc+o]` layout too (K*oc, L2-
+// resident -- no transpose copy). Determinism is thread-count-invariant via a FIXED input-chunk
+// decomposition (chunk count set by `ic`, not by the worker count) whose per-chunk partials are
+// summed in FIXED chunk-index order.
+// ============================================================================
+
+/// Input rows per fixed determinism chunk (independent of worker count).
+const NATIVE_CHUNK_I: usize = 256;
+
+/// Scalar i-outer decode-GEMV over an INPUT range `[i0,i1)`, native input-major `packed` + native
+/// codebook, ACCUMULATING into `y` (caller owns init). Streams `packed` contiguously; `cb` is
+/// gathered strided (`cb[id*oc+o]`) but is L2-resident. Sums i-ascending within the range. This is
+/// the portable reference; on x86_64 [`gemv_native_range`] dispatches to the SIMD twins below.
+fn gemv_native_range_scalar(packed: &[u8], cb: &[f32], oc: usize, x: &[f32], y: &mut [f32], i0: usize, i1: usize) {
+    let half = oc / 2;
+    for i in i0..i1 {
+        let xi = x[i];
+        let row = &packed[i * half..i * half + half];
+        for j in 0..half {
+            let b = row[j];
+            y[2 * j]     += cb[((b & 0xF) as usize) * oc + 2 * j] * xi;
+            y[2 * j + 1] += cb[((b >> 4) as usize) * oc + 2 * j + 1] * xi;
+        }
+    }
+}
+
+// x86_64 SIMD decode-GEMV (deliverable B lever 1). The 671B host is a Xeon; the scalar decode ran
+// ~1.2 GB/s single-thread (the NEON tbl kernel is cfg(aarch64) and never had a vpshufb twin), which
+// capped the hybrid at ~2.4 GB/s aggregate. These kernels keep the SAME i-outer streaming of `packed`
+// and process 8 (AVX2) / 16 (AVX-512) output columns per step: the packed byte -> nibble index expand
+// feeds a vectorized gather of the L2-resident codebook, then mul + add into the y accumulators.
+//
+// BIT-EXACTNESS: each output column is an INDEPENDENT accumulator summed over i in the SAME ascending
+// order as the scalar path, and the value is `cb_value * xi` with a SEPARATE mul then add (NOT an FMA
+// -- fusing would change the rounding, the vfmaq lesson from S14). So the SIMD result is bitwise equal
+// to the scalar reference, and the determinism/thread-invariance proofs carry over unchanged.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn gemv_native_range_avx2(packed: &[u8], cb: &[f32], oc: usize, x: &[f32], y: &mut [f32], i0: usize, i1: usize) {
+    use std::arch::x86_64::*;
+    let half = oc / 2;
+    let cbp = cb.as_ptr();
+    let ocv = _mm256_set1_epi32(oc as i32);
+    let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let yp = y.as_mut_ptr();
+    let rp = packed.as_ptr();
+    let xp = x.as_ptr();
+    for i in i0..i1 {
+        let xi = _mm256_set1_ps(*xp.add(i));
+        let row = rp.add(i * half);
+        let (mut col, mut j) = (0usize, 0usize);
+        while col < oc {
+            // 4 packed bytes -> 8 nibble indices for columns col..col+7 (low, high, low, high, ...)
+            let (b0, b1) = (*row.add(j) as i32, *row.add(j + 1) as i32);
+            let (b2, b3) = (*row.add(j + 2) as i32, *row.add(j + 3) as i32);
+            let idx = _mm256_setr_epi32(b0 & 0xF, b0 >> 4, b1 & 0xF, b1 >> 4, b2 & 0xF, b2 >> 4, b3 & 0xF, b3 >> 4);
+            let colv = _mm256_add_epi32(_mm256_set1_epi32(col as i32), lane);
+            let off = _mm256_add_epi32(_mm256_mullo_epi32(idx, ocv), colv); // cb element index = idx*oc + col
+            let w = _mm256_i32gather_ps::<4>(cbp, off);
+            let prod = _mm256_mul_ps(w, xi);
+            let yv = _mm256_loadu_ps(yp.add(col));
+            _mm256_storeu_ps(yp.add(col), _mm256_add_ps(yv, prod));
+            col += 8; j += 4;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn gemv_native_range_avx512(packed: &[u8], cb: &[f32], oc: usize, x: &[f32], y: &mut [f32], i0: usize, i1: usize) {
+    use std::arch::x86_64::*;
+    let half = oc / 2;
+    let cbp = cb.as_ptr();
+    let ocv = _mm512_set1_epi32(oc as i32);
+    let lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let yp = y.as_mut_ptr();
+    let rp = packed.as_ptr();
+    let xp = x.as_ptr();
+    for i in i0..i1 {
+        let xi = _mm512_set1_ps(*xp.add(i));
+        let row = rp.add(i * half);
+        let (mut col, mut j) = (0usize, 0usize);
+        while col < oc {
+            // 8 packed bytes -> 16 nibble indices for columns col..col+15
+            let mut ix = [0i32; 16];
+            let mut c = 0usize;
+            while c < 16 { let b = *row.add(j + c / 2) as i32; ix[c] = b & 0xF; ix[c + 1] = b >> 4; c += 2; }
+            let idx = _mm512_loadu_si512(ix.as_ptr() as *const __m512i);
+            let colv = _mm512_add_epi32(_mm512_set1_epi32(col as i32), lane);
+            let off = _mm512_add_epi32(_mm512_mullo_epi32(idx, ocv), colv);
+            let w = _mm512_i32gather_ps::<4>(off, cbp);
+            let prod = _mm512_mul_ps(w, xi);
+            let yv = _mm512_loadu_ps(yp.add(col));
+            _mm512_storeu_ps(yp.add(col), _mm512_add_ps(yv, prod));
+            col += 16; j += 8;
+        }
+    }
+}
+
+/// Native decode kernel selection (deliverable C). `TRAPETUM_CPU_KERNEL` picks explicitly, else auto
+/// (widest exact SIMD). `TRAPETUM_CPU_SCALAR=1` is a back-compat alias for `=scalar`.
+///   scalar          f32 reference (portable)
+///   gather / auto   f32 gather AVX2/AVX-512 (deliverable B; exact; gather-bound ~ the 671B ceiling)
+///   lut8            int8-recoded codebook + vpshufb value-LUT (deliverable C2; tolerance-gated)
+///   vpermps         f32 register-resident LUT (deliverable C1; exact) -- not yet built
+/// Values whose kernel is not yet implemented fall back to the best exact kernel with a one-time
+/// notice, so the box's A/B script can set the flag today without breaking.
+#[derive(Clone, Copy, PartialEq)]
+#[allow(dead_code)] // some variants only constructed under cfg(x86_64)
+pub(crate) enum CpuKernel { Scalar, GatherAvx2, GatherAvx512, Lut8 }
+
+pub(crate) fn cpu_kernel() -> CpuKernel {
+    static K: OnceLock<CpuKernel> = OnceLock::new();
+    *K.get_or_init(|| {
+        let scalar_alias = std::env::var("TRAPETUM_CPU_SCALAR").map(|v| v == "1").unwrap_or(false);
+        let sel = std::env::var("TRAPETUM_CPU_KERNEL").ok().unwrap_or_default();
+        #[cfg(target_arch = "x86_64")]
+        let best = if is_x86_feature_detected!("avx512f") { CpuKernel::GatherAvx512 }
+                   else if is_x86_feature_detected!("avx2") { CpuKernel::GatherAvx2 } else { CpuKernel::Scalar };
+        #[cfg(not(target_arch = "x86_64"))]
+        let best = CpuKernel::Scalar;
+        if scalar_alias { return CpuKernel::Scalar; }
+        match sel.as_str() {
+            "scalar" => CpuKernel::Scalar,
+            "gather" | "auto" | "" => best,
+            "lut8" => CpuKernel::Lut8,
+            other => { eprintln!("[cpu_kernel] '{other}' not implemented yet -> falling back to the best exact kernel"); best }
+        }
+    })
+}
+
+/// i-outer decode-GEMV, dispatching to the widest available x86_64 SIMD kernel (bit-exact to the
+/// scalar reference), or scalar elsewhere. `oc` is a multiple of 256 in the runtime, so the AVX-512
+/// (16-col) and AVX2 (8-col) tilings never leave a remainder; the guards keep it correct regardless.
+#[inline]
+fn gemv_native_range(packed: &[u8], cb: &[f32], oc: usize, x: &[f32], y: &mut [f32], i0: usize, i1: usize) {
+    // This is the f32-exact GEMV. The int8 lut8 path (C2) has a different signature (int8 cb + scale
+    // + int8 x) and is wired separately; here Lut8 maps to the best exact gather kernel.
+    #[cfg(target_arch = "x86_64")]
+    {
+        match cpu_kernel() {
+            CpuKernel::GatherAvx512 if oc % 16 == 0 => return unsafe { gemv_native_range_avx512(packed, cb, oc, x, y, i0, i1) },
+            CpuKernel::Scalar => {}
+            _ if oc % 8 == 0 => return unsafe { gemv_native_range_avx2(packed, cb, oc, x, y, i0, i1) },
+            _ => {}
+        }
+    }
+    gemv_native_range_scalar(packed, cb, oc, x, y, i0, i1);
+}
+
+/// Deterministic native decode-GEMV: `y[o] = sum_i cb[idx[o,i]*oc+o]*x[i]`, consuming the native
+/// input-major `packed` with NO re-tile. Multi-threaded over a FIXED input-chunk split (persistent
+/// pool); per-chunk partials (`oc` f32 each) are reduced in FIXED chunk-index order, so the bytes
+/// of `y` are identical for ANY worker count.
+pub fn gemv_cpu_native_det(packed: &[u8], cb: &[f32], oc: usize, ic: usize, x: &[f32], y: &mut [f32]) {
+    assert_eq!(packed.len(), ic * (oc / 2), "packed size");
+    assert_eq!(cb.len(), K * oc, "codebook size");
+    assert_eq!(x.len(), ic, "activation size");
+    assert!(y.len() >= oc, "output size");
+    let nchunks = (ic + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+    if nchunks <= 1 {
+        for v in y.iter_mut().take(oc) { *v = 0.0; }
+        gemv_native_range(packed, cb, oc, x, y, 0, ic);
+        return;
+    }
+    // Per-chunk partials (zeroed); each chunk owns a disjoint `oc`-slice.
+    let mut partials = vec![0f32; nchunks * oc];
+    let pp = RawF32(partials.as_mut_ptr());
+    let ctr = AtomicUsize::new(0);
+    // Capture the WHOLE RawF32 (Sync) by reference, not its raw-pointer field (disjoint capture
+    // of `*mut f32` would make the closure non-Sync).
+    let (packed, cb, x, pp) = (&packed, &cb, &x, &pp);
+    pool().run(&|| {
+        loop {
+            let c = ctr.fetch_add(1, Ordering::Relaxed);
+            if c >= nchunks { break; }
+            let (i0, i1) = (c * NATIVE_CHUNK_I, ((c + 1) * NATIVE_CHUNK_I).min(ic));
+            let pc = unsafe { std::slice::from_raw_parts_mut(pp.0.add(c * oc), oc) };
+            gemv_native_range(packed, cb, oc, x, pc, i0, i1);
+        }
+    });
+    // Fixed chunk-index-order reduction -> thread-count-invariant.
+    for v in y.iter_mut().take(oc) { *v = 0.0; }
+    for c in 0..nchunks {
+        let base = c * oc;
+        for o in 0..oc { y[o] += partials[base + o]; }
+    }
+}
+
+/// A routed expert for the native path: NATIVE input-major packed slices (mmap-backed, borrowed
+/// directly -- no copy) + native codebooks, plus the router weight.
+pub struct NativeExpert<'a> {
+    pub gp: &'a [u8], pub gc: &'a [f32],
+    pub up: &'a [u8], pub uc: &'a [f32],
+    pub dp: &'a [u8], pub dc: &'a [f32],
+    pub weight: f32,
+}
+
+/// Full SwiGLU expert forward on the native input-major layout: gate/up (`oc=inter, ic=hidden`)
+/// via [`gemv_cpu_native_det`], SiLU(g)*u, then down (`oc=hidden, ic=inter`). Deterministic.
+#[allow(clippy::too_many_arguments)]
+pub fn expert_forward_native(x: &[f32], gp: &[u8], gc: &[f32], up: &[u8], uc: &[f32], dp: &[u8], dc: &[f32],
+                             hidden: usize, inter: usize, y: &mut [f32]) {
+    assert_eq!(x.len(), hidden, "expert input width");
+    assert!(y.len() >= hidden, "expert output width");
+    let mut g = vec![0f32; inter];
+    let mut u = vec![0f32; inter];
+    gemv_cpu_native_det(gp, gc, inter, hidden, x, &mut g);
+    gemv_cpu_native_det(up, uc, inter, hidden, x, &mut u);
+    let mut act = vec![0f32; inter];
+    for i in 0..inter { act[i] = silu(g[i]) * u[i]; }
+    gemv_cpu_native_det(dp, dc, hidden, inter, &act, y);
+}
+
+/// Weighted routed MoE sum on the native path (for MoeBlockOffload / 671B): runs each picked
+/// expert with [`expert_forward_native`] and accumulates `sum_e w_e * expert_e(x)` in FIXED expert
+/// order. Deterministic (each GEMV is thread-invariant; the combine order is fixed). `acc_out`
+/// (len `hidden`) is overwritten. No re-tile, no per-expert copy -- the mmap slices are read directly.
+pub fn routed_experts_native(x: &[f32], experts: &[NativeExpert], hidden: usize, inter: usize, acc_out: &mut [f32]) {
+    for v in acc_out.iter_mut().take(hidden) { *v = 0.0; }
+    let mut y = vec![0f32; hidden];
+    for ex in experts {
+        expert_forward_native(x, ex.gp, ex.gc, ex.up, ex.uc, ex.dp, ex.dc, hidden, inter, &mut y);
+        for i in 0..hidden { acc_out[i] += ex.weight * y[i]; }
+    }
+}
+
+// ============================================================================
+// int8 codebook recode (deliverable C2). To reach the vpshufb/tbl 47 GB/s class the decode must be
+// a byte-LUT, which needs an int8 codebook. We recode each per-column f32 codebook to int8 + a
+// per-column f32 scale at LOAD time (a small one-time pass, no artifact change): cb_i8[k,o] =
+// round(cb[k,o] / scale[o]), scale[o] = max_k|cb[k,o]| / 127. The decode then quantizes the
+// activation to int8 too (per-vector scale), does an int32 dot, and rescales by (xs * scale[o]).
+// This adds codebook+activation int8 error -- comparable in scale to the fp16-vs-f32 path gap we
+// already accept; the tolerance is MEASURED and printed (int8_recode_error_probe), and the gate is
+// margins/PPL (the determinism campaign), not raw f32 equality. The SIMD kernel (C-inc3) implements
+// exactly this arithmetic, so its correctness test is "vpshufb == this scalar int8", bit-exact.
+// ============================================================================
+
+/// Recode a per-column f32 codebook `[K,oc]` to int8 `[K,oc]` + per-column f32 `scale[oc]`.
+pub fn recode_codebook_i8(cb: &[f32], oc: usize) -> (Vec<i8>, Vec<f32>) {
+    assert_eq!(cb.len(), K * oc);
+    let mut cb_i8 = vec![0i8; K * oc];
+    let mut scale = vec![0f32; oc];
+    for o in 0..oc {
+        let mut mx = 0f32;
+        for k in 0..K { mx = mx.max(cb[k * oc + o].abs()); }
+        let s = if mx > 0.0 { mx / 127.0 } else { 1.0 };
+        scale[o] = s;
+        for k in 0..K { cb_i8[k * oc + o] = (cb[k * oc + o] / s).round().clamp(-127.0, 127.0) as i8; }
+    }
+    (cb_i8, scale)
+}
+
+/// Full int8-path decode-GEMV (the arithmetic the lut8 SIMD kernel implements): quantize `x` to int8
+/// (per-vector scale `xs = max|x|/127`), int32 dot with the int8 codebook, rescale by `xs*scale[o]`.
+/// `y[o] = xs * scale[o] * sum_i cb_i8[idx[i,o], o] * round(x[i]/xs)`. Scalar reference for the probe
+/// and the SIMD correctness anchor. Overflow-safe: |cb_i8*xq| <= 127*127, summed over ic < 2^31.
+pub fn gemv_native_i8(packed: &[u8], cb_i8: &[i8], scale: &[f32], oc: usize, ic: usize, x: &[f32], y: &mut [f32]) {
+    let half = oc / 2;
+    let xs = { let mut mx = 0f32; for &v in &x[..ic] { mx = mx.max(v.abs()); } if mx > 0.0 { mx / 127.0 } else { 1.0 } };
+    let xq: Vec<i32> = x[..ic].iter().map(|&v| (v / xs).round().clamp(-127.0, 127.0) as i32).collect();
+    let mut acc = vec![0i32; oc];
+    for i in 0..ic {
+        let xi = xq[i];
+        if xi == 0 { continue; }
+        let row = &packed[i * half..i * half + half];
+        for j in 0..half {
+            let b = row[j];
+            acc[2 * j]     += cb_i8[((b & 0xF) as usize) * oc + 2 * j] as i32 * xi;
+            acc[2 * j + 1] += cb_i8[((b >> 4) as usize) * oc + 2 * j + 1] as i32 * xi;
+        }
+    }
+    for o in 0..oc { y[o] = xs * scale[o] * acc[o] as f32; }
+}
+
+// ============================================================================
+// lut8 SIMD decode (deliverable C increment 3). The vpshufb value-LUT needs a column's 16 int8
+// centroids CONTIGUOUS (a 16-byte shuffle table), so we first transpose the recoded codebook from
+// [K,oc] (strided cb_i8[k*oc+o]) to [oc,16] (cb_i8_t[o*16+k]) -- a small one-time pass. Then the
+// kernel streams the input-major `packed` contiguously in i-blocks of LUT8_IB inputs, and for each
+// byte-position gathers that column's LUT8_IB nibbles from the (cache-resident) tile, vpshufb-decodes
+// them against the column table, and int-madds with the int8 activation block. Integer accumulation
+// is EXACT and order-free, so lut8 == the scalar int8 accumulate BIT-FOR-BIT (the box's cheap gate).
+//
+// Block sizes are consts so the box (Sapphire-Rapids-class L2/L3) can retune in one line. LUT8_IB=16
+// matches an xmm's 16 int8 lanes; the per-byte-position nibble gather from the cache-resident tile is
+// the tunable hotspot (a full in-register 16x16 transpose is the perf follow-up once the box profiles).
+pub const LUT8_IB: usize = 16;
+
+/// Column held by output register k of `transpose16x16_epi8`: the unpack cascade emits columns in
+/// bit-reversed (reverse-4-bit) register order, so register k holds column `LUT8_COL_OF_REG[k]`.
+/// Verified on all arches by `transpose16x16_wiring_is_a_true_transpose` (the decode indexes by it).
+const LUT8_COL_OF_REG: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+
+/// Transpose the recoded int8 codebook `[K,oc]` (strided per column) to `[oc,16]` (16 contiguous
+/// centroids per column) -- the vpshufb table layout. One-time, small (oc*16 bytes).
+pub fn transpose_codebook_i8(cb_i8: &[i8], oc: usize) -> Vec<i8> {
+    assert_eq!(cb_i8.len(), K * oc);
+    let mut t = vec![0i8; oc * 16];
+    for o in 0..oc { for k in 0..K { t[o * 16 + k] = cb_i8[k * oc + o]; } }
+    t
+}
+
+/// Scalar int8 accumulate from the per-column table `cb_i8_t` `[oc,16]`: the bit-exact reference the
+/// lut8 SIMD kernel must match. `acc[o] += sum_i cb_i8_t[o*16 + idx[i,o]] * xq[i]` (integer, exact).
+pub fn accumulate_i8_t(packed: &[u8], cb_i8_t: &[i8], oc: usize, xq: &[i8], acc: &mut [i32], i0: usize, i1: usize) {
+    let half = oc / 2;
+    for i in i0..i1 {
+        let xi = xq[i] as i32;
+        let row = &packed[i * half..i * half + half];
+        for j in 0..half {
+            let b = row[j];
+            acc[2 * j]     += cb_i8_t[(2 * j) * 16 + (b & 0xF) as usize] as i32 * xi;
+            acc[2 * j + 1] += cb_i8_t[(2 * j + 1) * 16 + (b >> 4) as usize] as i32 * xi;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn hsum256_i32(v: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castsi256_si128(v);
+    let hi = _mm256_extracti128_si256::<1>(v);
+    let s = _mm_add_epi32(lo, hi);
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0x4E>(s));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0xB1>(s));
+    _mm_cvtsi128_si32(s)
+}
+
+/// AVX2 lut8 accumulate: vpshufb value-LUT decode + int madd, streaming `packed` in LUT8_IB-input
+/// blocks. Bit-exact to [`accumulate_i8_t`] (integer). `cb_i8_t` is `[oc,16]`, `xq` int8 activations.
+/// 16x16 byte transpose (deliverable C follow-up, session-4 per-core lever). `rows[t]` holds 16
+/// bytes = byte-positions j0..j0+15 of input `ib+t`; returns `cols[c]` = 16 bytes = the 16 inputs'
+/// byte at position j0+c. Standard 4-stage unpack cascade (8->16->32->64-bit interleave). This
+/// replaces the scalar strided nibble gather (16 L2-latency loads/byte-position -- the 0.66 GB/s/core
+/// atom) with in-register shuffles, so the lut8 decode is register-bound, not element-load-bound.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn transpose16x16_epi8(rows: &[std::arch::x86_64::__m128i; 16]) -> [std::arch::x86_64::__m128i; 16] {
+    use std::arch::x86_64::*;
+    let mut a = [_mm_setzero_si128(); 16];
+    for i in 0..8 { a[2*i] = _mm_unpacklo_epi8(rows[2*i], rows[2*i+1]); a[2*i+1] = _mm_unpackhi_epi8(rows[2*i], rows[2*i+1]); }
+    let mut b = [_mm_setzero_si128(); 16];
+    for i in 0..4 { for k in 0..2 { b[4*i+k] = _mm_unpacklo_epi16(a[4*i+k], a[4*i+2+k]); b[4*i+2+k] = _mm_unpackhi_epi16(a[4*i+k], a[4*i+2+k]); } }
+    let mut c = [_mm_setzero_si128(); 16];
+    for i in 0..2 { for k in 0..4 { c[8*i+k] = _mm_unpacklo_epi32(b[8*i+k], b[8*i+4+k]); c[8*i+4+k] = _mm_unpackhi_epi32(b[8*i+k], b[8*i+4+k]); } }
+    let mut d = [_mm_setzero_si128(); 16];
+    for k in 0..8 { d[k] = _mm_unpacklo_epi64(c[k], c[8+k]); d[8+k] = _mm_unpackhi_epi64(c[k], c[8+k]); }
+    d
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn accumulate_lut8_avx2(packed: &[u8], cb_i8_t: &[i8], oc: usize, xq: &[i8], acc: &mut [i32], i0: usize, i1: usize) {
+    use std::arch::x86_64::*;
+    let half = oc / 2;
+    let mask = _mm_set1_epi8(0x0F);
+    // decode one byte-position's transposed lane (16 inputs) into acc[o_lo],acc[o_hi].
+    #[target_feature(enable = "avx2")]
+    unsafe fn decode_lane(bytes: std::arch::x86_64::__m128i, o_lo: usize, cb_i8_t: &[i8],
+                          xq16: std::arch::x86_64::__m256i, acc: &mut [i32], mask: std::arch::x86_64::__m128i) {
+        use std::arch::x86_64::*;
+        let lo = _mm_and_si128(bytes, mask);
+        let hi = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+        let tbl_lo = _mm_loadu_si128(cb_i8_t.as_ptr().add(o_lo * 16) as *const __m128i);
+        let tbl_hi = _mm_loadu_si128(cb_i8_t.as_ptr().add((o_lo + 1) * 16) as *const __m128i);
+        let p_lo = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_shuffle_epi8(tbl_lo, lo)), xq16);
+        let p_hi = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_shuffle_epi8(tbl_hi, hi)), xq16);
+        *acc.get_unchecked_mut(o_lo)     += hsum256_i32(p_lo);
+        *acc.get_unchecked_mut(o_lo + 1) += hsum256_i32(p_hi);
+    }
+    let mut ib = i0;
+    while ib + LUT8_IB <= i1 {
+        let xq16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xq.as_ptr().add(ib) as *const __m128i));
+        let mut j = 0usize;
+        // full 16-byte-position tiles: load 16 input rows, transpose in-register, decode 16 lanes.
+        while j + 16 <= half {
+            let mut rows = [_mm_setzero_si128(); 16];
+            for t in 0..LUT8_IB { rows[t] = _mm_loadu_si128(packed.as_ptr().add((ib + t) * half + j) as *const __m128i); }
+            let cols = transpose16x16_epi8(&rows);
+            // register k holds column j + LUT8_COL_OF_REG[k] (cascade emits bit-reversed order).
+            for k in 0..16 { decode_lane(cols[k], 2 * (j + LUT8_COL_OF_REG[k]), cb_i8_t, xq16, acc, mask); }
+            j += 16;
+        }
+        // byte-position remainder (half % 16 != 0): scalar-gather the lane, same decode.
+        while j < half {
+            let mut buf = [0u8; LUT8_IB];
+            for t in 0..LUT8_IB { buf[t] = *packed.get_unchecked((ib + t) * half + j); }
+            decode_lane(_mm_loadu_si128(buf.as_ptr() as *const __m128i), 2 * j, cb_i8_t, xq16, acc, mask);
+            j += 1;
+        }
+        ib += LUT8_IB;
+    }
+    if ib < i1 { accumulate_i8_t(packed, cb_i8_t, oc, xq, acc, ib, i1); } // input tail (< LUT8_IB inputs)
+}
+
+// ============================================================================
+// Worker engagement (deliverable C). The 671B rerun showed only ~9-16 of 32 pool workers doing
+// useful work: the reduction phases (RA/RC) had just `k` tasks, phase C had `k*ceil(inter/256)`
+// (~64) for 32-60 workers, and the std Barrier's futex wake latency x (4 phases x 58 calls/token)
+// serialized the tail. Three orthogonal fixes, all behind flags so the box can A/B:
+//   * finer reduction: RA/RC split by OUTPUT chunk (RED_CHUNK), so every worker has reduce work.
+//   * spin phase barrier (TRAPETUM_CPU_SPIN=1): swap the blocking Barrier for an atomic spin so a
+//     phase transition costs a cache-line poll, not a futex round-trip (the AWS cores are dedicated
+//     during decode). Determinism is unaffected -- a barrier only orders phases, never sums.
+//   * per-worker task instrumentation (TRAPETUM_CPU_ENGAGE_DEBUG=1): counts tasks/worker so the
+//     engagement distribution is observable (on the M4 at V2-Lite dims, and on the box).
+// ============================================================================
+
+// Persistent per-thread worker index (set once when the pool spawns the thread); usize::MAX on
+// any non-pool thread (e.g. the scoped _nt path). Used only for engagement instrumentation.
+thread_local! { static WORKER_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) }; }
+
+/// Output elements per reduction task (RA/RC), so the cheap reduction phases have enough tasks to
+/// keep all workers busy instead of `k`. Fixed (not worker-derived) -> reduction order unchanged.
+const RED_CHUNK: usize = 512;
+
+/// Spin barrier: workers poll a generation counter instead of blocking on a futex, so a phase
+/// transition inside a MoE call is a cache-line read, not a kernel round-trip.
+struct SpinBarrier { n: usize, count: AtomicUsize, gen: AtomicUsize }
+impl SpinBarrier {
+    fn new(n: usize) -> Self { Self { n, count: AtomicUsize::new(0), gen: AtomicUsize::new(0) } }
+    fn wait(&self) {
+        let g = self.gen.load(Ordering::Acquire);
+        if self.count.fetch_add(1, Ordering::AcqRel) + 1 == self.n {
+            self.count.store(0, Ordering::Release);
+            self.gen.fetch_add(1, Ordering::Release);
+        } else {
+            while self.gen.load(Ordering::Acquire) == g { std::hint::spin_loop(); }
+        }
+    }
+}
+
+/// Phase barrier for the native work-steal: blocking (default) or spinning (`TRAPETUM_CPU_SPIN=1`).
+enum PhaseBar { Block(Barrier), Spin(SpinBarrier) }
+impl PhaseBar {
+    fn new(n: usize, spin: bool) -> Self { if spin { PhaseBar::Spin(SpinBarrier::new(n)) } else { PhaseBar::Block(Barrier::new(n)) } }
+    #[inline] fn wait(&self) { match self { PhaseBar::Block(b) => { b.wait(); } PhaseBar::Spin(s) => s.wait() } }
+}
+
+fn cpu_spin() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("TRAPETUM_CPU_SPIN").map(|v| v == "1").unwrap_or(false))
+}
+fn engage_debug() -> bool {
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| std::env::var("TRAPETUM_CPU_ENGAGE_DEBUG").map(|v| v == "1").unwrap_or(false))
+}
+
+/// TRAPETUM_MOE_TIMING=1: per-phase worker-microseconds (summed across workers) for the native MoE
+/// work-steal, so the box can see WHERE the MoE phase spends its ~1.4 s (phase A/C decode vs the
+/// reduce tails vs setup) without gdb. Summed worker-us / n_workers ~ the phase wall time.
+pub mod moetime {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    pub static A_US: AtomicU64 = AtomicU64::new(0);
+    pub static RA_US: AtomicU64 = AtomicU64::new(0);
+    pub static C_US: AtomicU64 = AtomicU64::new(0);
+    pub static RC_US: AtomicU64 = AtomicU64::new(0);
+    // Whole-forward stages OUTSIDE the work-steal phases (G-inc1: the ~386 ms/token gap session-5
+    // exposed lives here). XCOPY = norm.to_host() drain+copy; WS = the whole work-steal call wall
+    // (WS - (A+RA+C+RC) = the entry overhead: xquant + cache lookup + pool handoff + combine);
+    // SHARED = from_host + the GPU shared-expert run_ffn + residual (drained).
+    pub static XCOPY_US: AtomicU64 = AtomicU64::new(0);
+    pub static WS_US: AtomicU64 = AtomicU64::new(0);
+    pub static SHARED_US: AtomicU64 = AtomicU64::new(0);
+    // ws_entry sub-split (G-inc2): SETUP = codebook-cache lookups + x-quantize + scratch prep;
+    // RUN = the p.run() wall (RUN - phases = barrier + pool-handoff overhead); COMBINE = the
+    // fixed-order weighted saxpy. ws_entry = SETUP + (RUN - phases) + COMBINE.
+    pub static WS_SETUP_US: AtomicU64 = AtomicU64::new(0);
+    pub static WS_RUN_US: AtomicU64 = AtomicU64::new(0);
+    pub static WS_COMBINE_US: AtomicU64 = AtomicU64::new(0);
+    // setup sub-split (G-inc3): RECODE = the per-expert int8 codebook recode+transpose (cache MISS;
+    // HIT is ~free) -- the suspected wall while the lazy cache is still warming; QUANT = the once-per-
+    // layer x int8-quantize. setup_prep = SETUP - RECODE - QUANT (ei8 build + scratch zero).
+    pub static WS_RECODE_US: AtomicU64 = AtomicU64::new(0);
+    pub static WS_QUANT_US: AtomicU64 = AtomicU64::new(0);
+    /// Reset all ws-entry sub-stage timers and return them (setup, run, combine, recode, quant).
+    pub fn take_ws_sub() -> (u64, u64, u64, u64, u64) {
+        (WS_SETUP_US.swap(0, Ordering::Relaxed), WS_RUN_US.swap(0, Ordering::Relaxed), WS_COMBINE_US.swap(0, Ordering::Relaxed),
+         WS_RECODE_US.swap(0, Ordering::Relaxed), WS_QUANT_US.swap(0, Ordering::Relaxed))
+    }
+    pub fn on() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var("TRAPETUM_MOE_TIMING").map(|v| v == "1").unwrap_or(false))
+    }
+    #[inline] pub fn add(a: &AtomicU64, us: u64) { a.fetch_add(us, Ordering::Relaxed); }
+    /// (A, RA, C, RC, XCOPY, WS, SHARED) microseconds, reset.
+    pub fn take() -> (u64, u64, u64, u64, u64, u64, u64) {
+        (A_US.swap(0, Ordering::Relaxed), RA_US.swap(0, Ordering::Relaxed),
+         C_US.swap(0, Ordering::Relaxed), RC_US.swap(0, Ordering::Relaxed),
+         XCOPY_US.swap(0, Ordering::Relaxed), WS_US.swap(0, Ordering::Relaxed), SHARED_US.swap(0, Ordering::Relaxed))
+    }
+}
+
+/// Shared state a set of pool workers cooperatively drains for ONE native-path MoE call. Unlike the
+/// re-tiled [`WorkstealCtx`], the native layout chunks over the INPUT dimension (streaming `packed`
+/// once), so each (expert, proj, input-chunk) task writes a disjoint per-chunk PARTIAL that a later
+/// phase reduces in fixed chunk order. `Sync` because the only shared mutation is the phase atomics
+/// / barrier and raw pointers into non-overlapping partial/scratch slices.
+struct NativeWsCtx<'a> {
+    experts: &'a [NativeExpert<'a>],
+    x: &'a [f32],
+    hidden: usize, inter: usize,
+    nch_h: usize, nch_i: usize, k: usize,   // input chunks for gate/up (ic=hidden) and down (ic=inter)
+    ra_per: usize, rc_per: usize,           // output chunks per expert for the RA/RC reductions
+    ctr_a: AtomicUsize, ctr_ra: AtomicUsize, ctr_c: AtomicUsize, ctr_rc: AtomicUsize,
+    bar: PhaseBar,
+    eng: Option<&'a [AtomicUsize]>,         // per-worker task counts (TRAPETUM_CPU_ENGAGE_DEBUG)
+    pg: RawF32, pu: RawF32, pd: RawF32,           // per-chunk partials
+    g: RawF32, u: RawF32, act: RawF32, out: RawF32, // reduced per-expert scratch
+}
+unsafe impl Sync for NativeWsCtx<'_> {}
+
+/// One worker's slice of a native-path MoE call. Four phases separated by barriers:
+///   A  gate+up decode-GEMV per (expert, proj, input-chunk) -> disjoint partials
+///   RA reduce gate/up partials (fixed chunk order) + SiLU, per (expert, output-chunk)
+///   C  down decode-GEMV per (expert, input-chunk) -> disjoint partials
+///   RC reduce down partials (fixed chunk order), per (expert, output-chunk)
+/// The chunk->partial mapping and every reduction order are fixed, so which worker runs which task
+/// never changes a byte of the result -- thread-count invariant, exactly like the sequential path.
+/// RA/RC split by OUTPUT chunk (not just by expert) so the cheap reduction phases have enough tasks
+/// to keep every worker busy (the 671B engagement fix); the per-element reduction order is unchanged.
+fn native_ws_worker(c: &NativeWsCtx) {
+    let (nch_h, nch_i, inter, hidden, k) = (c.nch_h, c.nch_i, c.inter, c.hidden, c.k);
+    let wid = WORKER_ID.with(|w| w.get());
+    let mut done = 0usize;
+    let tm = moetime::on();
+    let mut ph = if tm { Some(std::time::Instant::now()) } else { None };
+    macro_rules! lap { ($a:expr) => { if let Some(t) = ph { moetime::add($a, t.elapsed().as_micros() as u64); ph = Some(std::time::Instant::now()); } }; }
+    // Phase A: gate+up input-chunks (2*nch_h per expert).
+    let na = k * 2 * nch_h;
+    loop {
+        let t = c.ctr_a.fetch_add(1, Ordering::Relaxed);
+        if t >= na { break; }
+        let (e, rr) = (t / (2 * nch_h), t % (2 * nch_h));
+        let (which, ci) = (rr / nch_h, rr % nch_h);
+        let (i0, i1) = (ci * NATIVE_CHUNK_I, ((ci + 1) * NATIVE_CHUNK_I).min(hidden));
+        let ex = &c.experts[e];
+        let (packed, cb, base) = if which == 0 { (ex.gp, ex.gc, &c.pg) } else { (ex.up, ex.uc, &c.pu) };
+        let slot = unsafe { std::slice::from_raw_parts_mut(base.0.add((e * nch_h + ci) * inter), inter) };
+        for v in slot.iter_mut() { *v = 0.0; } // parallel per-slot zero (moved off the serial scratch memset)
+        gemv_native_range(packed, cb, inter, c.x, slot, i0, i1);
+        done += 1;
+    }
+    lap!(&moetime::A_US);
+    c.bar.wait();
+    // Phase RA: reduce gate/up partials (fixed chunk order) + SiLU, per (expert, output-chunk).
+    let nra = k * c.ra_per;
+    loop {
+        let t = c.ctr_ra.fetch_add(1, Ordering::Relaxed);
+        if t >= nra { break; }
+        let (e, oc) = (t / c.ra_per, t % c.ra_per);
+        let (o0, o1) = (oc * RED_CHUNK, ((oc + 1) * RED_CHUNK).min(inter));
+        unsafe {
+            let (ge, ue, acte) = (c.g.0.add(e * inter), c.u.0.add(e * inter), c.act.0.add(e * inter));
+            for o in o0..o1 { *ge.add(o) = 0.0; *ue.add(o) = 0.0; }
+            for ci in 0..nch_h {
+                let (pgc, puc) = (c.pg.0.add((e * nch_h + ci) * inter), c.pu.0.add((e * nch_h + ci) * inter));
+                for o in o0..o1 { *ge.add(o) += *pgc.add(o); *ue.add(o) += *puc.add(o); }
+            }
+            for o in o0..o1 { *acte.add(o) = silu(*ge.add(o)) * *ue.add(o); }
+        }
+        done += 1;
+    }
+    lap!(&moetime::RA_US);
+    c.bar.wait();
+    // Phase C: down input-chunks (nch_i per expert).
+    let nc = k * nch_i;
+    loop {
+        let t = c.ctr_c.fetch_add(1, Ordering::Relaxed);
+        if t >= nc { break; }
+        let (e, ci) = (t / nch_i, t % nch_i);
+        let (i0, i1) = (ci * NATIVE_CHUNK_I, ((ci + 1) * NATIVE_CHUNK_I).min(inter));
+        let ex = &c.experts[e];
+        let act_e = unsafe { std::slice::from_raw_parts(c.act.0.add(e * inter), inter) };
+        let slot = unsafe { std::slice::from_raw_parts_mut(c.pd.0.add((e * nch_i + ci) * hidden), hidden) };
+        for v in slot.iter_mut() { *v = 0.0; } // parallel per-slot zero (moved off the serial scratch memset)
+        gemv_native_range(ex.dp, ex.dc, hidden, act_e, slot, i0, i1);
+        done += 1;
+    }
+    lap!(&moetime::C_US);
+    c.bar.wait();
+    // Phase RC: reduce down partials (fixed chunk order), per (expert, output-chunk).
+    let nrc = k * c.rc_per;
+    loop {
+        let t = c.ctr_rc.fetch_add(1, Ordering::Relaxed);
+        if t >= nrc { break; }
+        let (e, oc) = (t / c.rc_per, t % c.rc_per);
+        let (o0, o1) = (oc * RED_CHUNK, ((oc + 1) * RED_CHUNK).min(hidden));
+        unsafe {
+            let oe = c.out.0.add(e * hidden);
+            for o in o0..o1 { *oe.add(o) = 0.0; }
+            for ci in 0..nch_i {
+                let pdc = c.pd.0.add((e * nch_i + ci) * hidden);
+                for o in o0..o1 { *oe.add(o) += *pdc.add(o); }
+            }
+        }
+        done += 1;
+    }
+    lap!(&moetime::RC_US);
+    if let Some(eng) = c.eng { if wid < eng.len() { eng[wid].fetch_add(done, Ordering::Relaxed); } }
+}
+
+/// Build the ctx fields shared by the pool and scoped native work-steal entry points.
+#[allow(clippy::too_many_arguments)]
+fn native_ws_ctx<'a>(experts: &'a [NativeExpert<'a>], x: &'a [f32], hidden: usize, inter: usize,
+                     nch_h: usize, nch_i: usize, k: usize, nbar: usize, eng: Option<&'a [AtomicUsize]>,
+                     pg: &mut [f32], pu: &mut [f32], pd: &mut [f32],
+                     g: &mut [f32], u: &mut [f32], act: &mut [f32], out: &mut [f32]) -> NativeWsCtx<'a> {
+    NativeWsCtx {
+        experts, x, hidden, inter, nch_h, nch_i, k,
+        ra_per: (inter + RED_CHUNK - 1) / RED_CHUNK, rc_per: (hidden + RED_CHUNK - 1) / RED_CHUNK,
+        ctr_a: AtomicUsize::new(0), ctr_ra: AtomicUsize::new(0), ctr_c: AtomicUsize::new(0), ctr_rc: AtomicUsize::new(0),
+        bar: PhaseBar::new(nbar, cpu_spin()), eng,
+        pg: RawF32(pg.as_mut_ptr()), pu: RawF32(pu.as_mut_ptr()), pd: RawF32(pd.as_mut_ptr()),
+        g: RawF32(g.as_mut_ptr()), u: RawF32(u.as_mut_ptr()), act: RawF32(act.as_mut_ptr()), out: RawF32(out.as_mut_ptr()),
+    }
+}
+
+/// Persistent per-thread scratch for the native work-steal, reused across the ~58 MoE calls/token so
+/// the ~5.5 MB of partial/reduce buffers are allocated + faulted in ONCE, not per layer (the ~138 ms
+/// per-call overhead session-4 flagged was mostly this malloc + first-touch fault). Only the partials
+/// pg/pu/pd are re-zeroed each call (phase A accumulates into them); g/u/act/out are fully overwritten
+/// by RA/RC so they keep stale bytes harmlessly. Determinism is unchanged (same buffers, same math).
+#[derive(Default)]
+struct WsScratch { pg: Vec<f32>, pu: Vec<f32>, pd: Vec<f32>, g: Vec<f32>, u: Vec<f32>, act: Vec<f32>, out: Vec<f32> }
+impl WsScratch {
+    fn ready(&mut self, k: usize, nch_h: usize, nch_i: usize, inter: usize, hidden: usize) {
+        let (a, d, e) = (k * nch_h * inter, k * nch_i * hidden, k * inter);
+        // NO .clear(): resize is a no-op at steady size, so pg/pu/pd are not re-memset serially each
+        // call (the PREP wall); the workers zero their own slot in parallel (native_ws_worker phase A/C).
+        self.pg.resize(a, 0.0); self.pu.resize(a, 0.0); self.pd.resize(d, 0.0);
+        self.g.resize(e, 0.0); self.u.resize(e, 0.0); self.act.resize(e, 0.0); self.out.resize(k * hidden, 0.0);
+    }
+}
+thread_local! { static WS_SCRATCH: std::cell::RefCell<WsScratch> = std::cell::RefCell::new(WsScratch::default()); }
+
+/// Native-path routed MoE sum with ONE phased work-steal over ALL (expert, proj, input-chunk) tasks
+/// per call, on the persistent pool -- replacing the per-GEMV pool dispatch (`routed_experts_native`
+/// issued 3*k dispatches/layer; at 671B that was ~1392/token, most with too few chunks to fill the
+/// workers). Bit-identical to [`routed_experts_native`]: same input-chunk decomposition, same
+/// fixed-order partial reduction, same fixed expert-order combine -- so it is deterministic and
+/// thread-count invariant. `acc_out` (len `hidden`) is overwritten.
+pub fn routed_experts_native_worksteal(x: &[f32], experts: &[NativeExpert], hidden: usize, inter: usize, acc_out: &mut [f32]) {
+    let p = pool();
+    let k = experts.len();
+    for v in acc_out.iter_mut().take(hidden) { *v = 0.0; }
+    if k == 0 { return; }
+    if p.n <= 1 { routed_experts_native(x, experts, hidden, inter, acc_out); return; }
+    let nch_h = (hidden + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+    let nch_i = (inter + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+    let eng_vec: Vec<AtomicUsize> = if engage_debug() { (0..p.n).map(|_| AtomicUsize::new(0)).collect() } else { Vec::new() };
+    let eng = if engage_debug() { Some(eng_vec.as_slice()) } else { None };
+    WS_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        s.ready(k, nch_h, nch_i, inter, hidden);
+        let WsScratch { pg, pu, pd, g, u, act, out } = &mut *s;
+        let ctx = native_ws_ctx(experts, x, hidden, inter, nch_h, nch_i, k, p.n, eng,
+            pg, pu, pd, g, u, act, out);
+        p.run(&|| native_ws_worker(&ctx));
+        if engage_debug() {
+            // Print ONE representative distribution (not per-call, which would flood a decode).
+            static PRINTED: OnceLock<()> = OnceLock::new();
+            PRINTED.get_or_init(|| {
+                let counts: Vec<usize> = eng_vec.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+                let active = counts.iter().filter(|&&c| c > 0).count();
+                let (mn, mx) = (counts.iter().copied().min().unwrap_or(0), counts.iter().copied().max().unwrap_or(0));
+                let total: usize = counts.iter().sum();
+                eprintln!("[cpu_engage] workers={} active={active} tasks_total={total} per-worker min={mn} max={mx} spin={} dist={:?}",
+                          p.n, cpu_spin(), counts);
+            });
+        }
+        // Fixed expert-order weighted combine (single thread).
+        for (e, ex) in experts.iter().enumerate() {
+            let (w, base) = (ex.weight, e * hidden);
+            for i in 0..hidden { acc_out[i] += w * out[base + i]; }
+        }
+    });
+}
+
+/// Thread-count-explicit twin of [`routed_experts_native_worksteal`] (scoped spawn instead of the
+/// persistent pool), so the determinism harness can prove the result is BITWISE identical across
+/// worker counts. Same phases/reductions -> `worker_threads` only changes which core runs a task.
+pub fn routed_experts_native_worksteal_nt(x: &[f32], experts: &[NativeExpert], hidden: usize, inter: usize, acc_out: &mut [f32], worker_threads: usize) {
+    let k = experts.len();
+    for v in acc_out.iter_mut().take(hidden) { *v = 0.0; }
+    if k == 0 { return; }
+    let nch_h = (hidden + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+    let nch_i = (inter + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+    let nthreads = worker_threads.max(1).min((k * 2 * nch_h).max(k * nch_i).max(1));
+    if nthreads <= 1 { routed_experts_native(x, experts, hidden, inter, acc_out); return; }
+    let mut pg = vec![0f32; k * nch_h * inter];
+    let mut pu = vec![0f32; k * nch_h * inter];
+    let mut pd = vec![0f32; k * nch_i * hidden];
+    let mut g = vec![0f32; k * inter];
+    let mut u = vec![0f32; k * inter];
+    let mut act = vec![0f32; k * inter];
+    let mut out = vec![0f32; k * hidden];
+    let ctx = native_ws_ctx(experts, x, hidden, inter, nch_h, nch_i, k, nthreads, None,
+        &mut pg, &mut pu, &mut pd, &mut g, &mut u, &mut act, &mut out);
+    thread::scope(|s| {
+        for _ in 0..nthreads { let ctx = &ctx; s.spawn(move || native_ws_worker(ctx)); }
+    });
+    for (e, ex) in experts.iter().enumerate() {
+        let (w, base) = (ex.weight, e * hidden);
+        for i in 0..hidden { acc_out[i] += w * out[base + i]; }
+    }
+}
+
+// ============================================================================
+// lut8 END-TO-END int8 work-steal (deliverable C increment 4). Same phase skeleton as the f32
+// work-steal, but the decode is the int8 vpshufb kernel: codebooks are recoded+transposed to int8
+// per expert (small, one-time per call), the activation is quantized to int8 per GEMV, phases A/C
+// accumulate INT32 partials, and the reductions (RA/RC) fold in the rescale (xs * scale[o]). An extra
+// per-expert phase Q quantizes the SiLU output before the down GEMV (its scale spans the whole vector).
+// Integer partials -> deterministic and thread-invariant; result matches the f32 path within the
+// measured int8 tolerance (~0.5%/GEMV). Activated by TRAPETUM_CPU_KERNEL=lut8; the f32 path untouched.
+// ============================================================================
+struct RawI32(*mut i32);
+unsafe impl Send for RawI32 {}
+unsafe impl Sync for RawI32 {}
+struct RawI8(*mut i8);
+unsafe impl Send for RawI8 {}
+unsafe impl Sync for RawI8 {}
+
+/// Per-expert int8 codebooks (transposed to `[oc,16]`) + per-column scales, borrowed from the cache.
+struct ExpertI8<'a> {
+    gp: &'a [u8], g_t: &'a [i8], gs: &'a [f32],
+    up: &'a [u8], u_t: &'a [i8], us: &'a [f32],
+    dp: &'a [u8], d_t: &'a [i8], ds: &'a [f32],
+    weight: f32,
+}
+
+/// Owned int8-recoded+transposed codebooks for one routed expert. Cached ONCE (see `cached_recode`)
+/// and reused across every MoE call -- session 5 showed the transpose delivered (per-core atom
+/// 0.66 -> 3.3 GB/s) but the win was masked by re-doing this recode+transpose for all picked experts
+/// EVERY call (~464/token, ~710 ms). Hoisting it here (lazy-once) is the last increment to ~2 tok/s.
+struct ExpertI8Cb { g_t: Vec<i8>, gs: Vec<f32>, u_t: Vec<i8>, us: Vec<f32>, d_t: Vec<i8>, ds: Vec<f32> }
+
+/// Lazily recode+transpose an expert's int8 codebooks, cached by the (stable, model-lifetime) gate-
+/// codebook pointer. First touch per expert only; ~150 MB total at 671B (58*256*3 small mats).
+fn cached_recode(e: &NativeExpert, hidden: usize, inter: usize) -> std::sync::Arc<ExpertI8Cb> {
+    use std::collections::HashMap;
+    static CACHE: OnceLock<Mutex<HashMap<usize, std::sync::Arc<ExpertI8Cb>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = e.gc.as_ptr() as usize;
+    if let Some(a) = cache.lock().unwrap().get(&key) { return a.clone(); }
+    let (gi, gs) = recode_codebook_i8(e.gc, inter);
+    let (ui, us) = recode_codebook_i8(e.uc, inter);
+    let (di, ds) = recode_codebook_i8(e.dc, hidden);
+    let a = std::sync::Arc::new(ExpertI8Cb {
+        g_t: transpose_codebook_i8(&gi, inter), gs,
+        u_t: transpose_codebook_i8(&ui, inter), us,
+        d_t: transpose_codebook_i8(&di, hidden), ds });
+    cache.lock().unwrap().insert(key, a.clone());
+    a
+}
+
+/// Populate the lut8 codebook cache for ALL of a layer's routed experts ONCE (parallel over the
+/// pool), so the decode never pays a recode MISS at runtime. The lazy cache otherwise warms over
+/// ~tens of tokens (thousands of expert-instances), and the still-cold picks were the ~190 ms/token
+/// "setup" wall session-5 exposed. Call at first CPU forward per block; ~150 MB total, one-time.
+pub fn prewarm_lut8_cache(experts: &[NativeExpert], hidden: usize, inter: usize) {
+    let ep: &[NativeExpert] = experts;
+    parallel_for(experts.len(), &|i| { let _ = cached_recode(&ep[i], hidden, inter); });
+}
+
+/// int8-quantize a vector: `(xq, xs)` with `xs = max|v|/127`.
+fn quantize_i8(v: &[f32]) -> (Vec<i8>, f32) {
+    let mut mx = 0f32; for &a in v { mx = mx.max(a.abs()); }
+    let xs = if mx > 0.0 { mx / 127.0 } else { 1.0 };
+    (v.iter().map(|&a| (a / xs).round().clamp(-127.0, 127.0) as i8).collect(), xs)
+}
+
+/// int8 decode: AVX2 vpshufb lut8 where present, else the scalar int8 reference. Both accumulate
+/// int32 into `acc` and are bit-identical (integer, order-free).
+#[inline]
+fn accumulate_i8_dispatch(packed: &[u8], cb_i8_t: &[i8], oc: usize, xq: &[i8], acc: &mut [i32], i0: usize, i1: usize) {
+    #[cfg(target_arch = "x86_64")]
+    { if is_x86_feature_detected!("avx2") { unsafe { accumulate_lut8_avx2(packed, cb_i8_t, oc, xq, acc, i0, i1); } return; } }
+    accumulate_i8_t(packed, cb_i8_t, oc, xq, acc, i0, i1);
+}
+
+struct Lut8Ctx<'a> {
+    experts: &'a [ExpertI8<'a>],
+    xq_x: &'a [i8], xs_x: f32,
+    hidden: usize, inter: usize, nch_h: usize, nch_i: usize, k: usize, ra_per: usize, rc_per: usize,
+    ctr_a: AtomicUsize, ctr_ra: AtomicUsize, ctr_q: AtomicUsize, ctr_c: AtomicUsize, ctr_rc: AtomicUsize,
+    bar: PhaseBar,
+    pg: RawI32, pu: RawI32, pd: RawI32,
+    g: RawF32, u: RawF32, act: RawF32, out: RawF32,
+    xq_act: RawI8, xs_act: RawF32,
+}
+unsafe impl Sync for Lut8Ctx<'_> {}
+
+fn lut8_worker(c: &Lut8Ctx) {
+    let (nch_h, nch_i, inter, hidden, k) = (c.nch_h, c.nch_i, c.inter, c.hidden, c.k);
+    // TRAPETUM_MOE_TIMING also covers the lut8 path (the gap session-4 flagged): Phase Q (int8
+    // quantize of the SiLU output, lut8-only) folds into the RA bucket.
+    let tm = moetime::on();
+    let mut ph = if tm { Some(std::time::Instant::now()) } else { None };
+    macro_rules! lap { ($a:expr) => { if let Some(t) = ph { moetime::add($a, t.elapsed().as_micros() as u64); ph = Some(std::time::Instant::now()); } }; }
+    // Phase A: gate+up int8 decode -> int32 partials.
+    let na = k * 2 * nch_h;
+    loop {
+        let t = c.ctr_a.fetch_add(1, Ordering::Relaxed);
+        if t >= na { break; }
+        let (e, rr) = (t / (2 * nch_h), t % (2 * nch_h));
+        let (which, ci) = (rr / nch_h, rr % nch_h);
+        let (i0, i1) = (ci * NATIVE_CHUNK_I, ((ci + 1) * NATIVE_CHUNK_I).min(hidden));
+        let ex = &c.experts[e];
+        let (packed, cb_t, base) = if which == 0 { (ex.gp, ex.g_t, &c.pg) } else { (ex.up, ex.u_t, &c.pu) };
+        let slot = unsafe { std::slice::from_raw_parts_mut(base.0.add((e * nch_h + ci) * inter), inter) };
+        for v in slot.iter_mut() { *v = 0; } // parallel per-slot zero (moved off the serial PREP memset)
+        accumulate_i8_dispatch(packed, cb_t, inter, c.xq_x, slot, i0, i1);
+    }
+    lap!(&moetime::A_US);
+    c.bar.wait();
+    // Phase RA: reduce gate/up int32 partials + rescale (xs_x*scale) + SiLU, per (expert, o-chunk).
+    let nra = k * c.ra_per;
+    loop {
+        let t = c.ctr_ra.fetch_add(1, Ordering::Relaxed);
+        if t >= nra { break; }
+        let (e, oc) = (t / c.ra_per, t % c.ra_per);
+        let (o0, o1) = (oc * RED_CHUNK, ((oc + 1) * RED_CHUNK).min(inter));
+        let ex = &c.experts[e];
+        unsafe {
+            let (ge, ue, acte) = (c.g.0.add(e * inter), c.u.0.add(e * inter), c.act.0.add(e * inter));
+            for o in o0..o1 {
+                let (mut sg, mut su) = (0i32, 0i32);
+                for ci in 0..nch_h {
+                    sg += *c.pg.0.add((e * nch_h + ci) * inter + o);
+                    su += *c.pu.0.add((e * nch_h + ci) * inter + o);
+                }
+                let gv = c.xs_x * ex.gs[o] * sg as f32;
+                let uv = c.xs_x * ex.us[o] * su as f32;
+                *ge.add(o) = gv; *ue.add(o) = uv;
+                *acte.add(o) = silu(gv) * uv;
+            }
+        }
+    }
+    lap!(&moetime::RA_US);
+    c.bar.wait();
+    // Phase Q: quantize each expert's SiLU output to int8 (scale spans the whole vector).
+    loop {
+        let e = c.ctr_q.fetch_add(1, Ordering::Relaxed);
+        if e >= k { break; }
+        unsafe {
+            let acte = std::slice::from_raw_parts(c.act.0.add(e * inter), inter);
+            let (xq, xs) = quantize_i8(acte);
+            *c.xs_act.0.add(e) = xs;
+            let dst = c.xq_act.0.add(e * inter);
+            for o in 0..inter { *dst.add(o) = xq[o]; }
+        }
+    }
+    lap!(&moetime::RA_US); // fold the lut8-only quantize phase into RA
+    c.bar.wait();
+    // Phase C: down int8 decode -> int32 partials.
+    let nc = k * nch_i;
+    loop {
+        let t = c.ctr_c.fetch_add(1, Ordering::Relaxed);
+        if t >= nc { break; }
+        let (e, ci) = (t / nch_i, t % nch_i);
+        let (i0, i1) = (ci * NATIVE_CHUNK_I, ((ci + 1) * NATIVE_CHUNK_I).min(inter));
+        let ex = &c.experts[e];
+        let xq_act_e = unsafe { std::slice::from_raw_parts(c.xq_act.0.add(e * inter), inter) };
+        let slot = unsafe { std::slice::from_raw_parts_mut(c.pd.0.add((e * nch_i + ci) * hidden), hidden) };
+        for v in slot.iter_mut() { *v = 0; } // parallel per-slot zero (moved off the serial PREP memset)
+        accumulate_i8_dispatch(ex.dp, ex.d_t, hidden, xq_act_e, slot, i0, i1);
+    }
+    lap!(&moetime::C_US);
+    c.bar.wait();
+    // Phase RC: reduce down int32 partials + rescale (xs_act*scale), per (expert, o-chunk).
+    let nrc = k * c.rc_per;
+    loop {
+        let t = c.ctr_rc.fetch_add(1, Ordering::Relaxed);
+        if t >= nrc { break; }
+        let (e, oc) = (t / c.rc_per, t % c.rc_per);
+        let (o0, o1) = (oc * RED_CHUNK, ((oc + 1) * RED_CHUNK).min(hidden));
+        let ex = &c.experts[e];
+        unsafe {
+            let xs_act = *c.xs_act.0.add(e);
+            let oe = c.out.0.add(e * hidden);
+            for o in o0..o1 {
+                let mut s = 0i32;
+                for ci in 0..nch_i { s += *c.pd.0.add((e * nch_i + ci) * hidden + o); }
+                *oe.add(o) = xs_act * ex.ds[o] * s as f32;
+            }
+        }
+    }
+    lap!(&moetime::RC_US);
+}
+
+/// lut8 end-to-end routed MoE sum (TRAPETUM_CPU_KERNEL=lut8). Recodes codebooks to int8, quantizes
+/// activations, runs the int8 vpshufb decode through the phased work-steal, rescales in the reduces.
+/// Deterministic + thread-invariant (integer partials, fixed orders). Matches the f32 path within the
+/// int8 tolerance. `acc_out` (len `hidden`) overwritten. Falls back to the f32 path for k<=1 / no pool.
+/// Persistent per-thread scratch for the lut8 path (int32 partials + reduce/quantize buffers),
+/// reused across the ~58 MoE calls/token -- the same malloc+fault removal as the gather path
+/// (WsScratch), which the lut8 path had been paying every call (~5.5 MB, ~100 ms/token: the bulk
+/// of the ws_entry gap session-5 exposed). Only pg/pu/pd are re-zeroed (phase A accumulates).
+#[derive(Default)]
+struct Lut8Scratch { pg: Vec<i32>, pu: Vec<i32>, pd: Vec<i32>, g: Vec<f32>, u: Vec<f32>, act: Vec<f32>, out: Vec<f32>, xq_act: Vec<i8>, xs_act: Vec<f32> }
+impl Lut8Scratch {
+    fn ready(&mut self, k: usize, nch_h: usize, nch_i: usize, inter: usize, hidden: usize) {
+        let (a, d, e) = (k * nch_h * inter, k * nch_i * hidden, k * inter);
+        // NO .clear(): resize is a no-op at steady size (MoE dims are constant), so the ~5.4 MB int32
+        // partials are NOT re-memset single-threaded each call (the PREP wall). The workers zero their
+        // own pg/pu/pd slot in parallel (phase A/C) before accumulating -- same result, 32x the memset.
+        self.pg.resize(a, 0); self.pu.resize(a, 0); self.pd.resize(d, 0);
+        self.g.resize(e, 0.0); self.u.resize(e, 0.0); self.act.resize(e, 0.0);
+        self.out.resize(k * hidden, 0.0); self.xq_act.resize(e, 0); self.xs_act.resize(k, 0.0);
+    }
+}
+thread_local! { static LUT8_SCRATCH: std::cell::RefCell<Lut8Scratch> = std::cell::RefCell::new(Lut8Scratch::default()); }
+
+pub fn routed_experts_native_worksteal_lut8(x: &[f32], experts: &[NativeExpert], hidden: usize, inter: usize, acc_out: &mut [f32]) {
+    let p = pool();
+    let k = experts.len();
+    for v in acc_out.iter_mut().take(hidden) { *v = 0.0; }
+    if k == 0 { return; }
+    let tm = moetime::on();
+    let ts = std::time::Instant::now();
+    // Recode is CACHED per expert (lazy-once); x quantized once/call.
+    let cbs: Vec<std::sync::Arc<ExpertI8Cb>> = experts.iter().map(|e| cached_recode(e, hidden, inter)).collect();
+    if tm { moetime::add(&moetime::WS_RECODE_US, ts.elapsed().as_micros() as u64); }
+    let ei8: Vec<ExpertI8> = experts.iter().zip(&cbs).map(|(e, cb)| ExpertI8 {
+        gp: e.gp, g_t: &cb.g_t, gs: &cb.gs,
+        up: e.up, u_t: &cb.u_t, us: &cb.us,
+        dp: e.dp, d_t: &cb.d_t, ds: &cb.ds, weight: e.weight,
+    }).collect();
+    let tq = std::time::Instant::now();
+    let (xq_x, xs_x) = quantize_i8(&x[..hidden]);
+    if tm { moetime::add(&moetime::WS_QUANT_US, tq.elapsed().as_micros() as u64); }
+    let nch_h = (hidden + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+    let nch_i = (inter + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+    LUT8_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        s.ready(k, nch_h, nch_i, inter, hidden);
+        let Lut8Scratch { pg, pu, pd, g, u, act, out, xq_act, xs_act } = &mut *s;
+        let ctx = Lut8Ctx {
+            experts: &ei8, xq_x: &xq_x, xs_x, hidden, inter, nch_h, nch_i, k,
+            ra_per: (inter + RED_CHUNK - 1) / RED_CHUNK, rc_per: (hidden + RED_CHUNK - 1) / RED_CHUNK,
+            ctr_a: AtomicUsize::new(0), ctr_ra: AtomicUsize::new(0), ctr_q: AtomicUsize::new(0),
+            ctr_c: AtomicUsize::new(0), ctr_rc: AtomicUsize::new(0),
+            bar: PhaseBar::new(p.n, cpu_spin()),
+            pg: RawI32(pg.as_mut_ptr()), pu: RawI32(pu.as_mut_ptr()), pd: RawI32(pd.as_mut_ptr()),
+            g: RawF32(g.as_mut_ptr()), u: RawF32(u.as_mut_ptr()), act: RawF32(act.as_mut_ptr()), out: RawF32(out.as_mut_ptr()),
+            xq_act: RawI8(xq_act.as_mut_ptr()), xs_act: RawF32(xs_act.as_mut_ptr()),
+        };
+        if tm { moetime::add(&moetime::WS_SETUP_US, ts.elapsed().as_micros() as u64); }
+        let tr = std::time::Instant::now();
+        p.run(&|| lut8_worker(&ctx));
+        if tm { moetime::add(&moetime::WS_RUN_US, tr.elapsed().as_micros() as u64); }
+        let tc = std::time::Instant::now();
+        for (e, ex) in ei8.iter().enumerate() {
+            let (w, base) = (ex.weight, e * hidden);
+            for i in 0..hidden { acc_out[i] += w * out[base + i]; }
+        }
+        if tm { moetime::add(&moetime::WS_COMBINE_US, tc.elapsed().as_micros() as u64); }
+    });
 }
 
 #[cfg(test)]
@@ -984,6 +1967,26 @@ mod tests {
         let _ = (mism, worst);
     }
 
+    #[test]
+    fn gemv8_k256_matches_dequant_and_is_deterministic() {
+        // S19 increment 1: the K256 8-bit decode GEMV (gemv8) decodes uint8 indices against a
+        // per-column 256-entry codebook and matches a CPU reference that uses the GPU's exact
+        // fp16 codebook + fp16 activations -- so the only residual is float summation order.
+        // Also checks the path is bitwise run-to-run deterministic under the default (two-stage)
+        // mode. Two shapes: a wide small-OC (8192x512) and a shared-expert-shaped OC (2048x1408).
+        for (ic, oc) in [(8192usize, 512usize), (2048usize, 1408usize)] {
+            let (worst_rel, l2, mism) = crate::check_gpu_gemv8_vs_ref(ic, oc, 10);
+            let mode = std::env::var("TRAPETUM_DETERMINISTIC").unwrap_or_else(|_| "2(default)".into());
+            eprintln!("[gemv8_k256 ic={ic} oc={oc} mode={mode}] vs fp16cb-ref: worst_rel={worst_rel:e} l2={l2:e}; \
+                       determinism: {mism}/10 runs differ bitwise");
+            assert!(l2 < 5e-3, "K256 gemv8 vs fp16-codebook reference l2={l2:e} too large (ic={ic} oc={oc})");
+            // Under the default deterministic mode the path must be bitwise stable. If the env
+            // forces the atomic mode (=0) skip the determinism gate (atomics reorder by design).
+            let atomic = std::env::var("TRAPETUM_DETERMINISTIC").map(|v| v == "0").unwrap_or(false);
+            if !atomic { assert_eq!(mism, 0, "K256 gemv8 not deterministic under mode {mode} (ic={ic} oc={oc})"); }
+        }
+    }
+
     // Build k routed experts with RANDOM row-major packed + transposed codebooks (fast; we test
     // scheduling/timing, not decode accuracy). Returns (store, x) -- refs are built by the caller.
     fn rand_experts(hidden: usize, inter: usize, k: usize, seed: u64)
@@ -1037,6 +2040,280 @@ mod tests {
             for _ in 0..iters { routed_experts_worksteal_nt(&x, &experts, hidden, inter, &mut acc, nt); }
             let scope_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
             eprintln!("[pool_vs_scope {label}] hidden={hidden} inter={inter} k={k} threads={nt}: pool={pool_us:.1} us/call  scope={scope_us:.1} us/call  saved={:.1} us", scope_us - pool_us);
+        }
+    }
+
+    // Single-thread replica of gemv_cpu_native_det's math (same fixed chunks + fixed-order
+    // reduction) -- the deterministic reference the pooled version must equal BITWISE.
+    fn native_det_ref(packed: &[u8], cb: &[f32], oc: usize, ic: usize, x: &[f32]) -> Vec<f32> {
+        let nchunks = (ic + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+        let mut y = vec![0f32; oc];
+        if nchunks <= 1 { gemv_native_range(packed, cb, oc, x, &mut y, 0, ic); return y; }
+        let mut parts = vec![vec![0f32; oc]; nchunks];
+        for c in 0..nchunks {
+            let (i0, i1) = (c * NATIVE_CHUNK_I, ((c + 1) * NATIVE_CHUNK_I).min(ic));
+            gemv_native_range(packed, cb, oc, x, &mut parts[c], i0, i1);
+        }
+        for c in 0..nchunks { for o in 0..oc { y[o] += parts[c][o]; } }
+        y
+    }
+
+    #[test]
+    fn native_matches_dequant_and_is_deterministic() {
+        // The native input-major GEMV (no re-tile) matches the dequant reference to summation
+        // tolerance, and its pooled result is BIT-identical to the single-thread deterministic
+        // reference (fixed chunks + fixed-order reduce) -> thread-count-invariant by construction.
+        for (oc, ic) in [(256usize, 512usize), (64, 300), (512, 2048), (128, 4096)] {
+            let mut r = Lcg(0x0FF10AD5u64 ^ ((oc as u64) << 12) ^ ic as u64);
+            let w: Vec<f32> = (0..oc * ic).map(|_| r.f32()).collect();
+            let x: Vec<f32> = (0..ic).map(|_| r.f32()).collect();
+            let (packed, cb, w_dq) = quantize_host(&w, oc, ic);
+            let mut y = vec![0f32; oc];
+            gemv_cpu_native_det(&packed, &cb, oc, ic, &x, &mut y);
+            // (a) correctness vs dequant matmul (L2: worst-elt rel err blows up on near-zero
+            // outputs from the chunked reassociation; the true agreement is the L2 metric)
+            let reference = naive_matmul(&w_dq, oc, ic, &x);
+            let e = l2_rel(&y, &reference);
+            assert!(e < 1e-4, "native vs dequant matmul L2 rel err {e:e} at oc={oc} ic={ic}");
+            // (b) determinism: pooled == single-thread chunked reference, BITWISE
+            let det = native_det_ref(&packed, &cb, oc, ic, &x);
+            assert!(y.iter().zip(&det).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "native GEMV not bit-identical to the fixed-chunk reference at oc={oc} ic={ic}");
+        }
+    }
+
+    #[test]
+    fn native_expert_matches_reference() {
+        // Full native expert (gate/up/silu/down) vs a dequant f32 reference.
+        let (hidden, inter) = (512usize, 256usize);
+        let mut r = Lcg(0xA71_5713u64);
+        let gw: Vec<f32> = (0..inter * hidden).map(|_| r.f32() * 0.5).collect();
+        let uw: Vec<f32> = (0..inter * hidden).map(|_| r.f32() * 0.5).collect();
+        let dw: Vec<f32> = (0..hidden * inter).map(|_| r.f32() * 0.5).collect();
+        let x: Vec<f32> = (0..hidden).map(|_| r.f32()).collect();
+        let (gp, gc, g_dq) = quantize_host(&gw, inter, hidden);
+        let (up, uc, u_dq) = quantize_host(&uw, inter, hidden);
+        let (dp, dc, d_dq) = quantize_host(&dw, hidden, inter);
+        let mut y = vec![0f32; hidden];
+        expert_forward_native(&x, &gp, &gc, &up, &uc, &dp, &dc, hidden, inter, &mut y);
+        let g = naive_matmul(&g_dq, inter, hidden, &x);
+        let u = naive_matmul(&u_dq, inter, hidden, &x);
+        let act: Vec<f32> = (0..inter).map(|i| silu(g[i]) * u[i]).collect();
+        let reference = naive_matmul(&d_dq, hidden, inter, &act);
+        let e = l2_rel(&y, &reference);
+        assert!(e < 1e-4, "native expert vs reference L2 rel err {e:e}");
+    }
+
+    #[test]
+    fn native_worksteal_matches_sequential_and_is_thread_invariant() {
+        // Deliverable B lever 2: the single phased work-steal over all (expert, proj, input-chunk)
+        // tasks must be BIT-identical to the per-GEMV sequential native path AND invariant to the
+        // worker count -- same input-chunk decomposition, same fixed-order partial reduction, same
+        // fixed expert-order combine. V2-Lite-ish dims, random packed/codebooks (any bytes are valid
+        // indices; we test scheduling+reduction order, not decode values).
+        let (hidden, inter, k) = (2048usize, 1408usize, 6usize);
+        let mut r = Lcg(0xB17E_5713_u64);
+        let x: Vec<f32> = (0..hidden).map(|_| r.f32()).collect();
+        let bytes = |n: usize, r: &mut Lcg| -> Vec<u8> { (0..n).map(|_| ((r.f32() * 0.5 + 0.5) * 255.0) as u8).collect() };
+        let cbk = |n: usize, r: &mut Lcg| -> Vec<f32> { (0..n).map(|_| r.f32() * 0.05).collect() };
+        // NATIVE input-major packed: gate/up [hidden][inter/2] (oc=inter,ic=hidden); down [inter][hidden/2].
+        let mut store: Vec<(Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>, f32)> = Vec::new();
+        for e in 0..k {
+            store.push((bytes(hidden * (inter / 2), &mut r), cbk(K * inter, &mut r),
+                        bytes(hidden * (inter / 2), &mut r), cbk(K * inter, &mut r),
+                        bytes(inter * (hidden / 2), &mut r), cbk(K * hidden, &mut r), 0.1 + 0.13 * e as f32));
+        }
+        let experts: Vec<NativeExpert> = store.iter().map(|s| NativeExpert {
+            gp: &s.0, gc: &s.1, up: &s.2, uc: &s.3, dp: &s.4, dc: &s.5, weight: s.6,
+        }).collect();
+        let mut seq = vec![0f32; hidden];
+        routed_experts_native(&x, &experts, hidden, inter, &mut seq);
+        // pool path == sequential, bitwise
+        let mut pooled = vec![0f32; hidden];
+        routed_experts_native_worksteal(&x, &experts, hidden, inter, &mut pooled);
+        assert!(seq.iter().zip(&pooled).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "native worksteal (pool) not bit-identical to sequential native path");
+        // explicit worker counts == sequential, bitwise (thread-count invariant)
+        for nt in [1usize, 2, 4, 8, 16, 32] {
+            let mut got = vec![0f32; hidden];
+            routed_experts_native_worksteal_nt(&x, &experts, hidden, inter, &mut got, nt);
+            assert!(seq.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "native worksteal not bit-identical to sequential at {nt} workers");
+        }
+    }
+
+    #[test]
+    fn int8_recode_error_probe() {
+        // Deliverable C2 precision gate: how much error does the int8 path (int8 codebook + int8
+        // activation) add vs the EXACT f32 decode? Reports L2 rel error. Reference scale: the
+        // fp16-vs-f32 path we already accept is ~1e-3..1e-2. If int8 lands in that ballpark, C2's
+        // 47 GB/s ceiling is worth the SIMD kernel; if it blows up, C1 (exact vpermps) is the path.
+        for (oc, ic) in [(2048usize, 2048usize), (7168, 2048), (2048, 7168)] {
+            let mut r = Lcg(0x0C2E_5713u64 ^ ((oc as u64) << 7) ^ ic as u64);
+            let w: Vec<f32> = (0..oc * ic).map(|_| r.f32() * 0.5).collect();
+            let x: Vec<f32> = (0..ic).map(|_| r.f32()).collect();
+            let (packed, cb, _) = quantize_host(&w, oc, ic);
+            let mut yf = vec![0f32; oc];
+            super::gemv_native_range_scalar(&packed, &cb, oc, &x, &mut yf, 0, ic); // exact f32 decode
+            let (cb_i8, scale) = super::recode_codebook_i8(&cb, oc);
+            let mut yi = vec![0f32; oc];
+            super::gemv_native_i8(&packed, &cb_i8, &scale, oc, ic, &x, &mut yi);
+            let e = l2_rel(&yi, &yf);
+            eprintln!("[int8_recode_error oc={oc} ic={ic}] int8-path vs f32-decode L2 rel err = {e:.4e}");
+            assert!(e < 5e-2, "int8 path L2 rel err {e:e} too large at oc={oc} ic={ic}");
+        }
+    }
+
+    #[test]
+    fn lut8_worksteal_matches_f32_within_int8_tolerance() {
+        // Deliverable C-inc4: the end-to-end lut8 int8 work-steal (recode -> quantize -> int8 decode
+        // -> rescale) matches the f32 work-steal within the int8 tolerance. On the M4 the decode is
+        // the scalar int8 accumulate (no AVX2); on the box it is the vpshufb kernel (bit-exact to it),
+        // so this M4 test validates the STRUCTURE (scales, xs, rescale, phases) end-to-end. Realistic
+        // (quantize_host) codebooks so the int8 error is representative.
+        let (hidden, inter, k) = (2048usize, 1408usize, 6usize);
+        let mut r = Lcg(0x0148_5713u64);
+        let x: Vec<f32> = (0..hidden).map(|_| r.f32() * 0.5).collect();
+        // per expert: gate/up [inter][hidden], down [hidden][inter], quantized with the real k-means
+        let mut store = Vec::new();
+        for _ in 0..k {
+            let gw: Vec<f32> = (0..inter * hidden).map(|_| r.f32() * 0.5).collect();
+            let uw: Vec<f32> = (0..inter * hidden).map(|_| r.f32() * 0.5).collect();
+            let dw: Vec<f32> = (0..hidden * inter).map(|_| r.f32() * 0.5).collect();
+            let (gp, gc, _) = quantize_host(&gw, inter, hidden);
+            let (up, uc, _) = quantize_host(&uw, inter, hidden);
+            let (dp, dc, _) = quantize_host(&dw, hidden, inter);
+            store.push((gp, gc, up, uc, dp, dc, 0.15 + 0.1 * store.len() as f32));
+        }
+        let experts: Vec<NativeExpert> = store.iter().map(|s| NativeExpert {
+            gp: &s.0, gc: &s.1, up: &s.2, uc: &s.3, dp: &s.4, dc: &s.5, weight: s.6,
+        }).collect();
+        let mut yf = vec![0f32; hidden];
+        routed_experts_native_worksteal(&x, &experts, hidden, inter, &mut yf);
+        let mut yi = vec![0f32; hidden];
+        routed_experts_native_worksteal_lut8(&x, &experts, hidden, inter, &mut yi);
+        let e = l2_rel(&yi, &yf);
+        eprintln!("[lut8_worksteal] int8 end-to-end vs f32 work-steal L2 rel err = {e:.4e}");
+        assert!(e < 5e-2, "lut8 worksteal vs f32 L2 rel err {e:e} too large (int8 tolerance ~0.5%/GEMV compounded)");
+    }
+
+    #[test]
+    fn native_worksteal_engage_probe() {
+        // DIAGNOSTIC (deliverable C engagement): time the pooled native work-steal at V2-Lite dims
+        // and, under TRAPETUM_CPU_ENGAGE_DEBUG=1, print the per-worker task distribution; under
+        // TRAPETUM_CPU_SPIN=1, the phase barriers spin. Run on the M4 (where I can observe) with:
+        //   TRAPETUM_CPU_THREADS=8 TRAPETUM_CPU_ENGAGE_DEBUG=1 [TRAPETUM_CPU_SPIN=1] cargo test ... \
+        //     native_worksteal_engage_probe -- --nocapture
+        // No hard timing assert (machine-load sensitive); the numbers are the report.
+        let (hidden, inter, k) = (2048usize, 1408usize, 6usize);
+        let mut r = Lcg(0xE17A_9E31u64);
+        let x: Vec<f32> = (0..hidden).map(|_| r.f32()).collect();
+        let bytes = |n: usize, r: &mut Lcg| -> Vec<u8> { (0..n).map(|_| ((r.f32() * 0.5 + 0.5) * 255.0) as u8).collect() };
+        let cbk = |n: usize, r: &mut Lcg| -> Vec<f32> { (0..n).map(|_| r.f32() * 0.05).collect() };
+        let mut store: Vec<(Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>, f32)> = Vec::new();
+        for e in 0..k {
+            store.push((bytes(hidden * (inter / 2), &mut r), cbk(K * inter, &mut r),
+                        bytes(hidden * (inter / 2), &mut r), cbk(K * inter, &mut r),
+                        bytes(inter * (hidden / 2), &mut r), cbk(K * hidden, &mut r), 0.1 + 0.13 * e as f32));
+        }
+        let experts: Vec<NativeExpert> = store.iter().map(|s| NativeExpert {
+            gp: &s.0, gc: &s.1, up: &s.2, uc: &s.3, dp: &s.4, dc: &s.5, weight: s.6,
+        }).collect();
+        let mut acc = vec![0f32; hidden];
+        for _ in 0..20 { routed_experts_native_worksteal(&x, &experts, hidden, inter, &mut acc); } // warm
+        let iters = 200;
+        let t = std::time::Instant::now();
+        for _ in 0..iters { routed_experts_native_worksteal(&x, &experts, hidden, inter, &mut acc); }
+        let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        // routed bytes/call = k * 3 * hidden*inter/2 (gate+up+down packed, 4-bit)
+        let gbs = (k as f64 * 3.0 * hidden as f64 * inter as f64 / 2.0) / (ms * 1e-3) / 1e9;
+        eprintln!("[native_ws_probe] hidden={hidden} inter={inter} k={k} threads={} spin={} -> {ms:.3} ms/call, {gbs:.2} GB/s packed",
+                  crate::cpu_experts::cpu_threads(), cpu_spin());
+        let _ = acc;
+    }
+
+    #[test]
+    fn transpose16x16_wiring_is_a_true_transpose() {
+        // De-risk the 16x16 unpack-cascade WIRING on any arch (the SSE kernel is x86-only): model
+        // _mm_unpacklo/hi_epi{8,16,32,64} as byte permutations on [u8;16], run the SAME 4-stage
+        // cascade, and assert cols[c][t] == rows[t][c]. Proves the index arithmetic before the box.
+        type V = [u8; 16];
+        fn unpack(a: V, b: V, w: usize, hi: bool) -> V {
+            // interleave w-byte lanes from a and b; lo takes lanes 0..8/w*... i.e. the low half.
+            let mut o = [0u8; 16]; let lanes = 8 / w; let base = if hi { 8 } else { 0 };
+            for i in 0..lanes {
+                for x in 0..w { o[(2*i)*w + x] = a[base + i*w + x]; o[(2*i+1)*w + x] = b[base + i*w + x]; }
+            }
+            o
+        }
+        let mut rows = [[0u8; 16]; 16];
+        for t in 0..16 { for c in 0..16 { rows[t][c] = (t * 16 + c) as u8; } }
+        let mut a = [[0u8; 16]; 16];
+        for i in 0..8 { a[2*i] = unpack(rows[2*i], rows[2*i+1], 1, false); a[2*i+1] = unpack(rows[2*i], rows[2*i+1], 1, true); }
+        let mut b = [[0u8; 16]; 16];
+        for i in 0..4 { for k in 0..2 { b[4*i+k] = unpack(a[4*i+k], a[4*i+2+k], 2, false); b[4*i+2+k] = unpack(a[4*i+k], a[4*i+2+k], 2, true); } }
+        let mut cc = [[0u8; 16]; 16];
+        for i in 0..2 { for k in 0..4 { cc[8*i+k] = unpack(b[8*i+k], b[8*i+4+k], 4, false); cc[8*i+4+k] = unpack(b[8*i+k], b[8*i+4+k], 4, true); } }
+        let mut d = [[0u8; 16]; 16];
+        for k in 0..8 { d[k] = unpack(cc[k], cc[8+k], 8, false); d[8+k] = unpack(cc[k], cc[8+k], 8, true); }
+        // Each output register d[k] IS a full column (d[k][t] == rows[t][col] for a fixed col), but
+        // in bit-reversed register order. Compute the column each register holds and check it against
+        // the bit-reverse-4 table the kernel uses (LUT8_COL_OF_REG); also assert it's a permutation.
+        let mut col_of = [255usize; 16];
+        for k in 0..16 {
+            let c0 = (d[k][0]) as usize; // rows[0][c] = c, so d[k][0] names the column
+            for t in 0..16 { assert_eq!(d[k][t], (t*16 + c0) as u8, "d[{k}] is not a clean column"); }
+            col_of[k] = c0;
+        }
+        let mut seen = [false; 16];
+        for &c in &col_of { assert!(!seen[c], "not a permutation"); seen[c] = true; }
+        assert_eq!(col_of, super::LUT8_COL_OF_REG, "kernel's LUT8_COL_OF_REG must match the measured cascade permutation");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn lut8_matches_scalar_int8() {
+        // Deliverable C-inc3: the AVX2 lut8 (vpshufb value-LUT) accumulate must be BIT-EXACT to the
+        // scalar int8 accumulate -- integer math, so equality is exact regardless of order. This is
+        // the box's cheap correctness gate before any 671B perf run. ic=1000 exercises the tail.
+        if !is_x86_feature_detected!("avx2") { eprintln!("[lut8] no AVX2 here; skipping (runs on the box)"); return; }
+        for (oc, ic) in [(256usize, 512usize), (128, 1000), (2048, 320)] {
+            let mut r = Lcg(0x0107_8u64 ^ ((oc as u64) << 9) ^ ic as u64);
+            let packed: Vec<u8> = (0..ic * (oc / 2)).map(|_| ((r.f32() * 0.5 + 0.5) * 255.0) as u8).collect();
+            let cb_i8: Vec<i8> = (0..K * oc).map(|_| (r.f32() * 100.0) as i8).collect();
+            let xq: Vec<i8> = (0..ic).map(|_| (r.f32() * 100.0) as i8).collect();
+            let cb_t = super::transpose_codebook_i8(&cb_i8, oc);
+            let mut a1 = vec![0i32; oc];
+            super::accumulate_i8_t(&packed, &cb_t, oc, &xq, &mut a1, 0, ic);
+            let mut a2 = vec![0i32; oc];
+            unsafe { super::accumulate_lut8_avx2(&packed, &cb_t, oc, &xq, &mut a2, 0, ic); }
+            assert_eq!(a1, a2, "lut8 AVX2 != scalar int8 (bitwise) at oc={oc} ic={ic}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn native_simd_bit_exact_to_scalar() {
+        // Deliverable B lever 1: the AVX2 / AVX-512 decode-GEMV must be BITWISE equal to the scalar
+        // reference (independent per-column accumulators, mul-then-add not FMA, same i order). Runs
+        // only where the feature is present; team-lead runs this + the perf A/B on the x86 box.
+        for (oc, ic) in [(256usize, 512usize), (512, 300), (128, 1024), (2048, 256)] {
+            let mut r = Lcg(0x51D0_0AD5u64 ^ ((oc as u64) << 8) ^ ic as u64);
+            let packed: Vec<u8> = (0..ic * (oc / 2)).map(|_| ((r.f32() * 0.5 + 0.5) * 255.0) as u8).collect();
+            let cb: Vec<f32> = (0..K * oc).map(|_| r.f32() * 0.05).collect();
+            let x: Vec<f32> = (0..ic).map(|_| r.f32()).collect();
+            let mut sc = vec![0f32; oc];
+            super::gemv_native_range_scalar(&packed, &cb, oc, &x, &mut sc, 0, ic);
+            if is_x86_feature_detected!("avx2") {
+                let mut v = vec![0f32; oc];
+                unsafe { super::gemv_native_range_avx2(&packed, &cb, oc, &x, &mut v, 0, ic); }
+                assert!(sc.iter().zip(&v).all(|(a, b)| a.to_bits() == b.to_bits()), "AVX2 != scalar bitwise at oc={oc} ic={ic}");
+            }
+            if is_x86_feature_detected!("avx512f") && oc % 16 == 0 {
+                let mut v = vec![0f32; oc];
+                unsafe { super::gemv_native_range_avx512(&packed, &cb, oc, &x, &mut v, 0, ic); }
+                assert!(sc.iter().zip(&v).all(|(a, b)| a.to_bits() == b.to_bits()), "AVX512 != scalar bitwise at oc={oc} ic={ic}");
+            }
         }
     }
 
