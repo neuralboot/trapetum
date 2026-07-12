@@ -1143,8 +1143,22 @@ fn mmap_skip(r: &mut BufReader<File>, mmap: &Arc<memmap2::Mmap>, len: usize) -> 
 /// into ONE anonymous 2 MB-huge-page arena, bypassing the page cache (no double memory), so their
 /// address space is ~512x fewer PTEs than the 4 KB file mmap -- killing the page-walk pressure that
 /// is the suspected MoE wall. Pure storage relocation: same bytes, no arithmetic change.
+/// MemAvailable from /proc/meminfo (bytes) -- the kernel's own estimate of what can be allocated
+/// without reclaim/swap. Used by the F2 free-RAM guard so a too-big arena aborts instead of wedging.
 #[cfg(all(target_os = "linux", any(feature = "cuda", feature = "metal")))]
-struct AnonStager { arena: Arc<memmap2::MmapMut>, cursor: usize, od: File, bounce: memmap2::MmapMut }
+fn mem_available_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+#[cfg(all(target_os = "linux", any(feature = "cuda", feature = "metal")))]
+struct AnonStager { arena: Arc<memmap2::MmapMut>, cursor: usize, od: File, bounce: memmap2::MmapMut, reported: usize }
 #[cfg(all(target_os = "linux", any(feature = "cuda", feature = "metal")))]
 impl AnonStager {
     fn new(path: &str, total: usize) -> std::io::Result<Self> {
@@ -1154,7 +1168,7 @@ impl AnonStager {
         let _ = arena.advise(memmap2::Advice::HugePage); // ask for 2 MB pages (advise takes &self)
         let od = std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(path)?;
         let bounce = memmap2::MmapMut::map_anon(16 << 20)?; // reusable page-aligned O_DIRECT bounce
-        Ok(Self { arena: Arc::new(arena), cursor: 0, od, bounce })
+        Ok(Self { arena: Arc::new(arena), cursor: 0, od, bounce, reported: 0 })
     }
     /// O_DIRECT-read `len` bytes at `r`'s current position into the arena, advance `r` past them,
     /// return an `Anon` slice. O_DIRECT needs 4 KB-aligned offset+len+buffer, so read the aligned
@@ -1172,6 +1186,10 @@ impl AnonStager {
         // Sound: single-threaded during load; the Arc<MmapMut> readers (as_slice) come strictly after.
         unsafe { std::ptr::copy_nonoverlapping(self.bounce.as_ptr().add(skip), (self.arena.as_ptr() as *mut u8).add(dst), len); }
         self.cursor += len;
+        if self.cursor - self.reported >= 32 << 30 { // progress every 32 GB so a slow stage isn't silent
+            eprintln!("[anon_thp] staged {} / {} GB", self.cursor >> 30, self.arena.len() >> 30);
+            self.reported = self.cursor;
+        }
         Ok(PackedBytes::Anon(self.arena.clone(), dst, len))
     }
 }
@@ -3953,7 +3971,21 @@ impl DeepSeekModel {
         if experts_avq == 0 && std::env::var("TRAPETUM_EXPERTS_ANON_THP").map(|v| v == "1").unwrap_or(false) {
             let per = 2 * (hidden * (moe_inter / 2)) + moe_inter * (hidden / 2);
             let total = n_layers.saturating_sub(first_k_dense) * n_routed * per;
-            eprintln!("[anon_thp] staging {total} routed-expert bytes into an anon huge-page arena via O_DIRECT (this reads the routed bulk once)...");
+            // SAFETY (F2 killed a box): allocating the arena while the file's ~336 GB is still cached
+            // wedges the kernel in direct reclaim. Drop the mapping's page cache FIRST, then guard on
+            // MemAvailable and abort LOUDLY rather than wedge if the arena + headroom won't fit.
+            // unchecked_advise(DontNeed) is sound here: the mapping is read-only + file-backed, so
+            // dropped pages simply re-fault from disk on any later access (no dirty data to lose).
+            let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+            if let Some(avail) = mem_available_bytes() {
+                let need = total as u64 + (16u64 << 30); // 16 GB headroom for the pool/GPU/rest
+                assert!(need <= avail,
+                    "TRAPETUM_EXPERTS_ANON_THP: arena needs ~{} GB + headroom but only {} GB available \
+                     after dropping the file cache -- refusing to wedge the box. Use a bigger host, or \
+                     `echo 1 > /proc/sys/vm/drop_caches` first, or leave anon-THP off (mmap path is safe).",
+                    total >> 30, avail >> 30);
+            }
+            eprintln!("[anon_thp] cache dropped; staging {} GB routed experts into an anon huge-page arena via O_DIRECT...", total >> 30);
             stager = Some(AnonStager::new(path, total)?);
         }
         macro_rules! rp { ($len:expr) => {{
