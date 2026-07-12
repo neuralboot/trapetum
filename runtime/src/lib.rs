@@ -1139,6 +1139,43 @@ fn mmap_skip(r: &mut BufReader<File>, mmap: &Arc<memmap2::Mmap>, len: usize) -> 
     Ok(PackedBytes::Mmap(mmap.clone(), off, len))
 }
 
+/// Deliverable F2 (TRAPETUM_EXPERTS_ANON_THP=1): O_DIRECT-stage the routed experts' packed indices
+/// into ONE anonymous 2 MB-huge-page arena, bypassing the page cache (no double memory), so their
+/// address space is ~512x fewer PTEs than the 4 KB file mmap -- killing the page-walk pressure that
+/// is the suspected MoE wall. Pure storage relocation: same bytes, no arithmetic change.
+#[cfg(all(target_os = "linux", any(feature = "cuda", feature = "metal")))]
+struct AnonStager { arena: Arc<memmap2::MmapMut>, cursor: usize, od: File, bounce: memmap2::MmapMut }
+#[cfg(all(target_os = "linux", any(feature = "cuda", feature = "metal")))]
+impl AnonStager {
+    fn new(path: &str, total: usize) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_DIRECT: i32 = 0x4000; // Linux O_DIRECT
+        let mut arena = memmap2::MmapMut::map_anon(total)?;
+        let _ = arena.advise(memmap2::Advice::HugePage); // ask for 2 MB pages
+        let od = std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(path)?;
+        let bounce = memmap2::MmapMut::map_anon(16 << 20)?; // reusable page-aligned O_DIRECT bounce
+        Ok(Self { arena: Arc::new(arena), cursor: 0, od, bounce })
+    }
+    /// O_DIRECT-read `len` bytes at `r`'s current position into the arena, advance `r` past them,
+    /// return an `Anon` slice. O_DIRECT needs 4 KB-aligned offset+len+buffer, so read the aligned
+    /// superset into the page-aligned bounce and copy the exact sub-range into the arena. (Routed
+    /// experts are never at EOF -- shared expert / lm_head follow -- so the aligned span is in-file.)
+    fn stage(&mut self, r: &mut BufReader<File>, len: usize) -> std::io::Result<PackedBytes> {
+        use std::os::unix::fs::FileExt;
+        let off = r.stream_position()?;
+        r.seek(SeekFrom::Current(len as i64))?;
+        let (a0, a1) = (off & !4095, (off + len as u64 + 4095) & !4095);
+        let span = (a1 - a0) as usize;
+        if span > self.bounce.len() { self.bounce = memmap2::MmapMut::map_anon(span)?; }
+        self.od.read_exact_at(&mut self.bounce[..span], a0)?;
+        let (skip, dst) = ((off - a0) as usize, self.cursor);
+        // Sound: single-threaded during load; the Arc<MmapMut> readers (as_slice) come strictly after.
+        unsafe { std::ptr::copy_nonoverlapping(self.bounce.as_ptr().add(skip), (self.arena.as_ptr() as *mut u8).add(dst), len); }
+        self.cursor += len;
+        Ok(PackedBytes::Anon(self.arena.clone(), dst, len))
+    }
+}
+
 /// Block until all queued GPU work completes (call before stopping a timer).
 pub fn sync() {
     unsafe { dev_sync() };
@@ -2477,6 +2514,10 @@ mod moe_cpu_tests {
 pub enum PackedBytes {
     Owned(Vec<u8>),
     Mmap(Arc<memmap2::Mmap>, usize, usize), // (mmap, byte offset, byte length)
+    /// Deliverable F2: a slice of the shared anonymous huge-page arena the routed experts were
+    /// O_DIRECT-read into (TRAPETUM_EXPERTS_ANON_THP=1). 2 MB pages -> ~512x fewer PTEs than the
+    /// 4 KB file mmap, killing the page-walk pressure that is the suspected MoE wall. Same bytes.
+    Anon(Arc<memmap2::MmapMut>, usize, usize), // (arena, byte offset, byte length)
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -2485,6 +2526,7 @@ impl PackedBytes {
         match self {
             PackedBytes::Owned(v) => v.as_slice(),
             PackedBytes::Mmap(m, off, len) => &m[*off..*off + *len],
+            PackedBytes::Anon(m, off, len) => &m[*off..*off + *len],
         }
     }
 
@@ -3867,6 +3909,23 @@ impl DeepSeekModel {
         // under memory pressure), which is the actual "stream experts from storage" behavior.
         // Safety: the file is a static export artifact, not mutated while the model is loaded.
         let mmap = Arc::new(unsafe { memmap2::Mmap::map(&File::open(path)?)? });
+        // Deliverable F1 (opportunistic huge pages): the routed experts are scattered ~22 MB regions
+        // across a ~350 GB mapping, so page-walks over the ~90 M-PTE 4 KB-page table are the suspected
+        // MoE wall. TRAPETUM_MMAP_ADVISE={hugepage,random,sequential} madvises the whole mapping;
+        // hugepage asks khugepaged to collapse to 2 MB pages (cuts PTEs ~512x) IF the kernel supports
+        // read-only file-THP -- purely a paging hint, no arithmetic change. The GUARANTEED variant is
+        // TRAPETUM_EXPERTS_ANON_THP=1 (see below). Linux-only; a no-op elsewhere.
+        #[cfg(target_os = "linux")]
+        {
+            let adv = std::env::var("TRAPETUM_MMAP_ADVISE").unwrap_or_default();
+            let a = match adv.as_str() {
+                "hugepage" => Some(memmap2::Advice::HugePage),
+                "random" => Some(memmap2::Advice::Random),
+                "sequential" => Some(memmap2::Advice::Sequential),
+                _ => None,
+            };
+            if let Some(a) = a { let _ = mmap.advise(a); eprintln!("[mmap_advise] applied MADV {adv} to the {}-byte mapping", mmap.len()); }
+        }
         // Header is 18 i32 for CBKR (byte-identical to the original scalar format) or 19 i32 for
         // CBKV, where the trailing field is `experts_avq` (2 or 3 = additive CBKA routed experts
         // at that M). Everything else (attention, dense FFN, shared expert, router, lm_head) stays
@@ -3884,6 +3943,25 @@ impl DeepSeekModel {
         let inv_freq = rd_f32_vec(&mut r, rope/2);
         let embedding = rd_f16_vec(&mut r, vocab*hidden);
         let qdim = n_heads*(nope+rope);
+        // Deliverable F2: optionally O_DIRECT-stage all routed-expert packed indices into one anon
+        // huge-page arena (TRAPETUM_EXPERTS_ANON_THP=1; scalar CBKR only). Sized to the exact routed
+        // packed footprint so there is no double memory. `rp!(len)` below routes each packed read
+        // through the stager when present, else the zero-copy mmap_skip.
+        #[cfg(target_os = "linux")]
+        let mut stager: Option<AnonStager> = None;
+        #[cfg(target_os = "linux")]
+        if experts_avq == 0 && std::env::var("TRAPETUM_EXPERTS_ANON_THP").map(|v| v == "1").unwrap_or(false) {
+            let per = 2 * (hidden * (moe_inter / 2)) + moe_inter * (hidden / 2);
+            let total = n_layers.saturating_sub(first_k_dense) * n_routed * per;
+            eprintln!("[anon_thp] staging {total} routed-expert bytes into an anon huge-page arena via O_DIRECT (this reads the routed bulk once)...");
+            stager = Some(AnonStager::new(path, total)?);
+        }
+        macro_rules! rp { ($len:expr) => {{
+            #[cfg(target_os = "linux")]
+            { match stager.as_mut() { Some(s) => s.stage(&mut r, $len)?, None => mmap_skip(&mut r, &mmap, $len)? } }
+            #[cfg(not(target_os = "linux"))]
+            { mmap_skip(&mut r, &mmap, $len)? }
+        }}; }
         let mut layers = Vec::with_capacity(n_layers);
         for li in 0..n_layers {
             let attn_norm = rd_f32_vec(&mut r, hidden);
@@ -3908,13 +3986,13 @@ impl DeepSeekModel {
                 let mut hosts: Vec<ExpertHost> = Vec::with_capacity(n_routed);
                 for _ in 0..n_routed {
                     if experts_avq == 0 {
-                        // 4-bit scalar: packed indices SKIP (seek past, record the mmap byte
-                        // range); the tiny codebooks are read into RAM as before.
-                        let gp = mmap_skip(&mut r, &mmap, hidden * (moe_inter / 2))?;
+                        // 4-bit scalar: packed indices are mmap-skipped (zero copy) OR O_DIRECT-staged
+                        // into the anon huge-page arena (F2); the tiny codebooks are read into RAM.
+                        let gp = rp!(hidden * (moe_inter / 2));
                         let gc = rd_f32_vec(&mut r, K * moe_inter);
-                        let up = mmap_skip(&mut r, &mmap, hidden * (moe_inter / 2))?;
+                        let up = rp!(hidden * (moe_inter / 2));
                         let uc = rd_f32_vec(&mut r, K * moe_inter);
-                        let dp = mmap_skip(&mut r, &mmap, moe_inter * (hidden / 2))?;
+                        let dp = rp!(moe_inter * (hidden / 2));
                         let dc = rd_f32_vec(&mut r, K * hidden);
                         hosts.push(ExpertHost::Scalar { gp, gc, up, uc, dp, dc });
                     } else {
