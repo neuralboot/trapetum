@@ -421,3 +421,25 @@ Whole-forward instrumentation (G-inc1) at steady state (pos 17-18):
   Attention is the big project; prep is a quick win.
 - Session ~1h ~8 USD. Program: ~87 USD AWS + 4 RunPod. Milestone: 1.67 tok/s,
   full 671B lossless-4bit, ONE 64-vCPU box.
+
+## 671B session H (2026-07-12): attention on GPU -- 2.46 tok/s, TARGET HIT, x10 from baseline
+
+- GATE: mla_block_math_correct green (device MLA absorption numerically correct).
+- H-HOST control (PREP-fix only, absorption still on host): 542 ms = 1.84 tok/s
+  (the parallel-memset PREP fix alone lifted 1.67 -> 1.84; attention still 302).
+- H-DEVICE (W_UK/W_UV absorptions as device GEMVs): attention 302 -> 170 ms,
+  token 542 -> 416 = 2.40 tok/s. THE BIG WIN.
+- H-DEVICE-OVERLAP (dev_flush drops the redundant per-layer attn drain): 407 ms
+  = 2.46 tok/s. The residual-overlap saving is real but small (~9 ms): attention
+  is mostly serial before o_proj, little to hide. Honest.
+- FINAL: 2.46 tok/s. FULL CHAIN: 0.24 -> 0.44 -> 0.96 -> 1.31 -> 1.35 -> 1.67
+  -> 1.84 -> 2.46 tok/s = x10.2 from the disk-offload baseline, on ONE g6e.16xlarge
+  (64 vCPU + L40S), full DeepSeek-R1 671B, lossless 4-bit, pure Rust, no datacenter.
+- Remaining budget at 407 ms: attention 164 + moe 242 (decode ~150 + ws ~90) +
+  other. Both have more to give (attention GEMV batching, moe reduce tail) but
+  the stated 2-2.5 tok/s target is HIT.
+- Every wall in the chain, in order, each measured then killed: disk -> RAM ->
+  minor-faults -> dispatch-grain -> gather-latency -> worker-engagement ->
+  MLA-host-serial -> page-walks(refuted) -> per-core-decode -> recode-cache-cold
+  -> scratch-memset -> attention-on-host. Eleven diagnoses, ~$95 total.
+- Session ~1h ~8 USD. Program total: ~95 USD AWS + 4 RunPod.
