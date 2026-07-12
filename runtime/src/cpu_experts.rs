@@ -1026,6 +1026,90 @@ pub fn gemv_native_i8(packed: &[u8], cb_i8: &[i8], scale: &[f32], oc: usize, ic:
 }
 
 // ============================================================================
+// lut8 SIMD decode (deliverable C increment 3). The vpshufb value-LUT needs a column's 16 int8
+// centroids CONTIGUOUS (a 16-byte shuffle table), so we first transpose the recoded codebook from
+// [K,oc] (strided cb_i8[k*oc+o]) to [oc,16] (cb_i8_t[o*16+k]) -- a small one-time pass. Then the
+// kernel streams the input-major `packed` contiguously in i-blocks of LUT8_IB inputs, and for each
+// byte-position gathers that column's LUT8_IB nibbles from the (cache-resident) tile, vpshufb-decodes
+// them against the column table, and int-madds with the int8 activation block. Integer accumulation
+// is EXACT and order-free, so lut8 == the scalar int8 accumulate BIT-FOR-BIT (the box's cheap gate).
+//
+// Block sizes are consts so the box (Sapphire-Rapids-class L2/L3) can retune in one line. LUT8_IB=16
+// matches an xmm's 16 int8 lanes; the per-byte-position nibble gather from the cache-resident tile is
+// the tunable hotspot (a full in-register 16x16 transpose is the perf follow-up once the box profiles).
+pub const LUT8_IB: usize = 16;
+
+/// Transpose the recoded int8 codebook `[K,oc]` (strided per column) to `[oc,16]` (16 contiguous
+/// centroids per column) -- the vpshufb table layout. One-time, small (oc*16 bytes).
+pub fn transpose_codebook_i8(cb_i8: &[i8], oc: usize) -> Vec<i8> {
+    assert_eq!(cb_i8.len(), K * oc);
+    let mut t = vec![0i8; oc * 16];
+    for o in 0..oc { for k in 0..K { t[o * 16 + k] = cb_i8[k * oc + o]; } }
+    t
+}
+
+/// Scalar int8 accumulate from the per-column table `cb_i8_t` `[oc,16]`: the bit-exact reference the
+/// lut8 SIMD kernel must match. `acc[o] += sum_i cb_i8_t[o*16 + idx[i,o]] * xq[i]` (integer, exact).
+pub fn accumulate_i8_t(packed: &[u8], cb_i8_t: &[i8], oc: usize, xq: &[i8], acc: &mut [i32], i0: usize, i1: usize) {
+    let half = oc / 2;
+    for i in i0..i1 {
+        let xi = xq[i] as i32;
+        let row = &packed[i * half..i * half + half];
+        for j in 0..half {
+            let b = row[j];
+            acc[2 * j]     += cb_i8_t[(2 * j) * 16 + (b & 0xF) as usize] as i32 * xi;
+            acc[2 * j + 1] += cb_i8_t[(2 * j + 1) * 16 + (b >> 4) as usize] as i32 * xi;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn hsum256_i32(v: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castsi256_si128(v);
+    let hi = _mm256_extracti128_si256::<1>(v);
+    let s = _mm_add_epi32(lo, hi);
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0x4E>(s));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0xB1>(s));
+    _mm_cvtsi128_si32(s)
+}
+
+/// AVX2 lut8 accumulate: vpshufb value-LUT decode + int madd, streaming `packed` in LUT8_IB-input
+/// blocks. Bit-exact to [`accumulate_i8_t`] (integer). `cb_i8_t` is `[oc,16]`, `xq` int8 activations.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn accumulate_lut8_avx2(packed: &[u8], cb_i8_t: &[i8], oc: usize, xq: &[i8], acc: &mut [i32], i0: usize, i1: usize) {
+    use std::arch::x86_64::*;
+    let half = oc / 2;
+    let mask = _mm_set1_epi8(0x0F);
+    let mut ib = i0;
+    while ib + LUT8_IB <= i1 {
+        let xqv = _mm_loadu_si128(xq.as_ptr().add(ib) as *const __m128i); // LUT8_IB int8 activations
+        let xq16 = _mm256_cvtepi8_epi16(xqv);                            // -> 16 int16
+        for j in 0..half {
+            // nibble gather: this byte-position across the input block (cache-resident tile) -> xmm
+            let mut buf = [0u8; LUT8_IB];
+            for t in 0..LUT8_IB { buf[t] = *packed.get_unchecked((ib + t) * half + j); }
+            let bytes = _mm_loadu_si128(buf.as_ptr() as *const __m128i);
+            let lo = _mm_and_si128(bytes, mask);
+            let hi = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+            let (o_lo, o_hi) = (2 * j, 2 * j + 1);
+            let tbl_lo = _mm_loadu_si128(cb_i8_t.as_ptr().add(o_lo * 16) as *const __m128i);
+            let tbl_hi = _mm_loadu_si128(cb_i8_t.as_ptr().add(o_hi * 16) as *const __m128i);
+            let dec_lo = _mm_shuffle_epi8(tbl_lo, lo);   // 16 decoded int8 (indices 0..15, no zeroing)
+            let dec_hi = _mm_shuffle_epi8(tbl_hi, hi);
+            let p_lo = _mm256_madd_epi16(_mm256_cvtepi8_epi16(dec_lo), xq16); // exact int32 pairs
+            let p_hi = _mm256_madd_epi16(_mm256_cvtepi8_epi16(dec_hi), xq16);
+            *acc.get_unchecked_mut(o_lo) += hsum256_i32(p_lo);
+            *acc.get_unchecked_mut(o_hi) += hsum256_i32(p_hi);
+        }
+        ib += LUT8_IB;
+    }
+    if ib < i1 { accumulate_i8_t(packed, cb_i8_t, oc, xq, acc, ib, i1); } // scalar tail (< LUT8_IB inputs)
+}
+
+// ============================================================================
 // Worker engagement (deliverable C). The 671B rerun showed only ~9-16 of 32 pool workers doing
 // useful work: the reduction phases (RA/RC) had just `k` tasks, phase C had `k*ceil(inter/256)`
 // (~64) for 32-60 workers, and the std Barrier's futex wake latency x (4 phases x 58 calls/token)
@@ -1038,8 +1122,8 @@ pub fn gemv_native_i8(packed: &[u8], cb_i8: &[i8], scale: &[f32], oc: usize, ic:
 //     engagement distribution is observable (on the M4 at V2-Lite dims, and on the box).
 // ============================================================================
 
-/// Persistent per-thread worker index (set once when the pool spawns the thread); `usize::MAX` on
-/// any non-pool thread (e.g. the scoped `_nt` path). Used only for engagement instrumentation.
+// Persistent per-thread worker index (set once when the pool spawns the thread); usize::MAX on
+// any non-pool thread (e.g. the scoped _nt path). Used only for engagement instrumentation.
 thread_local! { static WORKER_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) }; }
 
 /// Output elements per reduction task (RA/RC), so the cheap reduction phases have enough tasks to
@@ -1739,6 +1823,27 @@ mod tests {
         eprintln!("[native_ws_probe] hidden={hidden} inter={inter} k={k} threads={} spin={} -> {ms:.3} ms/call, {gbs:.2} GB/s packed",
                   crate::cpu_experts::cpu_threads(), cpu_spin());
         let _ = acc;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn lut8_matches_scalar_int8() {
+        // Deliverable C-inc3: the AVX2 lut8 (vpshufb value-LUT) accumulate must be BIT-EXACT to the
+        // scalar int8 accumulate -- integer math, so equality is exact regardless of order. This is
+        // the box's cheap correctness gate before any 671B perf run. ic=1000 exercises the tail.
+        if !is_x86_feature_detected!("avx2") { eprintln!("[lut8] no AVX2 here; skipping (runs on the box)"); return; }
+        for (oc, ic) in [(256usize, 512usize), (128, 1000), (2048, 320)] {
+            let mut r = Lcg(0x0107_8u64 ^ ((oc as u64) << 9) ^ ic as u64);
+            let packed: Vec<u8> = (0..ic * (oc / 2)).map(|_| ((r.f32() * 0.5 + 0.5) * 255.0) as u8).collect();
+            let cb_i8: Vec<i8> = (0..K * oc).map(|_| (r.f32() * 100.0) as i8).collect();
+            let xq: Vec<i8> = (0..ic).map(|_| (r.f32() * 100.0) as i8).collect();
+            let cb_t = super::transpose_codebook_i8(&cb_i8, oc);
+            let mut a1 = vec![0i32; oc];
+            super::accumulate_i8_t(&packed, &cb_t, oc, &xq, &mut a1, 0, ic);
+            let mut a2 = vec![0i32; oc];
+            unsafe { super::accumulate_lut8_avx2(&packed, &cb_t, oc, &xq, &mut a2, 0, ic); }
+            assert_eq!(a1, a2, "lut8 AVX2 != scalar int8 (bitwise) at oc={oc} ic={ic}");
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
