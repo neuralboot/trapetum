@@ -487,6 +487,18 @@ __global__ void gemv_fp16_k(const __half* __restrict__ W, const __half* __restri
     Y[o] = acc;
 }
 
+// Batched per-head MLA absorption (deliverable H). out[h][o] = sum_i x[h][i]*W[(h*S+roff)*dc + o*co + i*ci].
+__global__ void mla_absorb_k(const __half* __restrict__ x, const __half* __restrict__ W, __half* __restrict__ out,
+                             int nh, int in_dim, int out_dim, int S, int dc, int roff, int co, int ci) {
+    int gid = blockIdx.x*blockDim.x + threadIdx.x;
+    if (gid >= nh*out_dim) return;
+    int h = gid / out_dim, o = gid % out_dim;
+    size_t wbase = (size_t)(h*S + roff)*dc + (size_t)o*co, xbase = (size_t)h*in_dim;
+    float acc = 0.f;
+    for (int i = 0; i < in_dim; i++) acc += __half2float(x[xbase + i]) * __half2float(W[wbase + (size_t)i*ci]);
+    out[gid] = __float2half(acc);
+}
+
 __global__ void gelu_mul_k(const float* __restrict__ gate, const float* __restrict__ up, __half* __restrict__ out, int n) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -885,6 +897,14 @@ void op_saxpy(void* acc_f32, const void* y_f32, float alpha, int n) {
 void op_gemv_fp16(const void* w_half, const void* x_half, void* y_f32, int ic, int oc) {
     ensure_stream();
     gemv_fp16_k<<<(oc+255)/256, 256, 0, g_stream>>>((const __half*)w_half, (const __half*)x_half, (float*)y_f32, ic, oc);
+}
+
+void op_mla_absorb(const void* x_half, const void* w_half, void* out_half,
+                   int nh, int in_dim, int out_dim, int S, int dc, int roff, int co, int ci) {
+    ensure_stream();
+    int total = nh*out_dim;
+    mla_absorb_k<<<(total+255)/256, 256, 0, g_stream>>>((const __half*)x_half, (const __half*)w_half, (__half*)out_half,
+        nh, in_dim, out_dim, S, dc, roff, co, ci);
 }
 
 void op_gelu_mul(const void* gate_f32, const void* up_f32, void* out_half, int n) {

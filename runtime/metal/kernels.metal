@@ -365,6 +365,29 @@ kernel void gemv_fp16(
     Y[o] = acc;
 }
 
+// Batched per-head MLA absorption (deliverable H): moves the two W_UK/W_UV contractions off the CPU
+// (where they were ~4 GB/token of host f32 matmul competing with the MoE cores) onto the idle GPU.
+//   out[h][o] = sum_i x[h*in + i] * W[(h*S + roff)*dc + o*co + i*ci]      (one thread per (h,o))
+//   aq   (W_UK^T @ q_nope): in=nope, out=d_c, roff=0,    co=1,  ci=d_c
+//   attn (scores/latent W_UV): in=d_c, out=v_head_dim, roff=nope, co=d_c, ci=1
+// W is the resident fp16 kv_b [n_heads*(nope+v_head_dim)][d_c]; x/out fp16.
+struct AbsorbParams { int nh; int in_dim; int out_dim; int S; int dc; int roff; int co; int ci; };
+kernel void mla_absorb(
+    device const half* x     [[buffer(0)]],
+    device const half* W     [[buffer(1)]],
+    device half*       out   [[buffer(2)]],
+    constant AbsorbParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if ((int)gid >= p.nh * p.out_dim) return;
+    int h = (int)gid / p.out_dim, o = (int)gid % p.out_dim;
+    ulong wbase = (ulong)(h * p.S + p.roff) * p.dc + (ulong)o * p.co;
+    ulong xbase = (ulong)h * p.in_dim;
+    float acc = 0.0f;
+    for (int i = 0; i < p.in_dim; i++) acc += (float)x[xbase + i] * (float)W[wbase + (ulong)i * p.ci];
+    out[gid] = (half)acc;
+}
+
 // Small-M fused 4-bit decode GEMM (the speculative-verification kernel).
 // Y[m][o] = sum_ic X[m][ic] * decode(packed[ic][o]). The packed weight + codebook
 // are read ONCE per ic and reused across all M input columns, so if M is small

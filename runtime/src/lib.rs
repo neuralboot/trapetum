@@ -67,6 +67,7 @@ mod backend {
 pub fn op_gelu_mul(gate_f32: *const c_void, up_f32: *const c_void, out_half: *mut c_void, n: i32);
                 pub fn op_gemv_fp16(w_half: *const c_void, x_half: *const c_void, y_f32: *mut c_void, ic: i32, oc: i32);
         pub fn op_mla_attn(q_half: *const c_void, qr_half: *const c_void, ckv_half: *const c_void, kr_half: *const c_void, out_half: *mut c_void, n_heads: i32, d_c: i32, d_rope: i32, seqlen: i32, scale: f32);
+        pub fn op_mla_absorb(x_half: *const c_void, w_half: *const c_void, out_half: *mut c_void, nh: i32, in_dim: i32, out_dim: i32, s: i32, dc: i32, roff: i32, co: i32, ci: i32);
         pub fn op_attn_m(
             q_half: *const c_void,
             ck_half: *const c_void,
@@ -2984,6 +2985,17 @@ pub fn gemv_fp16(w: &DevHalf, x: &DevHalf, y: &mut DevF32, ic: usize, oc: usize)
     unsafe { op_gemv_fp16(w.ptr, x.ptr, y.ptr, ic as i32, oc as i32) };
 }
 
+/// Batched per-head MLA absorption on the GPU (deliverable H): `out[h][o] = sum_i x[h][i] *
+/// W[(h*S+roff)*dc + o*co + i*ci]`, `W` the resident fp16 `kv_b`. aq (W_UK): in=nope, out=d_c,
+/// roff=0, co=1, ci=d_c. attn (W_UV): in=d_c, out=v_head_dim, roff=nope, co=d_c, ci=1.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+#[allow(clippy::too_many_arguments)]
+pub fn mla_absorb(x: &DevHalf, w: &DevHalf, out: &mut DevHalf,
+                  nh: usize, in_dim: usize, out_dim: usize, s: usize, dc: usize, roff: usize, co: usize, ci: usize) {
+    assert_eq!(x.n, nh * in_dim); assert_eq!(out.n, nh * out_dim);
+    unsafe { op_mla_absorb(x.ptr, w.ptr, out.ptr, nh as i32, in_dim as i32, out_dim as i32, s as i32, dc as i32, roff as i32, co as i32, ci as i32) };
+}
+
 /// A dense fp16 linear `y = W x`, weights resident on the GPU (`[oc][ic]` row-major).
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct DenseLinear { w: DevHalf, ic: usize, oc: usize }
@@ -3526,6 +3538,37 @@ pub fn check_mla_block() -> f64 {
 
 #[cfg(all(test, any(feature = "cuda", feature = "metal")))]
 mod mla_tests {
+    #[test]
+    fn mla_absorb_matches_host() {
+        // Deliverable H: the batched GPU absorption kernel matches the host reference (fp16 device
+        // GEMV vs fp16-rounded host, f32 accumulate) for BOTH configs -- aq (W_UK) and attn (W_UV).
+        use super::{DevHalf, mla_absorb};
+        let h16 = |x: f32| half::f16::from_f32(x).to_f32();
+        let (nh, nope, vhd, dc) = (8usize, 64usize, 64usize, 128usize);
+        let s = nope + vhd;
+        let mut st = 0x0A_B50_2BE_u64;
+        let mut r = move || { st ^= st<<13; st ^= st>>7; st ^= st<<17; ((st>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+        let kv_b: Vec<f32> = (0..nh*s*dc).map(|_| r()*0.1).collect();
+        let w = DevHalf::from_host(&kv_b);
+        let l2 = |a: &[f32], b: &[f32]| { let (mut n, mut d)=(0f64,0f64); for (x,y) in a.iter().zip(b){ let e=(x-y) as f64; n+=e*e; d+=(*x as f64)*(*x as f64);} n.sqrt()/d.sqrt().max(1e-12) };
+        // aq: x=q_nope[nh][nope] -> out=aq[nh][dc]; roff=0, co=1, ci=dc
+        let qn: Vec<f32> = (0..nh*nope).map(|_| r()).collect();
+        let mut aq = DevHalf::zeros(nh*dc);
+        mla_absorb(&DevHalf::from_host(&qn), &w, &mut aq, nh, nope, dc, s, dc, 0, 1, dc);
+        let aq_ref: Vec<f32> = (0..nh*dc).map(|g| { let (h,j)=(g/dc,g%dc);
+            (0..nope).map(|i| h16(qn[h*nope+i])*h16(kv_b[(h*s+i)*dc+j])).sum() }).collect();
+        let e1 = l2(&aq_ref, &aq.to_host());
+        // attn: x=outl[nh][dc] -> out=attn[nh][vhd]; roff=nope, co=dc, ci=1
+        let ol: Vec<f32> = (0..nh*dc).map(|_| r()).collect();
+        let mut at = DevHalf::zeros(nh*vhd);
+        mla_absorb(&DevHalf::from_host(&ol), &w, &mut at, nh, dc, vhd, s, dc, nope, dc, 1);
+        let at_ref: Vec<f32> = (0..nh*vhd).map(|g| { let (h,v)=(g/vhd,g%vhd);
+            (0..dc).map(|j| h16(ol[h*dc+j])*h16(kv_b[(h*s+nope+v)*dc+j])).sum() }).collect();
+        let e2 = l2(&at_ref, &at.to_host());
+        eprintln!("[mla_absorb] aq L2={e1:e} attn L2={e2:e} (fp16 device vs fp16-rounded host)");
+        assert!(e1 < 5e-3 && e2 < 5e-3, "mla_absorb mismatch aq={e1:e} attn={e2:e}");
+    }
+
     #[test]
     fn mla_block_math_correct() {
         // The Rust MLA (interleaved rope + W_UK/W_UV absorption + softmax_scale used as-is)

@@ -54,6 +54,7 @@ const KERNELS: &[&str] = &[
     "gemm_mtile_t1", "gemm_mtile_t2", "gemm_mtile_t3", "gemm_mtile_t4", "argmax_stage1", "argmax_stage2",
     "gemv4_partial", "gemv_reduce",
     "gemv8", "gemv8_partial",
+    "mla_absorb",
 ];
 
 struct Ctx {
@@ -1081,6 +1082,25 @@ pub unsafe fn op_gemv_fp16(w_half: *const c_void, x_half: *const c_void, y_f32: 
     enc.set_bytes(3, 8, &p as *const P as *const c_void);
     let tpb = 256u64;
     enc.dispatch_thread_groups(MTLSize::new((oc as u64 + tpb - 1)/tpb, 1, 1), MTLSize::new(tpb, 1, 1));
+    enc.end_encoding();
+}
+
+// Batched per-head MLA absorption (deliverable H): out[h][o] = sum_i x[h][i]*W[(h*S+roff)*dc + o*co + i*ci].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn op_mla_absorb(x_half: *const c_void, w_half: *const c_void, out_half: *mut c_void,
+                            nh: i32, in_dim: i32, out_dim: i32, s: i32, dc: i32, roff: i32, co: i32, ci: i32) {
+    let c = ctx();
+    let cb = cur_cb();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.pl["mla_absorb"]);
+    enc.set_buffer(0, Some(bufref(x_half)), 0);
+    enc.set_buffer(1, Some(bufref(w_half)), 0);
+    enc.set_buffer(2, Some(bufref(out_half)), 0);
+    #[repr(C)] struct P { nh: i32, in_dim: i32, out_dim: i32, s: i32, dc: i32, roff: i32, co: i32, ci: i32 }
+    let p = P { nh, in_dim, out_dim, s, dc, roff, co, ci };
+    enc.set_bytes(3, 32, &p as *const P as *const c_void);
+    let total = (nh * out_dim) as u64; let tpb = 256u64;
+    enc.dispatch_thread_groups(MTLSize::new((total + tpb - 1) / tpb, 1, 1), MTLSize::new(tpb, 1, 1));
     enc.end_encoding();
 }
 
