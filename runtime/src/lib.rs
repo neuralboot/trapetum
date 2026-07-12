@@ -3038,11 +3038,13 @@ pub struct MlaAttn {
     o_proj: Option<DenseLinear>,
     kv_a_norm: Vec<f32>,          // [d_c]
     kv_b: Vec<f32>,               // [n_heads*(nope+v_head_dim)][d_c]  (W_UK ++ W_UV per head)
+    kv_b_dev: DevHalf,            // resident fp16 copy of kv_b for the device `mla_absorb` GEMV (H)
     inv_freq: Vec<f32>,           // [d_rope/2]
     cache_ckv: DevHalf,           // [max_seq][d_c]
     cache_kr: DevHalf,            // [max_seq][d_rope]
     n_heads: usize, d_c: usize, d_rope: usize, nope: usize, v_head_dim: usize, hidden: usize,
     pub eps: f32, softmax_scale: f32,
+    qnope_dev: DevHalf,           // [n_heads*nope] fp16 scratch: q_nope extracted for the aq GEMV
     aq_dev: DevHalf, qr_dev: DevHalf, outl_dev: DevHalf,
     ckv_h: DevHalf, kr_h: DevHalf,
     qf: DevF32, kvf: DevF32, attn_dev: DevHalf, o_out: DevF32,
@@ -3083,6 +3085,17 @@ pub(crate) fn mla_rope_interleaved(v: &mut [f32], pos: usize, inv_freq: &[f32]) 
     }
 }
 
+/// `TRAPETUM_MLA_HOST=1`: run the two MLA absorptions (W_UK for `aq`, W_UV for `attn`) on the CPU
+/// pool (the deliverable-E path) instead of the device `mla_absorb` GEMV (deliverable H). Kept as
+/// the A/B lever and the fallback; the device path is the default. The device path uses a resident
+/// fp16 `kv_b_dev`, so it also drops the ~n_heads*(nope+vhd)*d_c host kv_b streaming per token.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn mla_host() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("TRAPETUM_MLA_HOST").map(|v| v == "1").unwrap_or(false))
+}
+
 /// Raw `*mut f32` wrapped Send+Sync so a `parallel_for` closure can write DISJOINT regions (one per
 /// head) without a borrow. Sound only because each parallel index writes a non-overlapping slice.
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -3102,9 +3115,11 @@ impl MlaAttn {
             q_proj: Some(DenseLinear::new(q_w, hidden, qdim)),
             kv_a: DenseLinear::new(kv_a_w, hidden, d_c + d_rope),
             o_proj: Some(DenseLinear::new(o_w, n_heads*v_head_dim, hidden)),
-            kv_a_norm: kv_a_norm.to_vec(), kv_b: kv_b.to_vec(), inv_freq: inv_freq.to_vec(),
+            kv_a_norm: kv_a_norm.to_vec(), kv_b: kv_b.to_vec(),
+            kv_b_dev: DevHalf::from_host(kv_b), inv_freq: inv_freq.to_vec(),
             cache_ckv: DevHalf::zeros(max_seq*d_c), cache_kr: DevHalf::zeros(max_seq*d_rope),
             n_heads, d_c, d_rope, nope, v_head_dim, hidden, eps, softmax_scale,
+            qnope_dev: DevHalf::zeros(n_heads*nope),
             aq_dev: DevHalf::zeros(n_heads*d_c), qr_dev: DevHalf::zeros(n_heads*d_rope),
             outl_dev: DevHalf::zeros(n_heads*d_c),
             ckv_h: DevHalf::zeros(d_c), kr_h: DevHalf::zeros(d_rope),
@@ -3128,9 +3143,11 @@ impl MlaAttn {
             q_proj: None,
             kv_a: DenseLinear::new(kv_a_w, hidden, d_c + d_rope),
             o_proj: None,
-            kv_a_norm: kv_a_norm.to_vec(), kv_b: kv_b.to_vec(), inv_freq: inv_freq.to_vec(),
+            kv_a_norm: kv_a_norm.to_vec(), kv_b: kv_b.to_vec(),
+            kv_b_dev: DevHalf::from_host(kv_b), inv_freq: inv_freq.to_vec(),
             cache_ckv: DevHalf::zeros(max_seq*d_c), cache_kr: DevHalf::zeros(max_seq*d_rope),
             n_heads, d_c, d_rope, nope, v_head_dim, hidden, eps, softmax_scale,
+            qnope_dev: DevHalf::zeros(n_heads*nope),
             aq_dev: DevHalf::zeros(n_heads*d_c), qr_dev: DevHalf::zeros(n_heads*d_rope),
             outl_dev: DevHalf::zeros(n_heads*d_c),
             ckv_h: DevHalf::zeros(d_c), kr_h: DevHalf::zeros(d_rope),
@@ -3177,34 +3194,53 @@ impl MlaAttn {
         for (i, x) in ckv.iter_mut().enumerate() { *x = *x * sc * self.kv_a_norm[i]; }
         let mut krope: Vec<f32> = kv[dc..dc+dr].to_vec();
         self.rope(&mut krope, pos);
-        // per-head absorbed query + rope query. This is the deliverable-E hot loop: the W_UK
-        // absorption reads ~n_heads*nope*d_c of kv_b per token per layer -- ~single-threaded GB/s
-        // on the host was the "MLA" wall. Parallelized per head over the CPU pool (heads write
-        // disjoint aq/qr slices). rope stays here (cheap) so kv_b streaming stays the only cost.
-        let mut aq = vec![0f32; nh*dc];
+        // rope query (host, cheap): rotate the d_rope tail of each head's q. Always host -- the
+        // kv_b streaming, not this, was the wall.
         let mut qr = vec![0f32; nh*dr];
         let hd = nope + dr;
         {
-            let (aqp, qrp) = (SyncMutPtr(aq.as_mut_ptr()), SyncMutPtr(qr.as_mut_ptr()));
-            // Capture the WHOLE wrappers by reference (Rust 2021 disjoint capture would otherwise
-            // grab the raw `*mut f32` field, which is not Sync). Sound: disjoint per-head writes.
-            let (aqp, qrp) = (&aqp, &qrp);
-            let (q_ref, kvb, invf) = (&q, &self.kv_b, &self.inv_freq);
+            let qrp = SyncMutPtr(qr.as_mut_ptr());
+            // Capture the WHOLE wrapper by reference (Rust 2021 disjoint capture would otherwise grab
+            // the raw `*mut f32` field, which is not Sync). Sound: disjoint per-head writes.
+            let qrp = &qrp;
+            let (q_ref, invf) = (&q, &self.inv_freq);
             cpu_experts::parallel_for(nh, &|h| {
                 let mut qrope = q_ref[h*hd+nope..h*hd+hd].to_vec();
                 mla_rope_interleaved(&mut qrope, pos, invf);
                 unsafe { for r in 0..dr { *qrp.0.add(h*dr + r) = qrope[r]; } }
-                // absorbed_q[h][j] = sum_i qn[i] * W_UK[h][i][j] ; W_UK[h] rows = kv_b[h*(nope+vhd)+i]
-                let base = h*(nope+vhd);
-                for j in 0..dc {
-                    let mut acc = 0f32;
-                    for i in 0..nope { acc += q_ref[h*hd + i] * kvb[(base+i)*dc + j]; }
-                    unsafe { *aqp.0.add(h*dc + j) = acc; }
-                }
             });
         }
-        // upload + append cache
-        self.aq_dev.upload(&aq); self.qr_dev.upload(&qr);
+        self.qr_dev.upload(&qr);
+        // absorbed query aq[h][j] = sum_i q_nope[h][i] * W_UK[h][i][j] (W_UK[h] rows =
+        // kv_b[h*(nope+vhd)+i]). Deliverable H: device `mla_absorb` GEMV over the resident fp16
+        // kv_b_dev (no host kv_b streaming). Host pool path (deliverable E) behind TRAPETUM_MLA_HOST
+        // as the A/B lever + fallback.
+        if mla_host() {
+            let mut aq = vec![0f32; nh*dc];
+            {
+                let aqp = SyncMutPtr(aq.as_mut_ptr());
+                let aqp = &aqp;
+                let (q_ref, kvb) = (&q, &self.kv_b);
+                cpu_experts::parallel_for(nh, &|h| {
+                    let base = h*(nope+vhd);
+                    for j in 0..dc {
+                        let mut acc = 0f32;
+                        for i in 0..nope { acc += q_ref[h*hd + i] * kvb[(base+i)*dc + j]; }
+                        unsafe { *aqp.0.add(h*dc + j) = acc; }
+                    }
+                });
+            }
+            self.aq_dev.upload(&aq);
+        } else {
+            // extract q_nope [nh][nope] (cheap host slice), upload fp16, GEMV -> aq_dev.
+            // config: in=nope, out=d_c, S=nope+vhd, roff=0, co=1, ci=d_c (matches the host formula).
+            let mut qnope = vec![0f32; nh*nope];
+            for h in 0..nh { qnope[h*nope..h*nope+nope].copy_from_slice(&q[h*hd..h*hd+nope]); }
+            self.qnope_dev.upload(&qnope);
+            mla_absorb(&self.qnope_dev, &self.kv_b_dev, &mut self.aq_dev,
+                       nh, nope, dc, nope+vhd, dc, 0, 1, dc);
+        }
+        // append cache
         self.ckv_h.upload(&ckv); self.kr_h.upload(&krope);
         unsafe {
             op_cache_append(self.cache_ckv.ptr, self.ckv_h.ptr, pos as i32, dc as i32);
@@ -3213,24 +3249,33 @@ impl MlaAttn {
         // MLA attention on device (DeepSeek softmax_scale = qk_head_dim^-0.5 * mscale^2)
         let scale = self.softmax_scale;
         mla_attention(&self.aq_dev, &self.qr_dev, &self.cache_ckv, &self.cache_kr, &mut self.outl_dev, nh, dc, dr, pos+1, scale);
-        let outl = self.outl_dev.to_host();
-        // per-head value: attn[h][v] = sum_j outl[h][j] * W_UV[h][v][j] ; W_UV[h] rows = kv_b[h*(nope+vhd)+nope+v]
-        // The W_UV absorption is the twin host wall (reads ~n_heads*v_head_dim*d_c of kv_b/token/layer);
-        // parallelized per head over the CPU pool (heads write disjoint last_attn slices).
-        {
-            let atp = SyncMutPtr(self.last_attn.as_mut_ptr());
-            let atp = &atp; // whole-wrapper capture (see aq block)
-            let (outl_ref, kvb) = (&outl, &self.kv_b);
-            cpu_experts::parallel_for(nh, &|h| {
-                let base = h*(nope+vhd) + nope;
-                for v in 0..vhd {
-                    let mut acc = 0f32;
-                    for j in 0..dc { acc += outl_ref[h*dc + j] * kvb[(base+v)*dc + j]; }
-                    unsafe { *atp.0.add(h*vhd + v) = acc; }
-                }
-            });
+        // per-head value: attn[h][v] = sum_j outl[h][j] * W_UV[h][v][j] ; W_UV[h] rows =
+        // kv_b[h*(nope+vhd)+nope+v]. Deliverable H: outl is ALREADY on device (from mla_attention),
+        // so this is a pure device GEMV -- no host round-trip. Host pool path (E) behind the flag.
+        if mla_host() {
+            let outl = self.outl_dev.to_host();
+            {
+                let atp = SyncMutPtr(self.last_attn.as_mut_ptr());
+                let atp = &atp; // whole-wrapper capture (see aq block)
+                let (outl_ref, kvb) = (&outl, &self.kv_b);
+                cpu_experts::parallel_for(nh, &|h| {
+                    let base = h*(nope+vhd) + nope;
+                    for v in 0..vhd {
+                        let mut acc = 0f32;
+                        for j in 0..dc { acc += outl_ref[h*dc + j] * kvb[(base+v)*dc + j]; }
+                        unsafe { *atp.0.add(h*vhd + v) = acc; }
+                    }
+                });
+            }
+            self.attn_dev.upload(&self.last_attn);
+        } else {
+            // config: in=d_c, out=v_head_dim, S=nope+vhd, roff=nope, co=d_c, ci=1 (matches host).
+            mla_absorb(&self.outl_dev, &self.kv_b_dev, &mut self.attn_dev,
+                       nh, dc, vhd, nope+vhd, dc, nope, dc, 1);
+            // mirror attn_dev into last_attn for the validation gate + box layer-0 sub-dump. Tiny
+            // (nh*vhd) vs the kv_b stream we removed; H-inc3 can make this conditional for overlap.
+            self.last_attn.copy_from_slice(&self.attn_dev.to_host());
         }
-        self.attn_dev.upload(&self.last_attn);
         if let Some(oq) = self.o_quant.as_ref() {
             oq.forward_into(&self.attn_dev, &mut self.o_out);
         } else {
