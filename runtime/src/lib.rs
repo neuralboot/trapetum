@@ -2988,6 +2988,14 @@ pub(crate) fn mla_rope_interleaved(v: &mut [f32], pos: usize, inv_freq: &[f32]) 
     }
 }
 
+/// Raw `*mut f32` wrapped Send+Sync so a `parallel_for` closure can write DISJOINT regions (one per
+/// head) without a borrow. Sound only because each parallel index writes a non-overlapping slice.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+#[derive(Clone, Copy)]
+struct SyncMutPtr(*mut f32);
+#[cfg(any(feature = "cuda", feature = "metal"))]
+unsafe impl Sync for SyncMutPtr {}
+
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl MlaAttn {
     #[allow(clippy::too_many_arguments)]
@@ -3074,23 +3082,31 @@ impl MlaAttn {
         for (i, x) in ckv.iter_mut().enumerate() { *x = *x * sc * self.kv_a_norm[i]; }
         let mut krope: Vec<f32> = kv[dc..dc+dr].to_vec();
         self.rope(&mut krope, pos);
-        // per-head absorbed query + rope query
+        // per-head absorbed query + rope query. This is the deliverable-E hot loop: the W_UK
+        // absorption reads ~n_heads*nope*d_c of kv_b per token per layer -- ~single-threaded GB/s
+        // on the host was the "MLA" wall. Parallelized per head over the CPU pool (heads write
+        // disjoint aq/qr slices). rope stays here (cheap) so kv_b streaming stays the only cost.
         let mut aq = vec![0f32; nh*dc];
         let mut qr = vec![0f32; nh*dr];
         let hd = nope + dr;
-        for h in 0..nh {
-            let mut qn = q[h*hd..h*hd+nope].to_vec();
-            let mut qrope = q[h*hd+nope..h*hd+hd].to_vec();
-            self.rope(&mut qrope, pos);
-            qr[h*dr..(h+1)*dr].copy_from_slice(&qrope);
-            // absorbed_q[h][j] = sum_i qn[i] * W_UK[h][i][j] ; W_UK[h] rows = kv_b[h*(nope+vhd)+i]
-            let base = h*(nope+vhd);
-            for j in 0..dc {
-                let mut acc = 0f32;
-                for i in 0..nope { acc += qn[i] * self.kv_b[(base+i)*dc + j]; }
-                aq[h*dc + j] = acc;
-            }
-            let _ = &mut qn;
+        {
+            let (aqp, qrp) = (SyncMutPtr(aq.as_mut_ptr()), SyncMutPtr(qr.as_mut_ptr()));
+            // Capture the WHOLE wrappers by reference (Rust 2021 disjoint capture would otherwise
+            // grab the raw `*mut f32` field, which is not Sync). Sound: disjoint per-head writes.
+            let (aqp, qrp) = (&aqp, &qrp);
+            let (q_ref, kvb, invf) = (&q, &self.kv_b, &self.inv_freq);
+            cpu_experts::parallel_for(nh, &|h| {
+                let mut qrope = q_ref[h*hd+nope..h*hd+hd].to_vec();
+                mla_rope_interleaved(&mut qrope, pos, invf);
+                unsafe { for r in 0..dr { *qrp.0.add(h*dr + r) = qrope[r]; } }
+                // absorbed_q[h][j] = sum_i qn[i] * W_UK[h][i][j] ; W_UK[h] rows = kv_b[h*(nope+vhd)+i]
+                let base = h*(nope+vhd);
+                for j in 0..dc {
+                    let mut acc = 0f32;
+                    for i in 0..nope { acc += q_ref[h*hd + i] * kvb[(base+i)*dc + j]; }
+                    unsafe { *aqp.0.add(h*dc + j) = acc; }
+                }
+            });
         }
         // upload + append cache
         self.aq_dev.upload(&aq); self.qr_dev.upload(&qr);
@@ -3104,13 +3120,20 @@ impl MlaAttn {
         mla_attention(&self.aq_dev, &self.qr_dev, &self.cache_ckv, &self.cache_kr, &mut self.outl_dev, nh, dc, dr, pos+1, scale);
         let outl = self.outl_dev.to_host();
         // per-head value: attn[h][v] = sum_j outl[h][j] * W_UV[h][v][j] ; W_UV[h] rows = kv_b[h*(nope+vhd)+nope+v]
-        for h in 0..nh {
-            let base = h*(nope+vhd) + nope;
-            for v in 0..vhd {
-                let mut acc = 0f32;
-                for j in 0..dc { acc += outl[h*dc + j] * self.kv_b[(base+v)*dc + j]; }
-                self.last_attn[h*vhd + v] = acc;
-            }
+        // The W_UV absorption is the twin host wall (reads ~n_heads*v_head_dim*d_c of kv_b/token/layer);
+        // parallelized per head over the CPU pool (heads write disjoint last_attn slices).
+        {
+            let atp = SyncMutPtr(self.last_attn.as_mut_ptr());
+            let atp = &atp; // whole-wrapper capture (see aq block)
+            let (outl_ref, kvb) = (&outl, &self.kv_b);
+            cpu_experts::parallel_for(nh, &|h| {
+                let base = h*(nope+vhd) + nope;
+                for v in 0..vhd {
+                    let mut acc = 0f32;
+                    for j in 0..dc { acc += outl_ref[h*dc + j] * kvb[(base+v)*dc + j]; }
+                    unsafe { *atp.0.add(h*vhd + v) = acc; }
+                }
+            });
         }
         self.attn_dev.upload(&self.last_attn);
         if let Some(oq) = self.o_quant.as_ref() {

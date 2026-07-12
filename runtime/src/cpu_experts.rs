@@ -639,6 +639,17 @@ impl Pool {
     }
 }
 
+/// Run `f(i)` for every `i` in `0..n` across the persistent pool (each `i` independent; the caller
+/// writes disjoint regions). Sequential fallback for a 1-thread pool or tiny `n`. Used to parallelize
+/// the MLA per-head W_UK/W_UV absorption -- the single-threaded host wall found in deliverable E.
+pub fn parallel_for(n: usize, f: &(dyn Fn(usize) + Sync)) {
+    let p = pool();
+    if p.n <= 1 || n <= 1 { for i in 0..n { f(i); } return; }
+    let ctr = AtomicUsize::new(0);
+    let ctr = &ctr;
+    p.run(&|| loop { let i = ctr.fetch_add(1, Ordering::Relaxed); if i >= n { break; } f(i); });
+}
+
 /// Global persistent pool, sized `TRAPETUM_CPU_THREADS` (default 8), created on first use.
 fn pool() -> &'static Pool {
     static P: OnceLock<&'static Pool> = OnceLock::new();
