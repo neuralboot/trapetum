@@ -1234,9 +1234,15 @@ pub mod moetime {
     pub static WS_SETUP_US: AtomicU64 = AtomicU64::new(0);
     pub static WS_RUN_US: AtomicU64 = AtomicU64::new(0);
     pub static WS_COMBINE_US: AtomicU64 = AtomicU64::new(0);
-    /// Reset all ws-entry sub-stage timers and return them (setup, run, combine).
-    pub fn take_ws_sub() -> (u64, u64, u64) {
-        (WS_SETUP_US.swap(0, Ordering::Relaxed), WS_RUN_US.swap(0, Ordering::Relaxed), WS_COMBINE_US.swap(0, Ordering::Relaxed))
+    // setup sub-split (G-inc3): RECODE = the per-expert int8 codebook recode+transpose (cache MISS;
+    // HIT is ~free) -- the suspected wall while the lazy cache is still warming; QUANT = the once-per-
+    // layer x int8-quantize. setup_prep = SETUP - RECODE - QUANT (ei8 build + scratch zero).
+    pub static WS_RECODE_US: AtomicU64 = AtomicU64::new(0);
+    pub static WS_QUANT_US: AtomicU64 = AtomicU64::new(0);
+    /// Reset all ws-entry sub-stage timers and return them (setup, run, combine, recode, quant).
+    pub fn take_ws_sub() -> (u64, u64, u64, u64, u64) {
+        (WS_SETUP_US.swap(0, Ordering::Relaxed), WS_RUN_US.swap(0, Ordering::Relaxed), WS_COMBINE_US.swap(0, Ordering::Relaxed),
+         WS_RECODE_US.swap(0, Ordering::Relaxed), WS_QUANT_US.swap(0, Ordering::Relaxed))
     }
     pub fn on() -> bool {
         static E: OnceLock<bool> = OnceLock::new();
@@ -1513,6 +1519,15 @@ fn cached_recode(e: &NativeExpert, hidden: usize, inter: usize) -> std::sync::Ar
     a
 }
 
+/// Populate the lut8 codebook cache for ALL of a layer's routed experts ONCE (parallel over the
+/// pool), so the decode never pays a recode MISS at runtime. The lazy cache otherwise warms over
+/// ~tens of tokens (thousands of expert-instances), and the still-cold picks were the ~190 ms/token
+/// "setup" wall session-5 exposed. Call at first CPU forward per block; ~150 MB total, one-time.
+pub fn prewarm_lut8_cache(experts: &[NativeExpert], hidden: usize, inter: usize) {
+    let ep: &[NativeExpert] = experts;
+    parallel_for(experts.len(), &|i| { let _ = cached_recode(&ep[i], hidden, inter); });
+}
+
 /// int8-quantize a vector: `(xq, xs)` with `xs = max|v|/127`.
 fn quantize_i8(v: &[f32]) -> (Vec<i8>, f32) {
     let mut mx = 0f32; for &a in v { mx = mx.max(a.abs()); }
@@ -1666,12 +1681,15 @@ pub fn routed_experts_native_worksteal_lut8(x: &[f32], experts: &[NativeExpert],
     let ts = std::time::Instant::now();
     // Recode is CACHED per expert (lazy-once); x quantized once/call.
     let cbs: Vec<std::sync::Arc<ExpertI8Cb>> = experts.iter().map(|e| cached_recode(e, hidden, inter)).collect();
+    if tm { moetime::add(&moetime::WS_RECODE_US, ts.elapsed().as_micros() as u64); }
     let ei8: Vec<ExpertI8> = experts.iter().zip(&cbs).map(|(e, cb)| ExpertI8 {
         gp: e.gp, g_t: &cb.g_t, gs: &cb.gs,
         up: e.up, u_t: &cb.u_t, us: &cb.us,
         dp: e.dp, d_t: &cb.d_t, ds: &cb.ds, weight: e.weight,
     }).collect();
+    let tq = std::time::Instant::now();
     let (xq_x, xs_x) = quantize_i8(&x[..hidden]);
+    if tm { moetime::add(&moetime::WS_QUANT_US, tq.elapsed().as_micros() as u64); }
     let nch_h = (hidden + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
     let nch_i = (inter + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
     LUT8_SCRATCH.with(|cell| {

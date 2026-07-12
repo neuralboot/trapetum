@@ -2692,6 +2692,8 @@ pub struct MoeBlockOffload {
     sigmoid: bool,
     // Some(_) overrides TRAPETUM_CPU_EXPERTS for this block (two-mode validation).
     cpu_override: Option<bool>,
+    // lut8: whether this block's routed codebooks have been pre-warmed into the int8 cache (once).
+    lut8_warmed: bool,
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -2727,6 +2729,7 @@ impl MoeBlockOffload {
             rscale: 1.0,
             score_bias: None, n_group: 0, topk_group: 0, sigmoid: false,
             cpu_override: None,
+            lut8_warmed: false,
         }
     }
 
@@ -2841,6 +2844,17 @@ impl MoeBlockOffload {
                 ExpertHost::Avq { .. } => panic!("TRAPETUM_CPU_EXPERTS: AVQ (additive-codebook) experts are out of scope; scalar CBKR only"),
             }).collect();
             let mut acc_host = vec![0f32; self.hidden];
+            // lut8: pre-warm this block's ENTIRE routed codebook cache once (parallel), so no decode
+            // ever pays a recode miss (the ~190 ms/token "setup" wall was the lazy cache warming).
+            if cpu_experts::cpu_kernel() == cpu_experts::CpuKernel::Lut8 && !self.lut8_warmed {
+                let all: Vec<cpu_experts::NativeExpert> = self.hosts.iter().filter_map(|h| match h {
+                    ExpertHost::Scalar { gp, gc, up, uc, dp, dc } => Some(cpu_experts::NativeExpert {
+                        gp: gp.as_slice(), gc, up: up.as_slice(), uc, dp: dp.as_slice(), dc, weight: 0.0 }),
+                    ExpertHost::Avq { .. } => None,
+                }).collect();
+                cpu_experts::prewarm_lut8_cache(&all, self.hidden, self.inter);
+                self.lut8_warmed = true;
+            }
             // ONE phased work-steal over all (expert, proj, input-chunk) tasks per MoE call, not a
             // pool dispatch per GEMV (deliverable B lever 2): at 671B this cuts ~1392 dispatches/token
             // to ~58 and fills the workers. TRAPETUM_CPU_KERNEL=lut8 selects the int8 vpshufb decode
@@ -3806,15 +3820,17 @@ impl DeepSeekModel {
             // XCOPY/WS/SHARED are single-thread wall (measured on the main thread in the forward). The
             // work-steal ENTRY overhead = WS - (A+RA+C+RC)/n. The gap = moe_wall - XCOPY - WS - SHARED.
             let (a, ra, c, rc, xcopy, ws, shared) = cpu_experts::moetime::take();
-            let (setup, run, combine) = cpu_experts::moetime::take_ws_sub();
+            let (setup, run, combine, recode, quant) = cpu_experts::moetime::take_ws_sub();
             let n = (cpu_experts::cpu_threads().max(1)) as f64;
             let ph = (a as f64 + ra as f64 + c as f64 + rc as f64) / n / 1e3;
             eprintln!("[moe_timing pos={pos}] A={:.1} RA={:.1} C={:.1} RC={:.1} (phases~{:.1}) | xcopy={:.1} ws_total={:.1} ws_entry={:.1} shared={:.1} ms",
                       a as f64/n/1e3, ra as f64/n/1e3, c as f64/n/1e3, rc as f64/n/1e3, ph,
                       xcopy as f64/1e3, ws as f64/1e3, ws as f64/1e3 - ph, shared as f64/1e3);
-            // ws_entry sub-split: setup (cache+quant+scratch) | barrier+handoff (run - phases) | combine
-            eprintln!("[moe_ws_sub pos={pos}] setup={:.1} run={:.1} barrier+handoff={:.1} combine={:.1} ms",
-                      setup as f64/1e3, run as f64/1e3, run as f64/1e3 - ph, combine as f64/1e3);
+            // ws_entry sub-split: setup (recode+quant+prep) | barrier+handoff (run - phases) | combine.
+            // setup itself splits: recode (cache-miss codebook prep), quant (x int8), prep (ei8+scratch).
+            eprintln!("[moe_ws_sub pos={pos}] setup={:.1} [recode={:.1} quant={:.1} prep={:.1}] barrier+handoff={:.1} combine={:.1} ms",
+                      setup as f64/1e3, recode as f64/1e3, quant as f64/1e3,
+                      (setup as f64 - recode as f64 - quant as f64)/1e3, run as f64/1e3 - ph, combine as f64/1e3);
         }
         out
     }
