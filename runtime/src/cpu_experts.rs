@@ -1303,6 +1303,7 @@ fn native_ws_worker(c: &NativeWsCtx) {
         let ex = &c.experts[e];
         let (packed, cb, base) = if which == 0 { (ex.gp, ex.gc, &c.pg) } else { (ex.up, ex.uc, &c.pu) };
         let slot = unsafe { std::slice::from_raw_parts_mut(base.0.add((e * nch_h + ci) * inter), inter) };
+        for v in slot.iter_mut() { *v = 0.0; } // parallel per-slot zero (moved off the serial scratch memset)
         gemv_native_range(packed, cb, inter, c.x, slot, i0, i1);
         done += 1;
     }
@@ -1338,6 +1339,7 @@ fn native_ws_worker(c: &NativeWsCtx) {
         let ex = &c.experts[e];
         let act_e = unsafe { std::slice::from_raw_parts(c.act.0.add(e * inter), inter) };
         let slot = unsafe { std::slice::from_raw_parts_mut(c.pd.0.add((e * nch_i + ci) * hidden), hidden) };
+        for v in slot.iter_mut() { *v = 0.0; } // parallel per-slot zero (moved off the serial scratch memset)
         gemv_native_range(ex.dp, ex.dc, hidden, act_e, slot, i0, i1);
         done += 1;
     }
@@ -1390,9 +1392,9 @@ struct WsScratch { pg: Vec<f32>, pu: Vec<f32>, pd: Vec<f32>, g: Vec<f32>, u: Vec
 impl WsScratch {
     fn ready(&mut self, k: usize, nch_h: usize, nch_i: usize, inter: usize, hidden: usize) {
         let (a, d, e) = (k * nch_h * inter, k * nch_i * hidden, k * inter);
-        self.pg.clear(); self.pg.resize(a, 0.0); // zeroed; keeps capacity so no realloc after warmup
-        self.pu.clear(); self.pu.resize(a, 0.0);
-        self.pd.clear(); self.pd.resize(d, 0.0);
+        // NO .clear(): resize is a no-op at steady size, so pg/pu/pd are not re-memset serially each
+        // call (the PREP wall); the workers zero their own slot in parallel (native_ws_worker phase A/C).
+        self.pg.resize(a, 0.0); self.pu.resize(a, 0.0); self.pd.resize(d, 0.0);
         self.g.resize(e, 0.0); self.u.resize(e, 0.0); self.act.resize(e, 0.0); self.out.resize(k * hidden, 0.0);
     }
 }
@@ -1574,6 +1576,7 @@ fn lut8_worker(c: &Lut8Ctx) {
         let ex = &c.experts[e];
         let (packed, cb_t, base) = if which == 0 { (ex.gp, ex.g_t, &c.pg) } else { (ex.up, ex.u_t, &c.pu) };
         let slot = unsafe { std::slice::from_raw_parts_mut(base.0.add((e * nch_h + ci) * inter), inter) };
+        for v in slot.iter_mut() { *v = 0; } // parallel per-slot zero (moved off the serial PREP memset)
         accumulate_i8_dispatch(packed, cb_t, inter, c.xq_x, slot, i0, i1);
     }
     lap!(&moetime::A_US);
@@ -1627,6 +1630,7 @@ fn lut8_worker(c: &Lut8Ctx) {
         let ex = &c.experts[e];
         let xq_act_e = unsafe { std::slice::from_raw_parts(c.xq_act.0.add(e * inter), inter) };
         let slot = unsafe { std::slice::from_raw_parts_mut(c.pd.0.add((e * nch_i + ci) * hidden), hidden) };
+        for v in slot.iter_mut() { *v = 0; } // parallel per-slot zero (moved off the serial PREP memset)
         accumulate_i8_dispatch(ex.dp, ex.d_t, hidden, xq_act_e, slot, i0, i1);
     }
     lap!(&moetime::C_US);
@@ -1665,7 +1669,10 @@ struct Lut8Scratch { pg: Vec<i32>, pu: Vec<i32>, pd: Vec<i32>, g: Vec<f32>, u: V
 impl Lut8Scratch {
     fn ready(&mut self, k: usize, nch_h: usize, nch_i: usize, inter: usize, hidden: usize) {
         let (a, d, e) = (k * nch_h * inter, k * nch_i * hidden, k * inter);
-        self.pg.clear(); self.pg.resize(a, 0); self.pu.clear(); self.pu.resize(a, 0); self.pd.clear(); self.pd.resize(d, 0);
+        // NO .clear(): resize is a no-op at steady size (MoE dims are constant), so the ~5.4 MB int32
+        // partials are NOT re-memset single-threaded each call (the PREP wall). The workers zero their
+        // own pg/pu/pd slot in parallel (phase A/C) before accumulating -- same result, 32x the memset.
+        self.pg.resize(a, 0); self.pu.resize(a, 0); self.pd.resize(d, 0);
         self.g.resize(e, 0.0); self.u.resize(e, 0.0); self.act.resize(e, 0.0);
         self.out.resize(k * hidden, 0.0); self.xq_act.resize(e, 0); self.xs_act.resize(k, 0.0);
     }
