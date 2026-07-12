@@ -360,3 +360,24 @@ Deliverable C fully measured (engagement + lut8), and the floor did not move:
 - Session ~1h ~8 USD. Program: ~63 USD AWS + 4 RunPod. Milestone: the inversion
   runs the full 671B at 1.31 tok/s lossless-4bit on ONE 64-vCPU box, no
   datacenter -- interactive-adjacent, x5.5 the disk-offload baseline.
+
+## 671B session G (2026-07-12): the 386ms MoE gap SPLIT -- it is ws_entry (per-call overhead), NOT the shared expert
+
+Whole-forward instrumentation (G-inc1) at steady state (pos 17-18):
+- moe wall ~455 ms = phases(A98+RA10+C41+RC28 ~177) + ws_entry(~213) + xcopy(1.4)
+  + shared(6.6).
+- SHARED EXPERT = 6.6 ms: the residual-overlap prior is REFUTED, shared is already
+  trivial (VRAM-resident, fast); no overlap lever there.
+- XCOPY (device->host activation drain) = 1.4 ms: trivial.
+- ws_entry = ws_total - timed phases = ~213 ms = THE GAP. It is the per-call
+  work-steal overhead OUTSIDE decode/reduce: int8 activation x-quantization,
+  codebook-cache HashMap lookup (464/token), pool submit/handoff (spin x58),
+  and the routed combine/saxpy. ~3.7 ms/layer of pure orchestration.
+- Token budget now: attention 291 + moe 455 (phases 177 + ws_entry 213 + misc) =
+  ~776 ms = 1.29 tok/s steady.
+- THE TWO REAL TARGETS, cleanly isolated: (1) ws_entry ~213 ms (per-call
+  overhead, needs a sub-split: x-quant vs handoff vs lookup vs combine); (2)
+  attention 291 ms (GPU-side absorption). Decode itself (phases 177) is DONE.
+- If ws_entry halves (~100) and attention drops to ~80: token ~460 ms = ~2.2
+  tok/s. Both are orchestration/overhead, not physics: reachable.
+- Session ~1h ~8 USD. Program: ~71 USD AWS + 4 RunPod.
