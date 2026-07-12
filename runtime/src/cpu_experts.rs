@@ -1317,6 +1317,24 @@ fn native_ws_ctx<'a>(experts: &'a [NativeExpert<'a>], x: &'a [f32], hidden: usiz
     }
 }
 
+/// Persistent per-thread scratch for the native work-steal, reused across the ~58 MoE calls/token so
+/// the ~5.5 MB of partial/reduce buffers are allocated + faulted in ONCE, not per layer (the ~138 ms
+/// per-call overhead session-4 flagged was mostly this malloc + first-touch fault). Only the partials
+/// pg/pu/pd are re-zeroed each call (phase A accumulates into them); g/u/act/out are fully overwritten
+/// by RA/RC so they keep stale bytes harmlessly. Determinism is unchanged (same buffers, same math).
+#[derive(Default)]
+struct WsScratch { pg: Vec<f32>, pu: Vec<f32>, pd: Vec<f32>, g: Vec<f32>, u: Vec<f32>, act: Vec<f32>, out: Vec<f32> }
+impl WsScratch {
+    fn ready(&mut self, k: usize, nch_h: usize, nch_i: usize, inter: usize, hidden: usize) {
+        let (a, d, e) = (k * nch_h * inter, k * nch_i * hidden, k * inter);
+        self.pg.clear(); self.pg.resize(a, 0.0); // zeroed; keeps capacity so no realloc after warmup
+        self.pu.clear(); self.pu.resize(a, 0.0);
+        self.pd.clear(); self.pd.resize(d, 0.0);
+        self.g.resize(e, 0.0); self.u.resize(e, 0.0); self.act.resize(e, 0.0); self.out.resize(k * hidden, 0.0);
+    }
+}
+thread_local! { static WS_SCRATCH: std::cell::RefCell<WsScratch> = std::cell::RefCell::new(WsScratch::default()); }
+
 /// Native-path routed MoE sum with ONE phased work-steal over ALL (expert, proj, input-chunk) tasks
 /// per call, on the persistent pool -- replacing the per-GEMV pool dispatch (`routed_experts_native`
 /// issued 3*k dispatches/layer; at 671B that was ~1392/token, most with too few chunks to fill the
@@ -1331,35 +1349,33 @@ pub fn routed_experts_native_worksteal(x: &[f32], experts: &[NativeExpert], hidd
     if p.n <= 1 { routed_experts_native(x, experts, hidden, inter, acc_out); return; }
     let nch_h = (hidden + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
     let nch_i = (inter + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
-    let mut pg = vec![0f32; k * nch_h * inter];
-    let mut pu = vec![0f32; k * nch_h * inter];
-    let mut pd = vec![0f32; k * nch_i * hidden];
-    let mut g = vec![0f32; k * inter];
-    let mut u = vec![0f32; k * inter];
-    let mut act = vec![0f32; k * inter];
-    let mut out = vec![0f32; k * hidden];
     let eng_vec: Vec<AtomicUsize> = if engage_debug() { (0..p.n).map(|_| AtomicUsize::new(0)).collect() } else { Vec::new() };
     let eng = if engage_debug() { Some(eng_vec.as_slice()) } else { None };
-    let ctx = native_ws_ctx(experts, x, hidden, inter, nch_h, nch_i, k, p.n, eng,
-        &mut pg, &mut pu, &mut pd, &mut g, &mut u, &mut act, &mut out);
-    p.run(&|| native_ws_worker(&ctx));
-    if engage_debug() {
-        // Print ONE representative distribution (not per-call, which would flood a decode).
-        static PRINTED: OnceLock<()> = OnceLock::new();
-        PRINTED.get_or_init(|| {
-            let counts: Vec<usize> = eng_vec.iter().map(|a| a.load(Ordering::Relaxed)).collect();
-            let active = counts.iter().filter(|&&c| c > 0).count();
-            let (mn, mx) = (counts.iter().copied().min().unwrap_or(0), counts.iter().copied().max().unwrap_or(0));
-            let total: usize = counts.iter().sum();
-            eprintln!("[cpu_engage] workers={} active={active} tasks_total={total} per-worker min={mn} max={mx} spin={} dist={:?}",
-                      p.n, cpu_spin(), counts);
-        });
-    }
-    // Fixed expert-order weighted combine (single thread).
-    for (e, ex) in experts.iter().enumerate() {
-        let (w, base) = (ex.weight, e * hidden);
-        for i in 0..hidden { acc_out[i] += w * out[base + i]; }
-    }
+    WS_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        s.ready(k, nch_h, nch_i, inter, hidden);
+        let WsScratch { pg, pu, pd, g, u, act, out } = &mut *s;
+        let ctx = native_ws_ctx(experts, x, hidden, inter, nch_h, nch_i, k, p.n, eng,
+            pg, pu, pd, g, u, act, out);
+        p.run(&|| native_ws_worker(&ctx));
+        if engage_debug() {
+            // Print ONE representative distribution (not per-call, which would flood a decode).
+            static PRINTED: OnceLock<()> = OnceLock::new();
+            PRINTED.get_or_init(|| {
+                let counts: Vec<usize> = eng_vec.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+                let active = counts.iter().filter(|&&c| c > 0).count();
+                let (mn, mx) = (counts.iter().copied().min().unwrap_or(0), counts.iter().copied().max().unwrap_or(0));
+                let total: usize = counts.iter().sum();
+                eprintln!("[cpu_engage] workers={} active={active} tasks_total={total} per-worker min={mn} max={mx} spin={} dist={:?}",
+                          p.n, cpu_spin(), counts);
+            });
+        }
+        // Fixed expert-order weighted combine (single thread).
+        for (e, ex) in experts.iter().enumerate() {
+            let (w, base) = (ex.weight, e * hidden);
+            for i in 0..hidden { acc_out[i] += w * out[base + i]; }
+        }
+    });
 }
 
 /// Thread-count-explicit twin of [`routed_experts_native_worksteal`] (scoped spawn instead of the
@@ -1453,6 +1469,11 @@ unsafe impl Sync for Lut8Ctx<'_> {}
 
 fn lut8_worker(c: &Lut8Ctx) {
     let (nch_h, nch_i, inter, hidden, k) = (c.nch_h, c.nch_i, c.inter, c.hidden, c.k);
+    // TRAPETUM_MOE_TIMING also covers the lut8 path (the gap session-4 flagged): Phase Q (int8
+    // quantize of the SiLU output, lut8-only) folds into the RA bucket.
+    let tm = moetime::on();
+    let mut ph = if tm { Some(std::time::Instant::now()) } else { None };
+    macro_rules! lap { ($a:expr) => { if let Some(t) = ph { moetime::add($a, t.elapsed().as_micros() as u64); ph = Some(std::time::Instant::now()); } }; }
     // Phase A: gate+up int8 decode -> int32 partials.
     let na = k * 2 * nch_h;
     loop {
@@ -1466,6 +1487,7 @@ fn lut8_worker(c: &Lut8Ctx) {
         let slot = unsafe { std::slice::from_raw_parts_mut(base.0.add((e * nch_h + ci) * inter), inter) };
         accumulate_i8_dispatch(packed, cb_t, inter, c.xq_x, slot, i0, i1);
     }
+    lap!(&moetime::A_US);
     c.bar.wait();
     // Phase RA: reduce gate/up int32 partials + rescale (xs_x*scale) + SiLU, per (expert, o-chunk).
     let nra = k * c.ra_per;
@@ -1490,6 +1512,7 @@ fn lut8_worker(c: &Lut8Ctx) {
             }
         }
     }
+    lap!(&moetime::RA_US);
     c.bar.wait();
     // Phase Q: quantize each expert's SiLU output to int8 (scale spans the whole vector).
     loop {
@@ -1503,6 +1526,7 @@ fn lut8_worker(c: &Lut8Ctx) {
             for o in 0..inter { *dst.add(o) = xq[o]; }
         }
     }
+    lap!(&moetime::RA_US); // fold the lut8-only quantize phase into RA
     c.bar.wait();
     // Phase C: down int8 decode -> int32 partials.
     let nc = k * nch_i;
@@ -1516,6 +1540,7 @@ fn lut8_worker(c: &Lut8Ctx) {
         let slot = unsafe { std::slice::from_raw_parts_mut(c.pd.0.add((e * nch_i + ci) * hidden), hidden) };
         accumulate_i8_dispatch(ex.dp, &ex.d_t, hidden, xq_act_e, slot, i0, i1);
     }
+    lap!(&moetime::C_US);
     c.bar.wait();
     // Phase RC: reduce down int32 partials + rescale (xs_act*scale), per (expert, o-chunk).
     let nrc = k * c.rc_per;
@@ -1535,6 +1560,7 @@ fn lut8_worker(c: &Lut8Ctx) {
             }
         }
     }
+    lap!(&moetime::RC_US);
 }
 
 /// lut8 end-to-end routed MoE sum (TRAPETUM_CPU_KERNEL=lut8). Recodes codebooks to int8, quantizes
