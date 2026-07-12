@@ -335,3 +335,28 @@ Deliverable C fully measured (engagement + lut8), and the floor did not move:
   WITH cache-drop staging. Ceiling if (1)+(2) land: ~400-500 ms/token
   (~2-2.5 tok/s) on this box class.
 - Session ~1.5 h ~11 USD. Program totals: ~55 USD AWS + 4 RunPod.
+
+## 671B session 5 (2026-07-12): the transpose lands -- 1.31 tok/s (x5.5 from 0.24)
+
+- lut8 16x16 in-register transpose (lever #1): per-core decode atom 0.66 ->
+  3.3 GB/s (x5), gate bit-exact on AVX2. But total was masked until:
+- recode+transpose HOISTED to a per-expert lazy cache (lever #2b): removed
+  ~710 ms/token of per-call codebook prep.
+- RESULT (T=32, steady, last 12): 762 ms/token = 1.31 tok/s. Chain:
+  0.24 -> 0.44 -> 0.96 -> 1.31. Best config T=32 (T=48/60 regress: the reduce
+  phase RC climbs 64->97->129 ms with threads = reduce contention/oversub).
+- Dissection at 1.31: attention=287 (38%), moe=613. But moe phases only sum to
+  A99+RA10+C54+RC64 = 227: ~386 ms/token STILL unaccounted inside the MoE
+  forward (not the 4 timed phases): candidates = host activation copy +
+  per-GEMV x-quantization + combine + pool handoff. This is the next lever, and
+  it is now the BIGGEST single chunk (bigger than attention).
+- Decode itself is essentially solved (A+C = 153 ms for 10 GB = ~67 GB/s
+  aggregate, near the read floor): the wall moved from compute to per-call
+  orchestration overhead + attention.
+- Next levers ranked: (1) the ~386 ms unaccounted MoE per-call overhead
+  (instrument the gap: activation quant, combine, handoff); (2) the 287 ms
+  attention (GPU-side absorption); (3) reduce-phase RC contention at high T.
+  If (1) halves and (2) drops to ~50: token ~ 480 ms = ~2 tok/s still in reach.
+- Session ~1h ~8 USD. Program: ~63 USD AWS + 4 RunPod. Milestone: the inversion
+  runs the full 671B at 1.31 tok/s lossless-4bit on ONE 64-vCPU box, no
+  datacenter -- interactive-adjacent, x5.5 the disk-offload baseline.
