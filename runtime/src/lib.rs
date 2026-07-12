@@ -2828,7 +2828,12 @@ impl MoeBlockOffload {
         static CPU_EXP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let cpu = self.cpu_override.unwrap_or_else(|| *CPU_EXP.get_or_init(|| std::env::var("TRAPETUM_CPU_EXPERTS").map(|v| v == "1").unwrap_or(false)));
         if cpu {
+            // G-inc1 whole-forward split: time the stages OUTSIDE the work-steal phases so the box can
+            // dissect the ~386 ms/token gap (xcopy drain, work-steal entry overhead, GPU shared expert).
+            let tm = cpu_experts::moetime::on();
+            let t = std::time::Instant::now();
             let x = self.norm.to_host();
+            if tm { cpu_experts::moetime::add(&cpu_experts::moetime::XCOPY_US, t.elapsed().as_micros() as u64); }
             let refs: Vec<cpu_experts::NativeExpert> = picks.iter().map(|&(e, w)| match &self.hosts[e] {
                 ExpertHost::Scalar { gp, gc, up, uc, dp, dc } => cpu_experts::NativeExpert {
                     gp: gp.as_slice(), gc, up: up.as_slice(), uc, dp: dp.as_slice(), dc, weight: w,
@@ -2840,15 +2845,19 @@ impl MoeBlockOffload {
             // pool dispatch per GEMV (deliverable B lever 2): at 671B this cuts ~1392 dispatches/token
             // to ~58 and fills the workers. TRAPETUM_CPU_KERNEL=lut8 selects the int8 vpshufb decode
             // (deliverable C, tolerance ~0.5%/GEMV); anything else uses the exact f32 gather decode.
+            let t = std::time::Instant::now();
             if cpu_experts::cpu_kernel() == cpu_experts::CpuKernel::Lut8 {
                 cpu_experts::routed_experts_native_worksteal_lut8(&x, &refs, self.hidden, self.inter, &mut acc_host);
             } else {
                 cpu_experts::routed_experts_native_worksteal(&x, &refs, self.hidden, self.inter, &mut acc_host);
             }
+            if tm { cpu_experts::moetime::add(&cpu_experts::moetime::WS_US, t.elapsed().as_micros() as u64); }
+            let t = std::time::Instant::now();
             let mut acc = DevF32::from_host(&acc_host);
             let (sg, su, sd) = (self.shared.gate.as_ref(), self.shared.up.as_ref(), self.shared.down.as_ref());
             self.run_ffn(sg, su, sd, &mut acc, 1.0); // shared expert on GPU, as in V2-Lite
             residual_add(h, &acc);
+            if tm { unsafe { dev_sync(); } cpu_experts::moetime::add(&cpu_experts::moetime::SHARED_US, t.elapsed().as_micros() as u64); }
             return;
         }
         // TRAPETUM_PREFETCH=1: kick off background reads for ALL picked experts not
@@ -3793,11 +3802,15 @@ impl DeepSeekModel {
                       attn_us as f64/1e3, moe_us as f64/1e3, other_us as f64/1e3, tot_us as f64/1e3);
         }
         if cpu_experts::moetime::on() {
-            // Per-token MoE phase split (summed over 58 layers), summed worker-us / n_threads ~ wall.
-            let (a, ra, c, rc) = cpu_experts::moetime::take();
+            // Per-token MoE split (summed over 58 layers). A/RA/C/RC are worker-us (/n_threads ~ wall);
+            // XCOPY/WS/SHARED are single-thread wall (measured on the main thread in the forward). The
+            // work-steal ENTRY overhead = WS - (A+RA+C+RC)/n. The gap = moe_wall - XCOPY - WS - SHARED.
+            let (a, ra, c, rc, xcopy, ws, shared) = cpu_experts::moetime::take();
             let n = (cpu_experts::cpu_threads().max(1)) as f64;
-            eprintln!("[moe_timing pos={pos}] A(gate+up decode)={:.1} RA(reduce+silu)={:.1} C(down decode)={:.1} RC(reduce)={:.1} ms  (worker-us/{n} ~ wall)",
-                      a as f64/n/1e3, ra as f64/n/1e3, c as f64/n/1e3, rc as f64/n/1e3);
+            let ph = (a as f64 + ra as f64 + c as f64 + rc as f64) / n / 1e3;
+            eprintln!("[moe_timing pos={pos}] A={:.1} RA={:.1} C={:.1} RC={:.1} (phases~{:.1}) | xcopy={:.1} ws_total={:.1} ws_entry={:.1} shared={:.1} ms",
+                      a as f64/n/1e3, ra as f64/n/1e3, c as f64/n/1e3, rc as f64/n/1e3, ph,
+                      xcopy as f64/1e3, ws as f64/1e3, ws as f64/1e3 - ph, shared as f64/1e3);
         }
         out
     }

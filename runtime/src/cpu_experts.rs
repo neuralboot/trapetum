@@ -1221,14 +1221,23 @@ pub mod moetime {
     pub static RA_US: AtomicU64 = AtomicU64::new(0);
     pub static C_US: AtomicU64 = AtomicU64::new(0);
     pub static RC_US: AtomicU64 = AtomicU64::new(0);
+    // Whole-forward stages OUTSIDE the work-steal phases (G-inc1: the ~386 ms/token gap session-5
+    // exposed lives here). XCOPY = norm.to_host() drain+copy; WS = the whole work-steal call wall
+    // (WS - (A+RA+C+RC) = the entry overhead: xquant + cache lookup + pool handoff + combine);
+    // SHARED = from_host + the GPU shared-expert run_ffn + residual (drained).
+    pub static XCOPY_US: AtomicU64 = AtomicU64::new(0);
+    pub static WS_US: AtomicU64 = AtomicU64::new(0);
+    pub static SHARED_US: AtomicU64 = AtomicU64::new(0);
     pub fn on() -> bool {
         static E: OnceLock<bool> = OnceLock::new();
         *E.get_or_init(|| std::env::var("TRAPETUM_MOE_TIMING").map(|v| v == "1").unwrap_or(false))
     }
     #[inline] pub fn add(a: &AtomicU64, us: u64) { a.fetch_add(us, Ordering::Relaxed); }
-    pub fn take() -> (u64, u64, u64, u64) {
+    /// (A, RA, C, RC, XCOPY, WS, SHARED) microseconds, reset.
+    pub fn take() -> (u64, u64, u64, u64, u64, u64, u64) {
         (A_US.swap(0, Ordering::Relaxed), RA_US.swap(0, Ordering::Relaxed),
-         C_US.swap(0, Ordering::Relaxed), RC_US.swap(0, Ordering::Relaxed))
+         C_US.swap(0, Ordering::Relaxed), RC_US.swap(0, Ordering::Relaxed),
+         XCOPY_US.swap(0, Ordering::Relaxed), WS_US.swap(0, Ordering::Relaxed), SHARED_US.swap(0, Ordering::Relaxed))
     }
 }
 
