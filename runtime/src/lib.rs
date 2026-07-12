@@ -3585,10 +3585,44 @@ impl DsFfn {
     }
 }
 
+/// `TRAPETUM_MLA_TIMING=1`: split the DeepSeek decode into MLA-attention vs MoE-FFN wall time per
+/// token, so the box can locate the serial wall without gdb. When on, each phase drains the GPU so
+/// the split is real (a small extra sync; off by default so it costs nothing).
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub mod dstime {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    pub static ATTN_US: AtomicU64 = AtomicU64::new(0);
+    pub static MOE_US: AtomicU64 = AtomicU64::new(0);
+    pub fn on() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var("TRAPETUM_MLA_TIMING").map(|v| v == "1").unwrap_or(false))
+    }
+    pub fn add_attn(us: u64) { ATTN_US.fetch_add(us, Ordering::Relaxed); }
+    pub fn add_moe(us: u64) { MOE_US.fetch_add(us, Ordering::Relaxed); }
+    pub fn take() -> (u64, u64) { (ATTN_US.swap(0, Ordering::Relaxed), MOE_US.swap(0, Ordering::Relaxed)) }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl DsLayer {
     fn forward(&mut self, h: &mut DevHalf, pos: usize) {
         let mut normed = DevHalf::zeros(h.n);
         rmsnorm(h, &self.attn_norm, &mut normed, self.attn.eps);
+        if dstime::on() {
+            let t = std::time::Instant::now();
+            { let o = self.attn.forward(&normed, pos); residual_add(h, o); }
+            unsafe { dev_sync(); }
+            dstime::add_attn(t.elapsed().as_micros() as u64);
+            let t = std::time::Instant::now();
+            match &mut self.ffn {
+                DsFfn::Dense(m) => m.forward(h),
+                DsFfn::Moe(m) => m.forward(h),
+                DsFfn::MoeOffload(m) => m.forward(h),
+            }
+            unsafe { dev_sync(); }
+            dstime::add_moe(t.elapsed().as_micros() as u64);
+            return;
+        }
         { let o = self.attn.forward(&normed, pos); residual_add(h, o); }
         match &mut self.ffn {
             DsFfn::Dense(m) => m.forward(h),
@@ -3663,10 +3697,19 @@ impl DeepSeekModel {
     pub fn forward(&mut self, token: usize, pos: usize) -> Vec<f32> {
         let row = &self.embedding[token*self.hidden..(token+1)*self.hidden];
         self.h.upload(row);
+        let tstart = if dstime::on() { Some(std::time::Instant::now()) } else { None };
         for l in &mut self.layers { l.forward(&mut self.h, pos); }
         rmsnorm(&self.h, &self.final_norm, &mut self.normed, self.eps);
         self.lm_head.forward_into(&self.normed, &mut self.logits);
-        self.logits.to_host()
+        let out = self.logits.to_host();
+        if let Some(t) = tstart {
+            let (attn_us, moe_us) = dstime::take();
+            let tot_us = t.elapsed().as_micros() as u64;
+            let other_us = tot_us.saturating_sub(attn_us + moe_us);
+            eprintln!("[mla_timing pos={pos}] attention={:.1} moe={:.1} other={:.1} total={:.1} ms",
+                      attn_us as f64/1e3, moe_us as f64/1e3, other_us as f64/1e3, tot_us as f64/1e3);
+        }
+        out
     }
 
     /// Like [`forward`], but dumps per-layer hidden-state statistics (l2/absmax/mean) for a
