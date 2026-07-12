@@ -3806,11 +3806,15 @@ impl DeepSeekModel {
             // XCOPY/WS/SHARED are single-thread wall (measured on the main thread in the forward). The
             // work-steal ENTRY overhead = WS - (A+RA+C+RC)/n. The gap = moe_wall - XCOPY - WS - SHARED.
             let (a, ra, c, rc, xcopy, ws, shared) = cpu_experts::moetime::take();
+            let (setup, run, combine) = cpu_experts::moetime::take_ws_sub();
             let n = (cpu_experts::cpu_threads().max(1)) as f64;
             let ph = (a as f64 + ra as f64 + c as f64 + rc as f64) / n / 1e3;
             eprintln!("[moe_timing pos={pos}] A={:.1} RA={:.1} C={:.1} RC={:.1} (phases~{:.1}) | xcopy={:.1} ws_total={:.1} ws_entry={:.1} shared={:.1} ms",
                       a as f64/n/1e3, ra as f64/n/1e3, c as f64/n/1e3, rc as f64/n/1e3, ph,
                       xcopy as f64/1e3, ws as f64/1e3, ws as f64/1e3 - ph, shared as f64/1e3);
+            // ws_entry sub-split: setup (cache+quant+scratch) | barrier+handoff (run - phases) | combine
+            eprintln!("[moe_ws_sub pos={pos}] setup={:.1} run={:.1} barrier+handoff={:.1} combine={:.1} ms",
+                      setup as f64/1e3, run as f64/1e3, run as f64/1e3 - ph, combine as f64/1e3);
         }
         out
     }

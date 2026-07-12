@@ -1228,6 +1228,16 @@ pub mod moetime {
     pub static XCOPY_US: AtomicU64 = AtomicU64::new(0);
     pub static WS_US: AtomicU64 = AtomicU64::new(0);
     pub static SHARED_US: AtomicU64 = AtomicU64::new(0);
+    // ws_entry sub-split (G-inc2): SETUP = codebook-cache lookups + x-quantize + scratch prep;
+    // RUN = the p.run() wall (RUN - phases = barrier + pool-handoff overhead); COMBINE = the
+    // fixed-order weighted saxpy. ws_entry = SETUP + (RUN - phases) + COMBINE.
+    pub static WS_SETUP_US: AtomicU64 = AtomicU64::new(0);
+    pub static WS_RUN_US: AtomicU64 = AtomicU64::new(0);
+    pub static WS_COMBINE_US: AtomicU64 = AtomicU64::new(0);
+    /// Reset all ws-entry sub-stage timers and return them (setup, run, combine).
+    pub fn take_ws_sub() -> (u64, u64, u64) {
+        (WS_SETUP_US.swap(0, Ordering::Relaxed), WS_RUN_US.swap(0, Ordering::Relaxed), WS_COMBINE_US.swap(0, Ordering::Relaxed))
+    }
     pub fn on() -> bool {
         static E: OnceLock<bool> = OnceLock::new();
         *E.get_or_init(|| std::env::var("TRAPETUM_MOE_TIMING").map(|v| v == "1").unwrap_or(false))
@@ -1631,12 +1641,30 @@ fn lut8_worker(c: &Lut8Ctx) {
 /// activations, runs the int8 vpshufb decode through the phased work-steal, rescales in the reduces.
 /// Deterministic + thread-invariant (integer partials, fixed orders). Matches the f32 path within the
 /// int8 tolerance. `acc_out` (len `hidden`) overwritten. Falls back to the f32 path for k<=1 / no pool.
+/// Persistent per-thread scratch for the lut8 path (int32 partials + reduce/quantize buffers),
+/// reused across the ~58 MoE calls/token -- the same malloc+fault removal as the gather path
+/// (WsScratch), which the lut8 path had been paying every call (~5.5 MB, ~100 ms/token: the bulk
+/// of the ws_entry gap session-5 exposed). Only pg/pu/pd are re-zeroed (phase A accumulates).
+#[derive(Default)]
+struct Lut8Scratch { pg: Vec<i32>, pu: Vec<i32>, pd: Vec<i32>, g: Vec<f32>, u: Vec<f32>, act: Vec<f32>, out: Vec<f32>, xq_act: Vec<i8>, xs_act: Vec<f32> }
+impl Lut8Scratch {
+    fn ready(&mut self, k: usize, nch_h: usize, nch_i: usize, inter: usize, hidden: usize) {
+        let (a, d, e) = (k * nch_h * inter, k * nch_i * hidden, k * inter);
+        self.pg.clear(); self.pg.resize(a, 0); self.pu.clear(); self.pu.resize(a, 0); self.pd.clear(); self.pd.resize(d, 0);
+        self.g.resize(e, 0.0); self.u.resize(e, 0.0); self.act.resize(e, 0.0);
+        self.out.resize(k * hidden, 0.0); self.xq_act.resize(e, 0); self.xs_act.resize(k, 0.0);
+    }
+}
+thread_local! { static LUT8_SCRATCH: std::cell::RefCell<Lut8Scratch> = std::cell::RefCell::new(Lut8Scratch::default()); }
+
 pub fn routed_experts_native_worksteal_lut8(x: &[f32], experts: &[NativeExpert], hidden: usize, inter: usize, acc_out: &mut [f32]) {
     let p = pool();
     let k = experts.len();
     for v in acc_out.iter_mut().take(hidden) { *v = 0.0; }
     if k == 0 { return; }
-    // Recode is now CACHED per expert (lazy-once), not redone every call -- the session-5 fix.
+    let tm = moetime::on();
+    let ts = std::time::Instant::now();
+    // Recode is CACHED per expert (lazy-once); x quantized once/call.
     let cbs: Vec<std::sync::Arc<ExpertI8Cb>> = experts.iter().map(|e| cached_recode(e, hidden, inter)).collect();
     let ei8: Vec<ExpertI8> = experts.iter().zip(&cbs).map(|(e, cb)| ExpertI8 {
         gp: e.gp, g_t: &cb.g_t, gs: &cb.gs,
@@ -1646,30 +1674,31 @@ pub fn routed_experts_native_worksteal_lut8(x: &[f32], experts: &[NativeExpert],
     let (xq_x, xs_x) = quantize_i8(&x[..hidden]);
     let nch_h = (hidden + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
     let nch_i = (inter + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
-    let mut pg = vec![0i32; k * nch_h * inter];
-    let mut pu = vec![0i32; k * nch_h * inter];
-    let mut pd = vec![0i32; k * nch_i * hidden];
-    let mut g = vec![0f32; k * inter];
-    let mut u = vec![0f32; k * inter];
-    let mut act = vec![0f32; k * inter];
-    let mut out = vec![0f32; k * hidden];
-    let mut xq_act = vec![0i8; k * inter];
-    let mut xs_act = vec![0f32; k];
-    let ctx = Lut8Ctx {
-        experts: &ei8, xq_x: &xq_x, xs_x, hidden, inter, nch_h, nch_i, k,
-        ra_per: (inter + RED_CHUNK - 1) / RED_CHUNK, rc_per: (hidden + RED_CHUNK - 1) / RED_CHUNK,
-        ctr_a: AtomicUsize::new(0), ctr_ra: AtomicUsize::new(0), ctr_q: AtomicUsize::new(0),
-        ctr_c: AtomicUsize::new(0), ctr_rc: AtomicUsize::new(0),
-        bar: PhaseBar::new(p.n, cpu_spin()),
-        pg: RawI32(pg.as_mut_ptr()), pu: RawI32(pu.as_mut_ptr()), pd: RawI32(pd.as_mut_ptr()),
-        g: RawF32(g.as_mut_ptr()), u: RawF32(u.as_mut_ptr()), act: RawF32(act.as_mut_ptr()), out: RawF32(out.as_mut_ptr()),
-        xq_act: RawI8(xq_act.as_mut_ptr()), xs_act: RawF32(xs_act.as_mut_ptr()),
-    };
-    p.run(&|| lut8_worker(&ctx));
-    for (e, ex) in ei8.iter().enumerate() {
-        let (w, base) = (ex.weight, e * hidden);
-        for i in 0..hidden { acc_out[i] += w * out[base + i]; }
-    }
+    LUT8_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        s.ready(k, nch_h, nch_i, inter, hidden);
+        let Lut8Scratch { pg, pu, pd, g, u, act, out, xq_act, xs_act } = &mut *s;
+        let ctx = Lut8Ctx {
+            experts: &ei8, xq_x: &xq_x, xs_x, hidden, inter, nch_h, nch_i, k,
+            ra_per: (inter + RED_CHUNK - 1) / RED_CHUNK, rc_per: (hidden + RED_CHUNK - 1) / RED_CHUNK,
+            ctr_a: AtomicUsize::new(0), ctr_ra: AtomicUsize::new(0), ctr_q: AtomicUsize::new(0),
+            ctr_c: AtomicUsize::new(0), ctr_rc: AtomicUsize::new(0),
+            bar: PhaseBar::new(p.n, cpu_spin()),
+            pg: RawI32(pg.as_mut_ptr()), pu: RawI32(pu.as_mut_ptr()), pd: RawI32(pd.as_mut_ptr()),
+            g: RawF32(g.as_mut_ptr()), u: RawF32(u.as_mut_ptr()), act: RawF32(act.as_mut_ptr()), out: RawF32(out.as_mut_ptr()),
+            xq_act: RawI8(xq_act.as_mut_ptr()), xs_act: RawF32(xs_act.as_mut_ptr()),
+        };
+        if tm { moetime::add(&moetime::WS_SETUP_US, ts.elapsed().as_micros() as u64); }
+        let tr = std::time::Instant::now();
+        p.run(&|| lut8_worker(&ctx));
+        if tm { moetime::add(&moetime::WS_RUN_US, tr.elapsed().as_micros() as u64); }
+        let tc = std::time::Instant::now();
+        for (e, ex) in ei8.iter().enumerate() {
+            let (w, base) = (ex.weight, e * hidden);
+            for i in 0..hidden { acc_out[i] += w * out[base + i]; }
+        }
+        if tm { moetime::add(&moetime::WS_COMBINE_US, tc.elapsed().as_micros() as u64); }
+    });
 }
 
 #[cfg(test)]
