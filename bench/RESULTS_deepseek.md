@@ -254,3 +254,28 @@ cache verified), branch s19-mixed-precision (deliverable A CPU-experts path).
   box, then redo the 671B session (fully scripted, ~40 min to reproduce).
 - Cost of the session: ~12 USD. Also noted: prompt.bin had a double BOS
   (tokenizer auto-adds id 0); fix the generator next run.
+
+## 671B v3 rerun with deliverable B (AWS g6e.16xlarge, 2026-07-12): 0.44 tok/s, gather is the wall
+
+- HYBRID AVX: 2271 ms/token (0.44 tok/s), thread-insensitive (32/48/60 identical).
+- Scalar A/B: 2500 ms/token: the AVX gather kernel buys only 8%.
+- MAP_POPULATE experiment: no change (minor-fault hypothesis refuted cleanly;
+  populate verified working: load 26s -> 50.6s).
+- Live utilization sampling: ~460-1000% CPU of 6400% = only ~9-16 of 32 workers
+  effective; ~0.5-0.7 GB/s per core.
+- DIAGNOSIS: two compounding ceilings. (1) per-core: AVX2 gather decode of the
+  per-column f32 codebook is ~1 elem/cycle even L2-resident: ~0.7 GB/s/core;
+  even perfect 32-core engagement would cap at ~22 GB/s = ~2 tok/s. (2)
+  engagement: pool wake latency + phase barriers x58 calls/token + tail
+  imbalance keep half the workers idle.
+- Deliverable B improved 0.24 -> 0.44 tok/s (the work-steal grain paid x1.8);
+  the remaining wall is the DECODE ITSELF, exactly as the deliverable-B report
+  flagged: hardware gather cannot reach the tbl/pshufb 47 GB/s class.
+- Deliverable C scoped, two candidate kernels to MEASURE (not assume): (C1)
+  AVX-512 vpermps register-resident 16xf32 LUT with an (i-block x o-block)
+  register-transpose tiling: EXACT, no contract change, hardest engineering;
+  (C2) int8 codebook recode + vpshufb value-LUT (the C-probe design, 47 GB/s
+  class): adds quantization of the codebook itself (error scale comparable to
+  the already-accepted fp16-vs-f32 path difference; gates are margins/PPL since
+  the determinism campaign). Build both behind flags, measure, pick.
+- Session cost ~9 USD. All boxes terminated.
