@@ -1050,6 +1050,11 @@ pub fn gemv_native_i8(packed: &[u8], cb_i8: &[i8], scale: &[f32], oc: usize, ic:
 // the tunable hotspot (a full in-register 16x16 transpose is the perf follow-up once the box profiles).
 pub const LUT8_IB: usize = 16;
 
+/// Column held by output register k of `transpose16x16_epi8`: the unpack cascade emits columns in
+/// bit-reversed (reverse-4-bit) register order, so register k holds column `LUT8_COL_OF_REG[k]`.
+/// Verified on all arches by `transpose16x16_wiring_is_a_true_transpose` (the decode indexes by it).
+const LUT8_COL_OF_REG: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+
 /// Transpose the recoded int8 codebook `[K,oc]` (strided per column) to `[oc,16]` (16 contiguous
 /// centroids per column) -- the vpshufb table layout. One-time, small (oc*16 bytes).
 pub fn transpose_codebook_i8(cb_i8: &[i8], oc: usize) -> Vec<i8> {
@@ -1088,36 +1093,69 @@ unsafe fn hsum256_i32(v: std::arch::x86_64::__m256i) -> i32 {
 
 /// AVX2 lut8 accumulate: vpshufb value-LUT decode + int madd, streaming `packed` in LUT8_IB-input
 /// blocks. Bit-exact to [`accumulate_i8_t`] (integer). `cb_i8_t` is `[oc,16]`, `xq` int8 activations.
+/// 16x16 byte transpose (deliverable C follow-up, session-4 per-core lever). `rows[t]` holds 16
+/// bytes = byte-positions j0..j0+15 of input `ib+t`; returns `cols[c]` = 16 bytes = the 16 inputs'
+/// byte at position j0+c. Standard 4-stage unpack cascade (8->16->32->64-bit interleave). This
+/// replaces the scalar strided nibble gather (16 L2-latency loads/byte-position -- the 0.66 GB/s/core
+/// atom) with in-register shuffles, so the lut8 decode is register-bound, not element-load-bound.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn transpose16x16_epi8(rows: &[std::arch::x86_64::__m128i; 16]) -> [std::arch::x86_64::__m128i; 16] {
+    use std::arch::x86_64::*;
+    let mut a = [_mm_setzero_si128(); 16];
+    for i in 0..8 { a[2*i] = _mm_unpacklo_epi8(rows[2*i], rows[2*i+1]); a[2*i+1] = _mm_unpackhi_epi8(rows[2*i], rows[2*i+1]); }
+    let mut b = [_mm_setzero_si128(); 16];
+    for i in 0..4 { for k in 0..2 { b[4*i+k] = _mm_unpacklo_epi16(a[4*i+k], a[4*i+2+k]); b[4*i+2+k] = _mm_unpackhi_epi16(a[4*i+k], a[4*i+2+k]); } }
+    let mut c = [_mm_setzero_si128(); 16];
+    for i in 0..2 { for k in 0..4 { c[8*i+k] = _mm_unpacklo_epi32(b[8*i+k], b[8*i+4+k]); c[8*i+4+k] = _mm_unpackhi_epi32(b[8*i+k], b[8*i+4+k]); } }
+    let mut d = [_mm_setzero_si128(); 16];
+    for k in 0..8 { d[k] = _mm_unpacklo_epi64(c[k], c[8+k]); d[8+k] = _mm_unpackhi_epi64(c[k], c[8+k]); }
+    d
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn accumulate_lut8_avx2(packed: &[u8], cb_i8_t: &[i8], oc: usize, xq: &[i8], acc: &mut [i32], i0: usize, i1: usize) {
     use std::arch::x86_64::*;
     let half = oc / 2;
     let mask = _mm_set1_epi8(0x0F);
+    // decode one byte-position's transposed lane (16 inputs) into acc[o_lo],acc[o_hi].
+    #[target_feature(enable = "avx2")]
+    unsafe fn decode_lane(bytes: std::arch::x86_64::__m128i, o_lo: usize, cb_i8_t: &[i8],
+                          xq16: std::arch::x86_64::__m256i, acc: &mut [i32], mask: std::arch::x86_64::__m128i) {
+        use std::arch::x86_64::*;
+        let lo = _mm_and_si128(bytes, mask);
+        let hi = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+        let tbl_lo = _mm_loadu_si128(cb_i8_t.as_ptr().add(o_lo * 16) as *const __m128i);
+        let tbl_hi = _mm_loadu_si128(cb_i8_t.as_ptr().add((o_lo + 1) * 16) as *const __m128i);
+        let p_lo = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_shuffle_epi8(tbl_lo, lo)), xq16);
+        let p_hi = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_shuffle_epi8(tbl_hi, hi)), xq16);
+        *acc.get_unchecked_mut(o_lo)     += hsum256_i32(p_lo);
+        *acc.get_unchecked_mut(o_lo + 1) += hsum256_i32(p_hi);
+    }
     let mut ib = i0;
     while ib + LUT8_IB <= i1 {
-        let xqv = _mm_loadu_si128(xq.as_ptr().add(ib) as *const __m128i); // LUT8_IB int8 activations
-        let xq16 = _mm256_cvtepi8_epi16(xqv);                            // -> 16 int16
-        for j in 0..half {
-            // nibble gather: this byte-position across the input block (cache-resident tile) -> xmm
+        let xq16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xq.as_ptr().add(ib) as *const __m128i));
+        let mut j = 0usize;
+        // full 16-byte-position tiles: load 16 input rows, transpose in-register, decode 16 lanes.
+        while j + 16 <= half {
+            let mut rows = [_mm_setzero_si128(); 16];
+            for t in 0..LUT8_IB { rows[t] = _mm_loadu_si128(packed.as_ptr().add((ib + t) * half + j) as *const __m128i); }
+            let cols = transpose16x16_epi8(&rows);
+            // register k holds column j + LUT8_COL_OF_REG[k] (cascade emits bit-reversed order).
+            for k in 0..16 { decode_lane(cols[k], 2 * (j + LUT8_COL_OF_REG[k]), cb_i8_t, xq16, acc, mask); }
+            j += 16;
+        }
+        // byte-position remainder (half % 16 != 0): scalar-gather the lane, same decode.
+        while j < half {
             let mut buf = [0u8; LUT8_IB];
             for t in 0..LUT8_IB { buf[t] = *packed.get_unchecked((ib + t) * half + j); }
-            let bytes = _mm_loadu_si128(buf.as_ptr() as *const __m128i);
-            let lo = _mm_and_si128(bytes, mask);
-            let hi = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
-            let (o_lo, o_hi) = (2 * j, 2 * j + 1);
-            let tbl_lo = _mm_loadu_si128(cb_i8_t.as_ptr().add(o_lo * 16) as *const __m128i);
-            let tbl_hi = _mm_loadu_si128(cb_i8_t.as_ptr().add(o_hi * 16) as *const __m128i);
-            let dec_lo = _mm_shuffle_epi8(tbl_lo, lo);   // 16 decoded int8 (indices 0..15, no zeroing)
-            let dec_hi = _mm_shuffle_epi8(tbl_hi, hi);
-            let p_lo = _mm256_madd_epi16(_mm256_cvtepi8_epi16(dec_lo), xq16); // exact int32 pairs
-            let p_hi = _mm256_madd_epi16(_mm256_cvtepi8_epi16(dec_hi), xq16);
-            *acc.get_unchecked_mut(o_lo) += hsum256_i32(p_lo);
-            *acc.get_unchecked_mut(o_hi) += hsum256_i32(p_hi);
+            decode_lane(_mm_loadu_si128(buf.as_ptr() as *const __m128i), 2 * j, cb_i8_t, xq16, acc, mask);
+            j += 1;
         }
         ib += LUT8_IB;
     }
-    if ib < i1 { accumulate_i8_t(packed, cb_i8_t, oc, xq, acc, ib, i1); } // scalar tail (< LUT8_IB inputs)
+    if ib < i1 { accumulate_i8_t(packed, cb_i8_t, oc, xq, acc, ib, i1); } // input tail (< LUT8_IB inputs)
 }
 
 // ============================================================================
@@ -2106,6 +2144,44 @@ mod tests {
         eprintln!("[native_ws_probe] hidden={hidden} inter={inter} k={k} threads={} spin={} -> {ms:.3} ms/call, {gbs:.2} GB/s packed",
                   crate::cpu_experts::cpu_threads(), cpu_spin());
         let _ = acc;
+    }
+
+    #[test]
+    fn transpose16x16_wiring_is_a_true_transpose() {
+        // De-risk the 16x16 unpack-cascade WIRING on any arch (the SSE kernel is x86-only): model
+        // _mm_unpacklo/hi_epi{8,16,32,64} as byte permutations on [u8;16], run the SAME 4-stage
+        // cascade, and assert cols[c][t] == rows[t][c]. Proves the index arithmetic before the box.
+        type V = [u8; 16];
+        fn unpack(a: V, b: V, w: usize, hi: bool) -> V {
+            // interleave w-byte lanes from a and b; lo takes lanes 0..8/w*... i.e. the low half.
+            let mut o = [0u8; 16]; let lanes = 8 / w; let base = if hi { 8 } else { 0 };
+            for i in 0..lanes {
+                for x in 0..w { o[(2*i)*w + x] = a[base + i*w + x]; o[(2*i+1)*w + x] = b[base + i*w + x]; }
+            }
+            o
+        }
+        let mut rows = [[0u8; 16]; 16];
+        for t in 0..16 { for c in 0..16 { rows[t][c] = (t * 16 + c) as u8; } }
+        let mut a = [[0u8; 16]; 16];
+        for i in 0..8 { a[2*i] = unpack(rows[2*i], rows[2*i+1], 1, false); a[2*i+1] = unpack(rows[2*i], rows[2*i+1], 1, true); }
+        let mut b = [[0u8; 16]; 16];
+        for i in 0..4 { for k in 0..2 { b[4*i+k] = unpack(a[4*i+k], a[4*i+2+k], 2, false); b[4*i+2+k] = unpack(a[4*i+k], a[4*i+2+k], 2, true); } }
+        let mut cc = [[0u8; 16]; 16];
+        for i in 0..2 { for k in 0..4 { cc[8*i+k] = unpack(b[8*i+k], b[8*i+4+k], 4, false); cc[8*i+4+k] = unpack(b[8*i+k], b[8*i+4+k], 4, true); } }
+        let mut d = [[0u8; 16]; 16];
+        for k in 0..8 { d[k] = unpack(cc[k], cc[8+k], 8, false); d[8+k] = unpack(cc[k], cc[8+k], 8, true); }
+        // Each output register d[k] IS a full column (d[k][t] == rows[t][col] for a fixed col), but
+        // in bit-reversed register order. Compute the column each register holds and check it against
+        // the bit-reverse-4 table the kernel uses (LUT8_COL_OF_REG); also assert it's a permutation.
+        let mut col_of = [255usize; 16];
+        for k in 0..16 {
+            let c0 = (d[k][0]) as usize; // rows[0][c] = c, so d[k][0] names the column
+            for t in 0..16 { assert_eq!(d[k][t], (t*16 + c0) as u8, "d[{k}] is not a clean column"); }
+            col_of[k] = c0;
+        }
+        let mut seen = [false; 16];
+        for &c in &col_of { assert!(!seen[c], "not a permutation"); seen[c] = true; }
+        assert_eq!(col_of, super::LUT8_COL_OF_REG, "kernel's LUT8_COL_OF_REG must match the measured cascade permutation");
     }
 
     #[cfg(target_arch = "x86_64")]
