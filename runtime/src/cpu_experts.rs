@@ -850,6 +850,159 @@ pub fn routed_experts_native(x: &[f32], experts: &[NativeExpert], hidden: usize,
     }
 }
 
+/// Shared state a set of pool workers cooperatively drains for ONE native-path MoE call. Unlike the
+/// re-tiled [`WorkstealCtx`], the native layout chunks over the INPUT dimension (streaming `packed`
+/// once), so each (expert, proj, input-chunk) task writes a disjoint per-chunk PARTIAL that a later
+/// phase reduces in fixed chunk order. `Sync` because the only shared mutation is the phase atomics
+/// / barrier and raw pointers into non-overlapping partial/scratch slices.
+struct NativeWsCtx<'a> {
+    experts: &'a [NativeExpert<'a>],
+    x: &'a [f32],
+    hidden: usize, inter: usize,
+    nch_h: usize, nch_i: usize, k: usize,   // input chunks for gate/up (ic=hidden) and down (ic=inter)
+    ctr_a: AtomicUsize, ctr_ra: AtomicUsize, ctr_c: AtomicUsize, ctr_rc: AtomicUsize,
+    barrier: Barrier,
+    pg: RawF32, pu: RawF32, pd: RawF32,           // per-chunk partials
+    g: RawF32, u: RawF32, act: RawF32, out: RawF32, // reduced per-expert scratch
+}
+unsafe impl Sync for NativeWsCtx<'_> {}
+
+/// One worker's slice of a native-path MoE call. Four phases separated by barriers:
+///   A  gate+up decode-GEMV per (expert, proj, input-chunk) -> disjoint partials
+///   RA reduce gate/up partials (fixed chunk order) + SiLU, per expert
+///   C  down decode-GEMV per (expert, input-chunk) -> disjoint partials
+///   RC reduce down partials (fixed chunk order), per expert
+/// The chunk->partial mapping and every reduction order are fixed, so which worker runs which task
+/// never changes a byte of the result -- thread-count invariant, exactly like the sequential path.
+fn native_ws_worker(c: &NativeWsCtx) {
+    let (nch_h, nch_i, inter, hidden) = (c.nch_h, c.nch_i, c.inter, c.hidden);
+    // Phase A: gate+up input-chunks (2*nch_h per expert).
+    let na = c.k * 2 * nch_h;
+    loop {
+        let t = c.ctr_a.fetch_add(1, Ordering::Relaxed);
+        if t >= na { break; }
+        let (e, rr) = (t / (2 * nch_h), t % (2 * nch_h));
+        let (which, ci) = (rr / nch_h, rr % nch_h);
+        let (i0, i1) = (ci * NATIVE_CHUNK_I, ((ci + 1) * NATIVE_CHUNK_I).min(hidden));
+        let ex = &c.experts[e];
+        let (packed, cb, base) = if which == 0 { (ex.gp, ex.gc, &c.pg) } else { (ex.up, ex.uc, &c.pu) };
+        let slot = unsafe { std::slice::from_raw_parts_mut(base.0.add((e * nch_h + ci) * inter), inter) };
+        gemv_native_range(packed, cb, inter, c.x, slot, i0, i1);
+    }
+    c.barrier.wait();
+    // Phase RA: reduce gate/up partials in fixed chunk order, then SiLU, per expert.
+    loop {
+        let e = c.ctr_ra.fetch_add(1, Ordering::Relaxed);
+        if e >= c.k { break; }
+        unsafe {
+            let (ge, ue, acte) = (c.g.0.add(e * inter), c.u.0.add(e * inter), c.act.0.add(e * inter));
+            for o in 0..inter { *ge.add(o) = 0.0; *ue.add(o) = 0.0; }
+            for ci in 0..nch_h {
+                let (pgc, puc) = (c.pg.0.add((e * nch_h + ci) * inter), c.pu.0.add((e * nch_h + ci) * inter));
+                for o in 0..inter { *ge.add(o) += *pgc.add(o); *ue.add(o) += *puc.add(o); }
+            }
+            for o in 0..inter { *acte.add(o) = silu(*ge.add(o)) * *ue.add(o); }
+        }
+    }
+    c.barrier.wait();
+    // Phase C: down input-chunks (nch_i per expert).
+    let nc = c.k * nch_i;
+    loop {
+        let t = c.ctr_c.fetch_add(1, Ordering::Relaxed);
+        if t >= nc { break; }
+        let (e, ci) = (t / nch_i, t % nch_i);
+        let (i0, i1) = (ci * NATIVE_CHUNK_I, ((ci + 1) * NATIVE_CHUNK_I).min(inter));
+        let ex = &c.experts[e];
+        let act_e = unsafe { std::slice::from_raw_parts(c.act.0.add(e * inter), inter) };
+        let slot = unsafe { std::slice::from_raw_parts_mut(c.pd.0.add((e * nch_i + ci) * hidden), hidden) };
+        gemv_native_range(ex.dp, ex.dc, hidden, act_e, slot, i0, i1);
+    }
+    c.barrier.wait();
+    // Phase RC: reduce down partials in fixed chunk order, per expert.
+    loop {
+        let e = c.ctr_rc.fetch_add(1, Ordering::Relaxed);
+        if e >= c.k { break; }
+        unsafe {
+            let oe = c.out.0.add(e * hidden);
+            for o in 0..hidden { *oe.add(o) = 0.0; }
+            for ci in 0..nch_i {
+                let pdc = c.pd.0.add((e * nch_i + ci) * hidden);
+                for o in 0..hidden { *oe.add(o) += *pdc.add(o); }
+            }
+        }
+    }
+}
+
+/// Native-path routed MoE sum with ONE phased work-steal over ALL (expert, proj, input-chunk) tasks
+/// per call, on the persistent pool -- replacing the per-GEMV pool dispatch (`routed_experts_native`
+/// issued 3*k dispatches/layer; at 671B that was ~1392/token, most with too few chunks to fill the
+/// workers). Bit-identical to [`routed_experts_native`]: same input-chunk decomposition, same
+/// fixed-order partial reduction, same fixed expert-order combine -- so it is deterministic and
+/// thread-count invariant. `acc_out` (len `hidden`) is overwritten.
+pub fn routed_experts_native_worksteal(x: &[f32], experts: &[NativeExpert], hidden: usize, inter: usize, acc_out: &mut [f32]) {
+    let p = pool();
+    let k = experts.len();
+    for v in acc_out.iter_mut().take(hidden) { *v = 0.0; }
+    if k == 0 { return; }
+    if p.n <= 1 { routed_experts_native(x, experts, hidden, inter, acc_out); return; }
+    let nch_h = (hidden + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+    let nch_i = (inter + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+    let mut pg = vec![0f32; k * nch_h * inter];
+    let mut pu = vec![0f32; k * nch_h * inter];
+    let mut pd = vec![0f32; k * nch_i * hidden];
+    let mut g = vec![0f32; k * inter];
+    let mut u = vec![0f32; k * inter];
+    let mut act = vec![0f32; k * inter];
+    let mut out = vec![0f32; k * hidden];
+    let ctx = NativeWsCtx {
+        experts, x, hidden, inter, nch_h, nch_i, k,
+        ctr_a: AtomicUsize::new(0), ctr_ra: AtomicUsize::new(0), ctr_c: AtomicUsize::new(0), ctr_rc: AtomicUsize::new(0),
+        barrier: Barrier::new(p.n),
+        pg: RawF32(pg.as_mut_ptr()), pu: RawF32(pu.as_mut_ptr()), pd: RawF32(pd.as_mut_ptr()),
+        g: RawF32(g.as_mut_ptr()), u: RawF32(u.as_mut_ptr()), act: RawF32(act.as_mut_ptr()), out: RawF32(out.as_mut_ptr()),
+    };
+    p.run(&|| native_ws_worker(&ctx));
+    // Fixed expert-order weighted combine (single thread).
+    for (e, ex) in experts.iter().enumerate() {
+        let (w, base) = (ex.weight, e * hidden);
+        for i in 0..hidden { acc_out[i] += w * out[base + i]; }
+    }
+}
+
+/// Thread-count-explicit twin of [`routed_experts_native_worksteal`] (scoped spawn instead of the
+/// persistent pool), so the determinism harness can prove the result is BITWISE identical across
+/// worker counts. Same phases/reductions -> `worker_threads` only changes which core runs a task.
+pub fn routed_experts_native_worksteal_nt(x: &[f32], experts: &[NativeExpert], hidden: usize, inter: usize, acc_out: &mut [f32], worker_threads: usize) {
+    let k = experts.len();
+    for v in acc_out.iter_mut().take(hidden) { *v = 0.0; }
+    if k == 0 { return; }
+    let nch_h = (hidden + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+    let nch_i = (inter + NATIVE_CHUNK_I - 1) / NATIVE_CHUNK_I;
+    let nthreads = worker_threads.max(1).min((k * 2 * nch_h).max(k * nch_i).max(1));
+    if nthreads <= 1 { routed_experts_native(x, experts, hidden, inter, acc_out); return; }
+    let mut pg = vec![0f32; k * nch_h * inter];
+    let mut pu = vec![0f32; k * nch_h * inter];
+    let mut pd = vec![0f32; k * nch_i * hidden];
+    let mut g = vec![0f32; k * inter];
+    let mut u = vec![0f32; k * inter];
+    let mut act = vec![0f32; k * inter];
+    let mut out = vec![0f32; k * hidden];
+    let ctx = NativeWsCtx {
+        experts, x, hidden, inter, nch_h, nch_i, k,
+        ctr_a: AtomicUsize::new(0), ctr_ra: AtomicUsize::new(0), ctr_c: AtomicUsize::new(0), ctr_rc: AtomicUsize::new(0),
+        barrier: Barrier::new(nthreads),
+        pg: RawF32(pg.as_mut_ptr()), pu: RawF32(pu.as_mut_ptr()), pd: RawF32(pd.as_mut_ptr()),
+        g: RawF32(g.as_mut_ptr()), u: RawF32(u.as_mut_ptr()), act: RawF32(act.as_mut_ptr()), out: RawF32(out.as_mut_ptr()),
+    };
+    thread::scope(|s| {
+        for _ in 0..nthreads { let ctx = &ctx; s.spawn(move || native_ws_worker(ctx)); }
+    });
+    for (e, ex) in experts.iter().enumerate() {
+        let (w, base) = (ex.weight, e * hidden);
+        for i in 0..hidden { acc_out[i] += w * out[base + i]; }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,6 +1379,44 @@ mod tests {
         let reference = naive_matmul(&d_dq, hidden, inter, &act);
         let e = l2_rel(&y, &reference);
         assert!(e < 1e-4, "native expert vs reference L2 rel err {e:e}");
+    }
+
+    #[test]
+    fn native_worksteal_matches_sequential_and_is_thread_invariant() {
+        // Deliverable B lever 2: the single phased work-steal over all (expert, proj, input-chunk)
+        // tasks must be BIT-identical to the per-GEMV sequential native path AND invariant to the
+        // worker count -- same input-chunk decomposition, same fixed-order partial reduction, same
+        // fixed expert-order combine. V2-Lite-ish dims, random packed/codebooks (any bytes are valid
+        // indices; we test scheduling+reduction order, not decode values).
+        let (hidden, inter, k) = (2048usize, 1408usize, 6usize);
+        let mut r = Lcg(0xB17E_5713_u64);
+        let x: Vec<f32> = (0..hidden).map(|_| r.f32()).collect();
+        let bytes = |n: usize, r: &mut Lcg| -> Vec<u8> { (0..n).map(|_| ((r.f32() * 0.5 + 0.5) * 255.0) as u8).collect() };
+        let cbk = |n: usize, r: &mut Lcg| -> Vec<f32> { (0..n).map(|_| r.f32() * 0.05).collect() };
+        // NATIVE input-major packed: gate/up [hidden][inter/2] (oc=inter,ic=hidden); down [inter][hidden/2].
+        let mut store: Vec<(Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>, f32)> = Vec::new();
+        for e in 0..k {
+            store.push((bytes(hidden * (inter / 2), &mut r), cbk(K * inter, &mut r),
+                        bytes(hidden * (inter / 2), &mut r), cbk(K * inter, &mut r),
+                        bytes(inter * (hidden / 2), &mut r), cbk(K * hidden, &mut r), 0.1 + 0.13 * e as f32));
+        }
+        let experts: Vec<NativeExpert> = store.iter().map(|s| NativeExpert {
+            gp: &s.0, gc: &s.1, up: &s.2, uc: &s.3, dp: &s.4, dc: &s.5, weight: s.6,
+        }).collect();
+        let mut seq = vec![0f32; hidden];
+        routed_experts_native(&x, &experts, hidden, inter, &mut seq);
+        // pool path == sequential, bitwise
+        let mut pooled = vec![0f32; hidden];
+        routed_experts_native_worksteal(&x, &experts, hidden, inter, &mut pooled);
+        assert!(seq.iter().zip(&pooled).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "native worksteal (pool) not bit-identical to sequential native path");
+        // explicit worker counts == sequential, bitwise (thread-count invariant)
+        for nt in [1usize, 2, 4, 8, 16, 32] {
+            let mut got = vec![0f32; hidden];
+            routed_experts_native_worksteal_nt(&x, &experts, hidden, inter, &mut got, nt);
+            assert!(seq.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "native worksteal not bit-identical to sequential at {nt} workers");
+        }
     }
 
     #[test]

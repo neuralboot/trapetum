@@ -2776,7 +2776,10 @@ impl MoeBlockOffload {
                 ExpertHost::Avq { .. } => panic!("TRAPETUM_CPU_EXPERTS: AVQ (additive-codebook) experts are out of scope; scalar CBKR only"),
             }).collect();
             let mut acc_host = vec![0f32; self.hidden];
-            cpu_experts::routed_experts_native(&x, &refs, self.hidden, self.inter, &mut acc_host);
+            // ONE phased work-steal over all (expert, proj, input-chunk) tasks per MoE call, not a
+            // pool dispatch per GEMV (deliverable B lever 2): at 671B this cuts ~1392 dispatches/token
+            // to ~58 and fills the workers (down-proj alone was 8 chunks for 48 cores). Bit-identical.
+            cpu_experts::routed_experts_native_worksteal(&x, &refs, self.hidden, self.inter, &mut acc_host);
             let mut acc = DevF32::from_host(&acc_host);
             let (sg, su, sd) = (self.shared.gate.as_ref(), self.shared.up.as_ref(), self.shared.down.as_ref());
             self.run_ffn(sg, su, sd, &mut acc, 1.0); // shared expert on GPU, as in V2-Lite
