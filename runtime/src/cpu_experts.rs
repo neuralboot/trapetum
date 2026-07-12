@@ -757,10 +757,11 @@ pub fn routed_experts_worksteal_nt(x: &[f32], experts: &[RoutedExpert], hidden: 
 /// Input rows per fixed determinism chunk (independent of worker count).
 const NATIVE_CHUNK_I: usize = 256;
 
-/// i-outer decode-GEMV over an INPUT range `[i0,i1)`, native input-major `packed` + native
+/// Scalar i-outer decode-GEMV over an INPUT range `[i0,i1)`, native input-major `packed` + native
 /// codebook, ACCUMULATING into `y` (caller owns init). Streams `packed` contiguously; `cb` is
-/// gathered strided (`cb[id*oc+o]`) but is L2-resident. Sums i-ascending within the range.
-fn gemv_native_range(packed: &[u8], cb: &[f32], oc: usize, x: &[f32], y: &mut [f32], i0: usize, i1: usize) {
+/// gathered strided (`cb[id*oc+o]`) but is L2-resident. Sums i-ascending within the range. This is
+/// the portable reference; on x86_64 [`gemv_native_range`] dispatches to the SIMD twins below.
+fn gemv_native_range_scalar(packed: &[u8], cb: &[f32], oc: usize, x: &[f32], y: &mut [f32], i0: usize, i1: usize) {
     let half = oc / 2;
     for i in i0..i1 {
         let xi = x[i];
@@ -771,6 +772,106 @@ fn gemv_native_range(packed: &[u8], cb: &[f32], oc: usize, x: &[f32], y: &mut [f
             y[2 * j + 1] += cb[((b >> 4) as usize) * oc + 2 * j + 1] * xi;
         }
     }
+}
+
+// x86_64 SIMD decode-GEMV (deliverable B lever 1). The 671B host is a Xeon; the scalar decode ran
+// ~1.2 GB/s single-thread (the NEON tbl kernel is cfg(aarch64) and never had a vpshufb twin), which
+// capped the hybrid at ~2.4 GB/s aggregate. These kernels keep the SAME i-outer streaming of `packed`
+// and process 8 (AVX2) / 16 (AVX-512) output columns per step: the packed byte -> nibble index expand
+// feeds a vectorized gather of the L2-resident codebook, then mul + add into the y accumulators.
+//
+// BIT-EXACTNESS: each output column is an INDEPENDENT accumulator summed over i in the SAME ascending
+// order as the scalar path, and the value is `cb_value * xi` with a SEPARATE mul then add (NOT an FMA
+// -- fusing would change the rounding, the vfmaq lesson from S14). So the SIMD result is bitwise equal
+// to the scalar reference, and the determinism/thread-invariance proofs carry over unchanged.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn gemv_native_range_avx2(packed: &[u8], cb: &[f32], oc: usize, x: &[f32], y: &mut [f32], i0: usize, i1: usize) {
+    use std::arch::x86_64::*;
+    let half = oc / 2;
+    let cbp = cb.as_ptr();
+    let ocv = _mm256_set1_epi32(oc as i32);
+    let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let yp = y.as_mut_ptr();
+    let rp = packed.as_ptr();
+    let xp = x.as_ptr();
+    for i in i0..i1 {
+        let xi = _mm256_set1_ps(*xp.add(i));
+        let row = rp.add(i * half);
+        let (mut col, mut j) = (0usize, 0usize);
+        while col < oc {
+            // 4 packed bytes -> 8 nibble indices for columns col..col+7 (low, high, low, high, ...)
+            let (b0, b1) = (*row.add(j) as i32, *row.add(j + 1) as i32);
+            let (b2, b3) = (*row.add(j + 2) as i32, *row.add(j + 3) as i32);
+            let idx = _mm256_setr_epi32(b0 & 0xF, b0 >> 4, b1 & 0xF, b1 >> 4, b2 & 0xF, b2 >> 4, b3 & 0xF, b3 >> 4);
+            let colv = _mm256_add_epi32(_mm256_set1_epi32(col as i32), lane);
+            let off = _mm256_add_epi32(_mm256_mullo_epi32(idx, ocv), colv); // cb element index = idx*oc + col
+            let w = _mm256_i32gather_ps::<4>(cbp, off);
+            let prod = _mm256_mul_ps(w, xi);
+            let yv = _mm256_loadu_ps(yp.add(col));
+            _mm256_storeu_ps(yp.add(col), _mm256_add_ps(yv, prod));
+            col += 8; j += 4;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn gemv_native_range_avx512(packed: &[u8], cb: &[f32], oc: usize, x: &[f32], y: &mut [f32], i0: usize, i1: usize) {
+    use std::arch::x86_64::*;
+    let half = oc / 2;
+    let cbp = cb.as_ptr();
+    let ocv = _mm512_set1_epi32(oc as i32);
+    let lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let yp = y.as_mut_ptr();
+    let rp = packed.as_ptr();
+    let xp = x.as_ptr();
+    for i in i0..i1 {
+        let xi = _mm512_set1_ps(*xp.add(i));
+        let row = rp.add(i * half);
+        let (mut col, mut j) = (0usize, 0usize);
+        while col < oc {
+            // 8 packed bytes -> 16 nibble indices for columns col..col+15
+            let mut ix = [0i32; 16];
+            let mut c = 0usize;
+            while c < 16 { let b = *row.add(j + c / 2) as i32; ix[c] = b & 0xF; ix[c + 1] = b >> 4; c += 2; }
+            let idx = _mm512_loadu_si512(ix.as_ptr() as *const __m512i);
+            let colv = _mm512_add_epi32(_mm512_set1_epi32(col as i32), lane);
+            let off = _mm512_add_epi32(_mm512_mullo_epi32(idx, ocv), colv);
+            let w = _mm512_i32gather_ps::<4>(off, cbp);
+            let prod = _mm512_mul_ps(w, xi);
+            let yv = _mm512_loadu_ps(yp.add(col));
+            _mm512_storeu_ps(yp.add(col), _mm512_add_ps(yv, prod));
+            col += 16; j += 8;
+        }
+    }
+}
+
+/// Selected native decode kernel, resolved ONCE: 2=AVX-512, 1=AVX2, 0=scalar. `TRAPETUM_CPU_SCALAR=1`
+/// forces scalar (for the x86 scalar-vs-SIMD perf A/B).
+#[cfg(target_arch = "x86_64")]
+fn native_kernel() -> u8 {
+    static K: OnceLock<u8> = OnceLock::new();
+    *K.get_or_init(|| {
+        if std::env::var("TRAPETUM_CPU_SCALAR").map(|v| v == "1").unwrap_or(false) { return 0; }
+        if is_x86_feature_detected!("avx512f") { 2 } else if is_x86_feature_detected!("avx2") { 1 } else { 0 }
+    })
+}
+
+/// i-outer decode-GEMV, dispatching to the widest available x86_64 SIMD kernel (bit-exact to the
+/// scalar reference), or scalar elsewhere. `oc` is a multiple of 256 in the runtime, so the AVX-512
+/// (16-col) and AVX2 (8-col) tilings never leave a remainder; the guards keep it correct regardless.
+#[inline]
+fn gemv_native_range(packed: &[u8], cb: &[f32], oc: usize, x: &[f32], y: &mut [f32], i0: usize, i1: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match native_kernel() {
+            2 if oc % 16 == 0 => return unsafe { gemv_native_range_avx512(packed, cb, oc, x, y, i0, i1) },
+            k if k >= 1 && oc % 8 == 0 => return unsafe { gemv_native_range_avx2(packed, cb, oc, x, y, i0, i1) },
+            _ => {}
+        }
+    }
+    gemv_native_range_scalar(packed, cb, oc, x, y, i0, i1);
 }
 
 /// Deterministic native decode-GEMV: `y[o] = sum_i cb[idx[o,i]*oc+o]*x[i]`, consuming the native
@@ -1416,6 +1517,32 @@ mod tests {
             routed_experts_native_worksteal_nt(&x, &experts, hidden, inter, &mut got, nt);
             assert!(seq.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()),
                     "native worksteal not bit-identical to sequential at {nt} workers");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn native_simd_bit_exact_to_scalar() {
+        // Deliverable B lever 1: the AVX2 / AVX-512 decode-GEMV must be BITWISE equal to the scalar
+        // reference (independent per-column accumulators, mul-then-add not FMA, same i order). Runs
+        // only where the feature is present; team-lead runs this + the perf A/B on the x86 box.
+        for (oc, ic) in [(256usize, 512usize), (512, 300), (128, 1024), (2048, 256)] {
+            let mut r = Lcg(0x51D0_0AD5u64 ^ ((oc as u64) << 8) ^ ic as u64);
+            let packed: Vec<u8> = (0..ic * (oc / 2)).map(|_| ((r.f32() * 0.5 + 0.5) * 255.0) as u8).collect();
+            let cb: Vec<f32> = (0..K * oc).map(|_| r.f32() * 0.05).collect();
+            let x: Vec<f32> = (0..ic).map(|_| r.f32()).collect();
+            let mut sc = vec![0f32; oc];
+            super::gemv_native_range_scalar(&packed, &cb, oc, &x, &mut sc, 0, ic);
+            if is_x86_feature_detected!("avx2") {
+                let mut v = vec![0f32; oc];
+                unsafe { super::gemv_native_range_avx2(&packed, &cb, oc, &x, &mut v, 0, ic); }
+                assert!(sc.iter().zip(&v).all(|(a, b)| a.to_bits() == b.to_bits()), "AVX2 != scalar bitwise at oc={oc} ic={ic}");
+            }
+            if is_x86_feature_detected!("avx512f") && oc % 16 == 0 {
+                let mut v = vec![0f32; oc];
+                unsafe { super::gemv_native_range_avx512(&packed, &cb, oc, &x, &mut v, 0, ic); }
+                assert!(sc.iter().zip(&v).all(|(a, b)| a.to_bits() == b.to_bits()), "AVX512 != scalar bitwise at oc={oc} ic={ic}");
+            }
         }
     }
 
