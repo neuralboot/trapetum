@@ -1150,8 +1150,8 @@ impl AnonStager {
     fn new(path: &str, total: usize) -> std::io::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
         const O_DIRECT: i32 = 0x4000; // Linux O_DIRECT
-        let mut arena = memmap2::MmapMut::map_anon(total)?;
-        let _ = arena.advise(memmap2::Advice::HugePage); // ask for 2 MB pages
+        let arena = memmap2::MmapMut::map_anon(total)?;
+        let _ = arena.advise(memmap2::Advice::HugePage); // ask for 2 MB pages (advise takes &self)
         let od = std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(path)?;
         let bounce = memmap2::MmapMut::map_anon(16 << 20)?; // reusable page-aligned O_DIRECT bounce
         Ok(Self { arena: Arc::new(arena), cursor: 0, od, bounce })
