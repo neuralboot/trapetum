@@ -304,3 +304,34 @@ Deliverable C fully measured (engagement + lut8), and the floor did not move:
   attention vs MoE vs rest per token; (2) MoE-phase micro-profiling hooks.
 - Session ~2h ~15 USD. Boxes terminated. Cumulative finding chain:
   disk -> RAM -> faults -> grain -> gather -> engagement -> MLA serial path.
+
+## 671B sessions 4+4b (2026-07-12): MLA fix pays x2.2 -> 0.96 tok/s; the per-core atom; F2 lesson
+
+- MLA host-absorption fix (deliverable E): attention 900 -> 290 ms/token; TOTAL
+  2271 -> 1046 ms/token = 0.96 tok/s. First time under 1.1 s.
+- Dissection (TRAPETUM_MLA_TIMING/MOE_TIMING): attention=290 moe=831 other=1.6;
+  moe split A(gate+up)=387 RA=21 C(down)=186 RC=101; decode dominates, ~140 ms
+  unaccounted per-call overhead.
+- THE ATOM: T=1 moe=15380 ms -> 0.66 GB/s per core on the gather kernel (warm
+  mmap). Thread scaling GOOD (T16 12.5x, T32 18.5x): the wall is PER-CORE
+  latency, not shared contention (the earlier thread-insensitivity was the
+  MLA-host floor masking everything).
+- F1 MADV_HUGEPAGE: -9% only. TLB/page-walk hypothesis largely refuted as the
+  main wall; 0.66 GB/s/core is gather-latency territory, and lut8 (no gather)
+  matching it suggests both kernels serialize ~equally for different reasons
+  (vpgatherdd latency vs per-byte-position nibble extraction).
+- F2 anon-THP arena: KILLED THE BOX: staging 350 GB anon while the page cache
+  still held ~336 GB wedged the kernel in direct reclaim (SSH dead, instance
+  terminated). LESSON: staging must fadvise(DONTNEED)/drop the model's page
+  cache BEFORE allocating the arena, with a staging progress print + free-RAM
+  guard. The scripted F2 run also failed silently earlier (empty output):
+  same cause.
+- lut8 correctness gate: cargo test output captured EMPTY twice; unresolved,
+  suspicious (filter name? test compilation?). To nail next session.
+- Next levers ranked: (1) per-core decode kernel: the in-register 16x16
+  transpose on lut8 (marked hotspot) OR a gather-free vpermps tile: target
+  2-4 GB/s/core = moe ~200-400 ms; (2) the ~140 ms per-call overhead gap;
+  (3) GPU-side absorption for the remaining 290 ms attention; (4) F2 retried
+  WITH cache-drop staging. Ceiling if (1)+(2) land: ~400-500 ms/token
+  (~2-2.5 tok/s) on this box class.
+- Session ~1.5 h ~11 USD. Program totals: ~55 USD AWS + 4 RunPod.
