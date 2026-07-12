@@ -279,3 +279,28 @@ cache verified), branch s19-mixed-precision (deliverable A CPU-experts path).
   the already-accepted fp16-vs-f32 path difference; gates are margins/PPL since
   the determinism campaign). Build both behind flags, measure, pick.
 - Session cost ~9 USD. All boxes terminated.
+
+## 671B session 3 (2026-07-12): the THIRD wall is MLA attention + both prior levers exonerated
+
+Deliverable C fully measured (engagement + lut8), and the floor did not move:
+- Engagement A/B: futex 2316 ms/token vs spin 2201 (5%); ENGAGE_DEBUG proves
+  workers=32 active=32, tasks balanced 13-26 -> ENGAGEMENT EXONERATED (the
+  earlier 9-16/32 top-sampling read memory-stalled threads as idle).
+- lut8 vs gather vs scalar: 2319 / 2210 / 2500 ms/token -> KERNEL EXONERATED.
+- Box raw memory: 11.0 GB/s page-cache read on ONE thread -> BOX EXONERATED
+  (and the sequential-TLB hypothesis with it).
+- gdb thread-stack sampling during decode (PMU is blocked on virtualized EC2;
+  stacks are not): main thread 2/5 samples inside MlaAttn::forward, 3/5 parked
+  in Pool::run waiting on workers -> per token roughly ~0.9 s of GPU MLA and
+  ~1.4 s of CPU-MoE phase.
+- MLA at ~0.9 s/token with VRAM-resident weights is the new prime suspect:
+  671B exercises the q_lora path (q_lora_rank=1536, absent on V2-Lite) and
+  128 heads x 61 layers of per-op launches/syncs can alone cost ~0.8 s. The
+  MoE-CPU phase at ~7 GB/s aggregate also has headroom (workers active but
+  memory-stalled; per-GEMV x-quantization and reduce tails to profile).
+- Next: deliverable E = (1) MLA batching/sync audit on the CUDA path for the
+  671B config (batch per-head ops, kill per-op drains, inspect q_lora), with
+  env-gated per-component timing (TRAPETUM_MLA_TIMING) so the box can split
+  attention vs MoE vs rest per token; (2) MoE-phase micro-profiling hooks.
+- Session ~2h ~15 USD. Boxes terminated. Cumulative finding chain:
+  disk -> RAM -> faults -> grain -> gather -> engagement -> MLA serial path.
