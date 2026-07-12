@@ -3096,6 +3096,20 @@ fn mla_host() -> bool {
     *E.get_or_init(|| std::env::var("TRAPETUM_MLA_HOST").map(|v| v == "1").unwrap_or(false))
 }
 
+/// `TRAPETUM_MLA_OVERLAP=1` (device absorption path only): skip mirroring `attn_dev` back to the
+/// host `last_attn` on the hot path. The device path never needs `attn` on host -- o_proj consumes
+/// `attn_dev` directly and the in-order queue guarantees the absorb kernel finishes first -- so that
+/// download is a REDUNDANT second per-layer device drain (the first, unavoidable one is the
+/// qf/kvf read-back for host ckv/krope). Dropping it lets the absorb+o_proj+residual+rmsnorm tail
+/// stay in one command buffer, drained once when the MoE downloads `h`. Off by default so the gate
+/// and the box layer-0 sub-dump still see `last_attn`; on = the A/B perf lever.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn mla_overlap() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("TRAPETUM_MLA_OVERLAP").map(|v| v == "1").unwrap_or(false))
+}
+
 /// Raw `*mut f32` wrapped Send+Sync so a `parallel_for` closure can write DISJOINT regions (one per
 /// head) without a borrow. Sound only because each parallel index writes a non-overlapping slice.
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -3272,9 +3286,12 @@ impl MlaAttn {
             // config: in=d_c, out=v_head_dim, S=nope+vhd, roff=nope, co=d_c, ci=1 (matches host).
             mla_absorb(&self.outl_dev, &self.kv_b_dev, &mut self.attn_dev,
                        nh, dc, vhd, nope+vhd, dc, nope, dc, 1);
-            // mirror attn_dev into last_attn for the validation gate + box layer-0 sub-dump. Tiny
-            // (nh*vhd) vs the kv_b stream we removed; H-inc3 can make this conditional for overlap.
-            self.last_attn.copy_from_slice(&self.attn_dev.to_host());
+            if !mla_overlap() {
+                // mirror attn_dev into last_attn for the validation gate + box layer-0 sub-dump.
+                // This forces a device drain; TRAPETUM_MLA_OVERLAP=1 skips it (o_proj reads
+                // attn_dev on-device, in-order queue) -- one fewer per-layer drain (H-inc3).
+                self.last_attn.copy_from_slice(&self.attn_dev.to_host());
+            }
         }
         if let Some(oq) = self.o_quant.as_ref() {
             oq.forward_into(&self.attn_dev, &mut self.o_out);
