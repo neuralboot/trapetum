@@ -464,3 +464,16 @@ Whole-forward instrumentation (G-inc1) at steady state (pos 17-18):
 - Program result stands: 671B at 2.46 tok/s (x10.2), determinism-by-default,
   mixed-precision format shipped and validated, Paris MLA export fix validated.
 - Session ~40 min ~5 USD. Program: ~100 USD AWS + 4 RunPod.
+
+## Quality: measured perplexity (wikitext-2, ctx 2048, DeepSeek-V2-Lite, our export's k-means)
+
+Answers "how much does OUR 4-bit cost vs fp16", using the shipped export quantizer:
+  fp16 baseline : PPL 5.6983  (reference)
+  our 4-bit K16 : PPL 6.1024  (+7.09%)  -- the real cost of weight-only 4-bit
+  mixed (S19)   : PPL 5.7832  (+1.49%)  -- shared experts + lm_head at 8-bit K256, routed 4-bit
+  full 8-bit    : PPL 5.6998  (+0.03%)  -- all experts+lm_head K256, essentially fp16-lossless
+
+Conclusion: full 8-bit is essentially lossless; the mixed-precision format captures most of
+that recovery (7.1% -> 1.5%) by promoting only the shared experts + lm_head (0.7% of the 671B
+footprint, the every-token path). The "Paris token-1" probe was a single-prompt red herring;
+PPL is the honest metric and the mixed format is the right default. ~5 USD, cheap g6e.2xlarge.
