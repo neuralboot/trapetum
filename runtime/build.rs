@@ -7,7 +7,6 @@ use std::process::Command;
 
 fn main() {
     let out = env::var("OUT_DIR").unwrap();
-    let arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_80".to_string());
     let windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
 
     // Backend features: `cuda` compiles/links the nvcc kernel; `metal` compiles
@@ -66,10 +65,28 @@ fn main() {
         }
     });
 
-    // 1. compile the .cu with nvcc
+    // 1. compile the .cu with nvcc.
+    // GPU code generation: if CUDA_ARCH is set explicitly, honor it as a single
+    // target (dev/bench boxes that want one arch). Otherwise emit a portable
+    // fatbin with real SASS for Turing..Hopper plus compute_90 PTX, so a shipped
+    // release runs natively on those GPUs and JIT-compiles on anything newer.
+    // The kernel is plain CUDA C (no arch-specific intrinsics), so every arch
+    // below compiles unchanged.
     let obj = format!("{out}/codebook_gemv.{}", if windows { "obj" } else { "o" });
     let mut nvcc = Command::new("nvcc");
-    nvcc.arg("-O3").arg(format!("-arch={arch}"));
+    nvcc.arg("-O3");
+    match env::var("CUDA_ARCH") {
+        Ok(a) => {
+            nvcc.arg(format!("-arch={a}"));
+        }
+        Err(_) => {
+            for a in ["70", "75", "80", "86", "89", "90"] {
+                nvcc.args(["-gencode", &format!("arch=compute_{a},code=sm_{a}")]);
+            }
+            // PTX for forward compatibility (JIT on Blackwell and later).
+            nvcc.args(["-gencode", "arch=compute_90,code=compute_90"]);
+        }
+    }
     if !windows {
         nvcc.args(["--compiler-options", "-fPIC"]);
     }
