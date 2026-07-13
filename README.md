@@ -30,15 +30,22 @@ Y[m, j]     = sum_i  X[m, i] * W_deq[i, j]
   additive-VQ training that beats the scalar codebook, the accuracy probes, and the
   **torch-free exporter** (`export_safetensors.py`): it reads `safetensors` directly
   (no PyTorch, no transformers) and compresses any Llama- or Phi-3-architecture model
-  to the runtime's format — this is how Phi-4 (14B) was exported and run at 79.9 tok/s.
+  to the runtime's format: this is how Phi-4 (14B) was exported and run at 79.9 tok/s.
   Nine architectures run end-to-end in pure Rust, including Gemma-2-9B, Phi-4 and
   DeepSeek-V2-Lite (MLA + MoE); see [`bench/RESULTS_models.md`](bench/RESULTS_models.md).
-  Scale probe: **DeepSeek-R1 671B** (full V3 architecture) loads in 43 s and decodes
-  coherently on a single node, 1.34 TB bf16 compressed to a 326 GiB 4-bit artifact,
-  routed experts streamed from disk via mmap inside a **73 GB peak RAM** footprint.
-  Measured on a **single consumer RTX 4090**: 20.9 GB peak VRAM, 0.24 tok/s steady
-  state (disk-bound), fully coherent output;
-  see [`bench/RESULTS_deepseek.md`](bench/RESULTS_deepseek.md).
+  Scale result: **DeepSeek-R1 671B** (full V3 architecture), 1.34 TB bf16 compressed to
+  a 326 GB 4-bit artifact, serves the **full model at 2.46 tok/s** on a single commodity
+  node (64 vCPU, one L40S, 497 GB RAM), a **x10.2** gain over the 0.24 tok/s disk-offload
+  baseline. The lever is **inversion**: the routed experts stay resident in host RAM and
+  are decoded in place on the CPU (one `vpshufb` per 32 weights on AVX2), while the GPU
+  holds only MLA attention and the dense layers (20.9 GB VRAM). At batch one only the
+  ~10 GB of routed-expert bytes per token matter, and they no longer travel to the GPU.
+  The gain came from removing eight measured walls: 0.24, 0.44, 0.96, 1.31, 1.35, 1.67,
+  1.84, 2.46 tok/s. Routed decode reaches ~67 GB/s aggregate, near the memory read floor.
+  Quality (wikitext-2 PPL): full 8-bit is essentially lossless at +0.03% vs fp16 (5.70);
+  4-bit costs +7.1% (6.10); a mixed-precision variant (shared experts + lm_head at 8-bit)
+  captures most of the recovery at **+1.5%** (5.78) for +0.7% size.
+  See [`bench/RESULTS_deepseek.md`](bench/RESULTS_deepseek.md).
 - [`bench/`](bench/): a fair single-harness speed vs accuracy vs memory benchmark of
   fp16, AWQ and AQLM (the `pareto`/`mem70` figures and `results*.json`).
 - [`paper/`](paper/): the write-up (`trapetum.pdf`).
