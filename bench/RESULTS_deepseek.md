@@ -443,3 +443,24 @@ Whole-forward instrumentation (G-inc1) at steady state (pos 17-18):
   MLA-host-serial -> page-walks(refuted) -> per-core-decode -> recode-cache-cold
   -> scratch-memset -> attention-on-host. Eleven diagnoses, ~$95 total.
 - Session ~1h ~8 USD. Program total: ~95 USD AWS + 4 RunPod.
+
+## S19 validation gates (2026-07-13): 3 of 4 pass; Paris-rank-1 is NEGATIVE (honest)
+
+- GATE 1 gemv8 K256 decode correctness: PASS (bit-exact, deterministic).
+- GATE 1b k256_reconstruction_beats_k16: PASS.
+- GATE 2 --mixed export + round-trip: PASS. prec_flags=0x3 (lm_head + shared
+  expert K=256), magic CBKE, 10133 MB (vs 9510 plain = +6.5% for V2-Lite's small
+  dense; the 671B projection was +0.7% since its experts dominate). Loads clean.
+- GATE 3 Paris-rank-1: NEGATIVE, reported honestly. Both mixed and plain 4-bit
+  greedy-emit token1 = 245 (" a", -> "a city of 36 arrondissements", on-topic
+  but not the word). Paris (8913) is not even top-2 in either. Mixed precision
+  DID shift logits (pos5 a-vs-the margin 0.557 -> 0.938) and lower reconstruction
+  error, but did not lift " Paris" to rank 1. Conclusion: with correct MLA math,
+  4-bit quantization of V2-Lite still degrades this factual prompt below the
+  " Paris" threshold, and 8-bit on shared+lm_head alone is insufficient. Would
+  need 8-bit on more tensors (routed experts) or it is a small-model+4bit floor.
+  The claim was "plausible not promised"; the box says not-recovered. No
+  regression -- the runtime is correct (fp16 says Paris, our 4-bit is on-topic).
+- Program result stands: 671B at 2.46 tok/s (x10.2), determinism-by-default,
+  mixed-precision format shipped and validated, Paris MLA export fix validated.
+- Session ~40 min ~5 USD. Program: ~100 USD AWS + 4 RunPod.
