@@ -1,0 +1,497 @@
+++ date
++ echo '### H attention-on-GPU Sun Jul 12 15:59:54 UTC 2026 ###'
+### H attention-on-GPU Sun Jul 12 15:59:54 UTC 2026 ###
++ D=/opt/dlami/nvme
++ sudo chown ubuntu /opt/dlami/nvme
++ aws configure set default.s3.max_concurrent_requests 64
++ aws s3 cp s3://neuralboot-trapetum-models/deepseek-r1-671b/ /opt/dlami/nvme/parts/ --recursive --exclude '*' --include 'model.cbk.part.*' --only-show-errors
+
+real	25m27.811s
+user	23m8.054s
+sys	23m10.691s
++ cat /opt/dlami/nvme/parts/model.cbk.part.000 /opt/dlami/nvme/parts/model.cbk.part.001 /opt/dlami/nvme/parts/model.cbk.part.002 /opt/dlami/nvme/parts/model.cbk.part.003 /opt/dlami/nvme/parts/model.cbk.part.004 /opt/dlami/nvme/parts/model.cbk.part.005 /opt/dlami/nvme/parts/model.cbk.part.006 /opt/dlami/nvme/parts/model.cbk.part.007 /opt/dlami/nvme/parts/model.cbk.part.008 /opt/dlami/nvme/parts/model.cbk.part.009 /opt/dlami/nvme/parts/model.cbk.part.010 /opt/dlami/nvme/parts/model.cbk.part.011 /opt/dlami/nvme/parts/model.cbk.part.012 /opt/dlami/nvme/parts/model.cbk.part.013 /opt/dlami/nvme/parts/model.cbk.part.014 /opt/dlami/nvme/parts/model.cbk.part.015 /opt/dlami/nvme/parts/model.cbk.part.016 /opt/dlami/nvme/parts/model.cbk.part.017 /opt/dlami/nvme/parts/model.cbk.part.018 /opt/dlami/nvme/parts/model.cbk.part.019 /opt/dlami/nvme/parts/model.cbk.part.020 /opt/dlami/nvme/parts/model.cbk.part.021 /opt/dlami/nvme/parts/model.cbk.part.022 /opt/dlami/nvme/parts/model.cbk.part.023 /opt/dlami/nvme/parts/model.cbk.part.024 /opt/dlami/nvme/parts/model.cbk.part.025 /opt/dlami/nvme/parts/model.cbk.part.026 /opt/dlami/nvme/parts/model.cbk.part.027 /opt/dlami/nvme/parts/model.cbk.part.028 /opt/dlami/nvme/parts/model.cbk.part.029 /opt/dlami/nvme/parts/model.cbk.part.030 /opt/dlami/nvme/parts/model.cbk.part.031 /opt/dlami/nvme/parts/model.cbk.part.032 /opt/dlami/nvme/parts/model.cbk.part.033 /opt/dlami/nvme/parts/model.cbk.part.034 /opt/dlami/nvme/parts/model.cbk.part.035 /opt/dlami/nvme/parts/model.cbk.part.036 /opt/dlami/nvme/parts/model.cbk.part.037 /opt/dlami/nvme/parts/model.cbk.part.038 /opt/dlami/nvme/parts/model.cbk.part.039 /opt/dlami/nvme/parts/model.cbk.part.040 /opt/dlami/nvme/parts/model.cbk.part.041 /opt/dlami/nvme/parts/model.cbk.part.042 /opt/dlami/nvme/parts/model.cbk.part.043 /opt/dlami/nvme/parts/model.cbk.part.044 /opt/dlami/nvme/parts/model.cbk.part.045 /opt/dlami/nvme/parts/model.cbk.part.046 /opt/dlami/nvme/parts/model.cbk.part.047 /opt/dlami/nvme/parts/model.cbk.part.048 /opt/dlami/nvme/parts/model.cbk.part.049 /opt/dlami/nvme/parts/model.cbk.part.050 /opt/dlami/nvme/parts/model.cbk.part.051 /opt/dlami/nvme/parts/model.cbk.part.052 /opt/dlami/nvme/parts/model.cbk.part.053 /opt/dlami/nvme/parts/model.cbk.part.054 /opt/dlami/nvme/parts/model.cbk.part.055 /opt/dlami/nvme/parts/model.cbk.part.056 /opt/dlami/nvme/parts/model.cbk.part.057 /opt/dlami/nvme/parts/model.cbk.part.058 /opt/dlami/nvme/parts/model.cbk.part.059 /opt/dlami/nvme/parts/model.cbk.part.060 /opt/dlami/nvme/parts/model.cbk.part.061 /opt/dlami/nvme/parts/model.cbk.part.062 /opt/dlami/nvme/parts/model.cbk.part.063 /opt/dlami/nvme/parts/model.cbk.part.064 /opt/dlami/nvme/parts/model.cbk.part.065 /opt/dlami/nvme/parts/model.cbk.part.066 /opt/dlami/nvme/parts/model.cbk.part.067 /opt/dlami/nvme/parts/model.cbk.part.068
+
+real	5m0.862s
+user	0m1.865s
+sys	4m58.472s
++ rm -rf /opt/dlami/nvme/parts
++ aws s3 cp s3://neuralboot-trapetum-models/deepseek-r1-671b/tokenizer.json /opt/dlami/nvme/
+Completed 256.0 KiB/9.5 MiB (1.5 MiB/s) with 1 file(s) remainingCompleted 512.0 KiB/9.5 MiB (3.0 MiB/s) with 1 file(s) remainingCompleted 768.0 KiB/9.5 MiB (4.5 MiB/s) with 1 file(s) remainingCompleted 1.0 MiB/9.5 MiB (6.0 MiB/s) with 1 file(s) remaining  Completed 1.2 MiB/9.5 MiB (7.4 MiB/s) with 1 file(s) remaining  Completed 1.5 MiB/9.5 MiB (8.7 MiB/s) with 1 file(s) remaining  Completed 1.8 MiB/9.5 MiB (10.1 MiB/s) with 1 file(s) remaining Completed 2.0 MiB/9.5 MiB (11.5 MiB/s) with 1 file(s) remaining Completed 2.2 MiB/9.5 MiB (12.9 MiB/s) with 1 file(s) remaining Completed 2.5 MiB/9.5 MiB (14.2 MiB/s) with 1 file(s) remaining Completed 2.8 MiB/9.5 MiB (15.5 MiB/s) with 1 file(s) remaining Completed 3.0 MiB/9.5 MiB (16.1 MiB/s) with 1 file(s) remaining Completed 3.2 MiB/9.5 MiB (17.4 MiB/s) with 1 file(s) remaining Completed 3.5 MiB/9.5 MiB (18.6 MiB/s) with 1 file(s) remaining Completed 3.8 MiB/9.5 MiB (19.9 MiB/s) with 1 file(s) remaining Completed 4.0 MiB/9.5 MiB (21.1 MiB/s) with 1 file(s) remaining Completed 4.2 MiB/9.5 MiB (22.4 MiB/s) with 1 file(s) remaining Completed 4.5 MiB/9.5 MiB (23.6 MiB/s) with 1 file(s) remaining Completed 4.8 MiB/9.5 MiB (24.8 MiB/s) with 1 file(s) remaining Completed 5.0 MiB/9.5 MiB (26.0 MiB/s) with 1 file(s) remaining Completed 5.2 MiB/9.5 MiB (27.2 MiB/s) with 1 file(s) remaining Completed 5.5 MiB/9.5 MiB (28.4 MiB/s) with 1 file(s) remaining Completed 5.8 MiB/9.5 MiB (29.5 MiB/s) with 1 file(s) remaining Completed 6.0 MiB/9.5 MiB (30.6 MiB/s) with 1 file(s) remaining Completed 6.2 MiB/9.5 MiB (31.6 MiB/s) with 1 file(s) remaining Completed 6.5 MiB/9.5 MiB (32.3 MiB/s) with 1 file(s) remaining Completed 6.8 MiB/9.5 MiB (33.4 MiB/s) with 1 file(s) remaining Completed 7.0 MiB/9.5 MiB (34.5 MiB/s) with 1 file(s) remaining Completed 7.2 MiB/9.5 MiB (35.7 MiB/s) with 1 file(s) remaining Completed 7.5 MiB/9.5 MiB (36.7 MiB/s) with 1 file(s) remaining Completed 7.8 MiB/9.5 MiB (37.8 MiB/s) with 1 file(s) remaining Completed 8.0 MiB/9.5 MiB (38.9 MiB/s) with 1 file(s) remaining Completed 8.2 MiB/9.5 MiB (39.3 MiB/s) with 1 file(s) remaining Completed 8.5 MiB/9.5 MiB (29.0 MiB/s) with 1 file(s) remaining Completed 8.8 MiB/9.5 MiB (29.7 MiB/s) with 1 file(s) remaining Completed 9.0 MiB/9.5 MiB (30.3 MiB/s) with 1 file(s) remaining Completed 9.2 MiB/9.5 MiB (31.0 MiB/s) with 1 file(s) remaining Completed 9.5 MiB/9.5 MiB (31.6 MiB/s) with 1 file(s) remaining Completed 9.5 MiB/9.5 MiB (31.5 MiB/s) with 1 file(s) remaining download: s3://neuralboot-trapetum-models/deepseek-r1-671b/tokenizer.json to ../../opt/dlami/nvme/tokenizer.json
++ curl -sSf https://sh.rustup.rs
++ sh -s -- -y --profile minimal
+info: downloading installer
+warn: It looks like you have an existing rustup settings file at:
+warn: /home/ubuntu/.rustup/settings.toml
+warn: Rustup will install the default toolchain as specified in the settings file,
+warn: instead of the one inferred from the default host triple.
+info: profile set to minimal
+info: default host triple is x86_64-unknown-linux-gnu
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-09 for version 1.97.0 (2d8144b78 2026-07-07)
+info: downloading 3 components
+info: default toolchain set to stable-x86_64-unknown-linux-gnu
+
+  stable-x86_64-unknown-linux-gnu installed - rustc 1.97.0 (2d8144b78 2026-07-07)
+
+
+Rust is installed now. Great!
+
+To get started you may need to restart your current shell.
+This would reload your PATH environment variable to include
+Cargo's bin directory ($HOME/.cargo/bin).
+
+To configure your current shell, you need to source
+the corresponding env file under $HOME/.cargo.
+
+This is usually done by running one of the following (note the leading DOT):
+. "$HOME/.cargo/env"            # For sh/bash/zsh/ash/dash/pdksh
+source "$HOME/.cargo/env.fish"  # For fish
+source "~/.cargo/env.nu"  # For nushell
+source "$HOME/.cargo/env.tcsh"  # For tcsh
+. "$HOME/.cargo/env.ps1"        # For pwsh
+source "$HOME/.cargo/env.xsh"   # For xonsh
++ export PATH=/home/ubuntu/.cargo/bin:/usr/local/cuda/bin:/usr/local/cuda-13.2/bin:/usr/local/cuda-13.2/include:/usr/local/cuda-12.9/bin:/usr/local/cuda-12.9/include:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
++ PATH=/home/ubuntu/.cargo/bin:/usr/local/cuda/bin:/usr/local/cuda-13.2/bin:/usr/local/cuda-13.2/include:/usr/local/cuda-12.9/bin:/usr/local/cuda-12.9/include:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
++ cd /home/ubuntu
++ rm -rf trapetum
++ git clone -q trap_h.bundle trapetum
+warning: remote HEAD refers to nonexistent ref, unable to checkout.
+
++ cd trapetum
++ git checkout -q s19-mixed-precision
++ git log --oneline -1
+d3662c4 perf(runtime): TRAPETUM_MLA_OVERLAP drops the redundant per-layer attn drain -- deliverable H increment 3
++ cd runtime
++ cargo build --release --features cuda --bin deepseek_run
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded cfg-if v1.0.4
+  Downloaded macro_rules_attribute v0.2.2
+  Downloaded chunked_transfer v1.5.0
+  Downloaded base64 v0.13.1
+  Downloaded cc v1.2.65
+  Downloaded thiserror v1.0.69
+  Downloaded bitflags v2.13.0
+  Downloaded aho-corasick v1.1.4
+  Downloaded serde_spanned v0.6.9
+  Downloaded ascii v1.1.0
+  Downloaded memmap2 v0.9.11
+  Downloaded quote v1.0.46
+  Downloaded proc-macro2 v1.0.106
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded itoa v1.0.18
+  Downloaded paste v1.0.15
+  Downloaded tiny_http v0.12.0
+  Downloaded serde_derive v1.0.228
+  Downloaded toml_write v0.1.2
+  Downloaded monostate-impl v0.1.18
+  Downloaded itertools v0.12.1
+  Downloaded memchr v2.8.2
+  Downloaded monostate v0.1.18
+  Downloaded once_cell v1.21.4
+  Downloaded fnv v1.0.7
+  Downloaded getrandom v0.2.17
+  Downloaded itertools v0.11.0
+  Downloaded strsim v0.11.1
+  Downloaded zerocopy-derive v0.8.52
+  Downloaded derive_builder v0.20.2
+  Downloaded derive_builder_macro v0.20.2
+  Downloaded half v2.7.1
+  Downloaded serde_core v1.0.228
+  Downloaded unicode_categories v0.1.1
+  Downloaded pkg-config v0.3.33
+  Downloaded toml v0.8.23
+  Downloaded toml_edit v0.22.27
+  Downloaded zmij v1.0.21
+  Downloaded darling_core v0.20.11
+  Downloaded derive_builder_core v0.20.2
+  Downloaded regex-syntax v0.8.11
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded serde_json v1.0.150
+  Downloaded lazy_static v1.5.0
+  Downloaded unicode-segmentation v1.13.3
+  Downloaded rand_core v0.6.4
+  Downloaded regex-automata v0.4.14
+  Downloaded indexmap v2.14.0
+  Downloaded macro_rules_attribute-proc_macro v0.2.2
+  Downloaded thiserror-impl v1.0.69
+  Downloaded rayon-cond v0.3.0
+  Downloaded smallvec v1.15.2
+  Downloaded nom v7.1.3
+  Downloaded darling_macro v0.20.11
+  Downloaded log v0.4.33
+  Downloaded hashbrown v0.17.1
+  Downloaded minimal-lexical v0.2.1
+  Downloaded httpdate v1.0.3
+  Downloaded darling v0.20.11
+  Downloaded rayon-core v1.13.0
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded onig v6.5.3
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded either v1.16.0
+  Downloaded equivalent v1.0.2
+  Downloaded rand_chacha v0.3.1
+  Downloaded toml_datetime v0.6.11
+  Downloaded unicode-ident v1.0.24
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded shlex v2.0.1
+  Downloaded unicode-normalization-alignments v0.1.12
+  Downloaded regex v1.12.4
+  Downloaded serde v1.0.228
+  Downloaded ident_case v1.0.1
+  Downloaded rand v0.8.6
+  Downloaded rayon v1.12.0
+  Downloaded winnow v0.7.15
+  Downloaded tokenizers v0.20.4
+  Downloaded syn v2.0.118
+  Downloaded esaxx-rs v0.1.10
+  Downloaded zerocopy v0.8.52
+  Downloaded spm_precompiled v0.1.4
+  Downloaded libc v0.2.186
+  Downloaded onig_sys v69.9.3
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.46
+   Compiling serde_core v1.0.228
+   Compiling libc v0.2.186
+   Compiling serde v1.0.228
+   Compiling crossbeam-utils v0.8.21
+   Compiling memchr v2.8.2
+   Compiling ident_case v1.0.1
+   Compiling fnv v1.0.7
+   Compiling zerocopy v0.8.52
+   Compiling strsim v0.11.1
+   Compiling cfg-if v1.0.4
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling either v1.16.0
+   Compiling rayon-core v1.13.0
+   Compiling pkg-config v0.3.33
+   Compiling zmij v1.0.21
+   Compiling paste v1.0.15
+   Compiling minimal-lexical v0.2.1
+   Compiling equivalent v1.0.2
+   Compiling hashbrown v0.17.1
+   Compiling serde_json v1.0.150
+   Compiling regex-syntax v0.8.11
+   Compiling esaxx-rs v0.1.10
+   Compiling thiserror v1.0.69
+   Compiling log v0.4.33
+   Compiling macro_rules_attribute-proc_macro v0.2.2
+   Compiling winnow v0.7.15
+   Compiling toml_write v0.1.2
+   Compiling smallvec v1.15.2
+   Compiling bitflags v2.13.0
+   Compiling itoa v1.0.18
+   Compiling base64 v0.13.1
+   Compiling once_cell v1.21.4
+   Compiling unicode-segmentation v1.13.3
+   Compiling lazy_static v1.5.0
+   Compiling unicode_categories v0.1.1
+   Compiling ascii v1.1.0
+   Compiling chunked_transfer v1.5.0
+   Compiling trapetum v0.1.0 (/home/ubuntu/trapetum/runtime)
+   Compiling httpdate v1.0.3
+   Compiling cc v1.2.65
+   Compiling itertools v0.11.0
+   Compiling itertools v0.12.1
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling tiny_http v0.12.0
+   Compiling aho-corasick v1.1.4
+   Compiling nom v7.1.3
+   Compiling indexmap v2.14.0
+   Compiling macro_rules_attribute v0.2.2
+   Compiling crossbeam-epoch v0.9.18
+   Compiling onig_sys v69.9.3
+   Compiling syn v2.0.118
+   Compiling crossbeam-deque v0.8.6
+   Compiling getrandom v0.2.17
+   Compiling memmap2 v0.9.11
+   Compiling rand_core v0.6.4
+   Compiling regex-automata v0.4.14
+   Compiling rayon v1.12.0
+   Compiling darling_core v0.20.11
+   Compiling rayon-cond v0.3.0
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.52
+   Compiling monostate-impl v0.1.18
+   Compiling thiserror-impl v1.0.69
+   Compiling regex v1.12.4
+   Compiling monostate v0.1.18
+   Compiling darling_macro v0.20.11
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+   Compiling derive_builder_macro v0.20.2
+   Compiling derive_builder v0.20.2
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling spm_precompiled v0.1.4
+   Compiling toml_edit v0.22.27
+   Compiling toml v0.8.23
+   Compiling ppv-lite86 v0.2.21
+   Compiling half v2.7.1
+   Compiling rand_chacha v0.3.1
+   Compiling rand v0.8.6
+   Compiling onig v6.5.3
+   Compiling tokenizers v0.20.4
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:1301:70
+     |
+1301 |     let mut nx = || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; (((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+     |                                                                      ^                                            ^
+     |
+     = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+     |
+1301 -     let mut nx = || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; (((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+1301 +     let mut nx = || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; ((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+     |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:1597:75
+     |
+1597 |     let mut nx = move || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; (((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+     |                                                                           ^                                            ^
+     |
+help: remove these parentheses
+     |
+1597 -     let mut nx = move || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; (((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+1597 +     let mut nx = move || { rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; ((rng>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+     |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:1600:91
+     |
+1600 | ... || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) } };
+     |                                             ^                                          ^
+     |
+help: remove these parentheses
+     |
+1600 -         let mut r = { let mut s = 0x5EEDu64; move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) } };
+1600 +         let mut r = { let mut s = 0x5EEDu64; move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 } };
+     |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:1655:91
+     |
+1655 | ... || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) } };
+     |                                             ^                                          ^
+     |
+help: remove these parentheses
+     |
+1655 -         let mut r = { let mut s = 0x5EEDu64; move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) } };
+1655 +         let mut r = { let mut s = 0x5EEDu64; move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 } };
+     |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:1758:91
+     |
+1758 | ... || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) } };
+     |                                             ^                                          ^
+     |
+help: remove these parentheses
+     |
+1758 -         let mut r = { let mut s = 0x5EEDu64; move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) } };
+1758 +         let mut r = { let mut s = 0x5EEDu64; move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 } };
+     |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:2268:62
+     |
+2268 |     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+     |                                                              ^                                          ^
+     |
+help: remove these parentheses
+     |
+2268 -     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+2268 +     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+     |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:2305:62
+     |
+2305 |     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+     |                                                              ^                                          ^
+     |
+help: remove these parentheses
+     |
+2305 -     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+2305 +     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+     |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:2391:62
+     |
+2391 |     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+     |                                                              ^                                          ^
+     |
+help: remove these parentheses
+     |
+2391 -     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+2391 +     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+     |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:2431:62
+     |
+2431 |     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+     |                                                              ^                                          ^
+     |
+help: remove these parentheses
+     |
+2431 -     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+2431 +     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+     |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:2908:62
+     |
+2908 |     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+     |                                                              ^                                          ^
+     |
+help: remove these parentheses
+     |
+2908 -     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+2908 +     let mut r = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+     |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:2941:69
+     |
+2941 |     let mut rr = move || { sh ^= sh<<13; sh ^= sh>>7; sh ^= sh<<17; (((sh>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+     |                                                                     ^                                           ^
+     |
+help: remove these parentheses
+     |
+2941 -     let mut rr = move || { sh ^= sh<<13; sh ^= sh>>7; sh ^= sh<<17; (((sh>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+2941 +     let mut rr = move || { sh ^= sh<<13; sh ^= sh>>7; sh ^= sh<<17; ((sh>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+     |
+
+warning: unnecessary parentheses around block return value
+    --> src/lib.rs:2963:63
+     |
+2963 |     let mut rr = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+     |                                                               ^                                          ^
+     |
+help: remove these parentheses
+     |
+2963 -     let mut rr = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; (((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0) };
+2963 +     let mut rr = move || { s ^= s<<13; s ^= s>>7; s ^= s<<17; ((s>>40) as f32/(1u64<<24) as f32)*2.0-1.0 };
+     |
+
+warning: value assigned to `ph` is never read
+    --> src/cpu_experts.rs:1294:111
+     |
+1294 |     macro_rules! lap { ($a:expr) => { if let Some(t) = ph { moetime::add($a, t.elapsed().as_micros() as u64); ph = Some(std::time::Instant::now()); }...
+     |                                                                                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1365 |     lap!(&moetime::RC_US);
+     |     --------------------- in this macro invocation
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `lap` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: value assigned to `ph` is never read
+    --> src/cpu_experts.rs:1567:111
+     |
+1567 |     macro_rules! lap { ($a:expr) => { if let Some(t) = ph { moetime::add($a, t.elapsed().as_micros() as u64); ph = Some(std::time::Instant::now()); }...
+     |                                                                                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1656 |     lap!(&moetime::RC_US);
+     |     --------------------- in this macro invocation
+     |
+     = help: maybe it is overwritten before being read?
+     = note: this warning originates in the macro `lap` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: field `shared_inter` is never read
+    --> src/lib.rs:1951:5
+     |
+1939 | pub struct MoeBlock {
+     |            -------- field in this struct
+...
+1951 |     shared_inter: usize,
+     |     ^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `hidden` is never read
+    --> src/lib.rs:3045:80
+     |
+3035 | pub struct MlaAttn {
+     |            ------- field in this struct
+...
+3045 |     n_heads: usize, d_c: usize, d_rope: usize, nope: usize, v_head_dim: usize, hidden: usize,
+     |                                                                                ^^^^^^
+
+warning: `trapetum` (lib) generated 16 warnings (run `cargo fix --lib -p trapetum` to apply 12 suggestions)
+    Finished `release` profile [optimized] target(s) in 41.78s
++ echo 'BUILD_EXIT 0'
+BUILD_EXIT 0
++ echo '=== GATE mla_block_math_correct (overlap OFF) ==='
+=== GATE mla_block_math_correct (overlap OFF) ===
++ cargo test --release --lib --features cuda mla_block_math_correct -- --nocapture
++ grep -E 'test result|mla'
++ head -3
+test mla_tests::mla_block_math_correct ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 5.60s
++ pip3 install -q tokenizers numpy
+WARNING: Error parsing dependencies of devscripts: Invalid version: '2.22.1ubuntu1.2'
+  WARNING: The scripts f2py and numpy-config are installed in '/home/ubuntu/.local/bin' which is not on PATH.
+  Consider adding this directory to PATH or, if you prefer to suppress this warning, use --no-warn-script-location.
+  WARNING: The script httpx is installed in '/home/ubuntu/.local/bin' which is not on PATH.
+  Consider adding this directory to PATH or, if you prefer to suppress this warning, use --no-warn-script-location.
+  WARNING: The scripts hf, huggingface-cli and tiny-agents are installed in '/home/ubuntu/.local/bin' which is not on PATH.
+  Consider adding this directory to PATH or, if you prefer to suppress this warning, use --no-warn-script-location.
++ python3 -c '
+from tokenizers import Tokenizer
+import numpy as np
+t = Tokenizer.from_file("/opt/dlami/nvme/tokenizer.json")
+np.array(t.encode("The capital of France is").ids, dtype="<i4").tofile("/opt/dlami/nvme/prompt.bin")
+'
++ dd if=/opt/dlami/nvme/model.cbk of=/dev/null bs=16M status=none
+
+real	0m24.216s
+user	0m0.021s
+sys	0m24.190s
++ B=./target/release/deepseek_run
++ run H-DEVICE-default TRAPETUM_NTOK=24
++ echo '=== H-DEVICE-default ==='
+=== H-DEVICE-default ===
++ shift
++ env TRAPETUM_NTOK=24 TRAPETUM_CPU_KERNEL=lut8 TRAPETUM_CPU_SPIN=1 TRAPETUM_CPU_EXPERTS=1 TRAPETUM_CPU_THREADS=32 TRAPETUM_MLA_TIMING=1 TRAPETUM_MOE_TIMING=1 TRAPETUM_NTOK=24 ./target/release/deepseek_run /opt/dlami/nvme/model.cbk /opt/dlami/nvme/prompt.bin
++ grep -E 'mla_timing pos=1[5-9]|moe_ws_sub pos=1[5-9]|decode:|steady'
++ tail -5
+[moe_ws_sub pos=18] setup=1.5 [recode=0.3 quant=1.2 prep=0.0] barrier+handoff=20.8 combine=2.3 ms
+[mla_timing pos=19] attention=169.7 moe=242.7 other=1.3 total=413.7 ms
+[moe_ws_sub pos=19] setup=1.5 [recode=0.3 quant=1.2 prep=0.0] barrier+handoff=21.5 combine=2.3 ms
+decode: 417.5 ms/token (2.4 tok/s), pure Rust MLA+MoE, no Python
+steady-state (last 12 tokens): 416.5 ms/token (2.40 tok/s)
++ run H-DEVICE-overlap TRAPETUM_MLA_OVERLAP=1
++ echo '=== H-DEVICE-overlap ==='
+=== H-DEVICE-overlap ===
++ shift
++ env TRAPETUM_MLA_OVERLAP=1 TRAPETUM_CPU_KERNEL=lut8 TRAPETUM_CPU_SPIN=1 TRAPETUM_CPU_EXPERTS=1 TRAPETUM_CPU_THREADS=32 TRAPETUM_MLA_TIMING=1 TRAPETUM_MOE_TIMING=1 TRAPETUM_NTOK=24 ./target/release/deepseek_run /opt/dlami/nvme/model.cbk /opt/dlami/nvme/prompt.bin
++ grep -E 'mla_timing pos=1[5-9]|moe_ws_sub pos=1[5-9]|decode:|steady'
++ tail -5
+[moe_ws_sub pos=18] setup=1.6 [recode=0.3 quant=1.2 prep=0.1] barrier+handoff=20.9 combine=2.2 ms
+[mla_timing pos=19] attention=164.0 moe=242.3 other=1.3 total=407.7 ms
+[moe_ws_sub pos=19] setup=1.6 [recode=0.3 quant=1.2 prep=0.1] barrier+handoff=20.1 combine=2.3 ms
+decode: 407.5 ms/token (2.5 tok/s), pure Rust MLA+MoE, no Python
+steady-state (last 12 tokens): 407.2 ms/token (2.46 tok/s)
++ run H-HOST-ctl TRAPETUM_MLA_HOST=1
++ echo '=== H-HOST-ctl ==='
+=== H-HOST-ctl ===
++ shift
++ env TRAPETUM_MLA_HOST=1 TRAPETUM_CPU_KERNEL=lut8 TRAPETUM_CPU_SPIN=1 TRAPETUM_CPU_EXPERTS=1 TRAPETUM_CPU_THREADS=32 TRAPETUM_MLA_TIMING=1 TRAPETUM_MOE_TIMING=1 TRAPETUM_NTOK=24 ./target/release/deepseek_run /opt/dlami/nvme/model.cbk /opt/dlami/nvme/prompt.bin
++ grep -E 'mla_timing pos=1[5-9]|moe_ws_sub pos=1[5-9]|decode:|steady'
++ tail -5
+[moe_ws_sub pos=18] setup=1.5 [recode=0.3 quant=1.2 prep=0.1] barrier+handoff=20.3 combine=2.1 ms
+[mla_timing pos=19] attention=302.4 moe=236.5 other=1.4 total=540.2 ms
+[moe_ws_sub pos=19] setup=1.6 [recode=0.3 quant=1.2 prep=0.1] barrier+handoff=20.5 combine=2.1 ms
+decode: 542.9 ms/token (1.8 tok/s), pure Rust MLA+MoE, no Python
+steady-state (last 12 tokens): 542.0 ms/token (1.84 tok/s)
++ echo '### H_COMPLETE ###'
+### H_COMPLETE ###
+++ date +%s
++ aws s3 cp /home/ubuntu/h.log s3://neuralboot-trapetum-models/deepseek-r1-671b/aws_h_1783874129.log
