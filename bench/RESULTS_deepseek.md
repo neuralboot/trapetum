@@ -40,7 +40,10 @@ q_a_proj/q_b_proj export. Both walls fell in July 2026: see the 671B section bel
 
 DeepSeek-R1 671B (the full V3 architecture: MLA with low-rank query projection,
 256 routed experts, sigmoid noaux_tc router) loads and decodes coherently in the
-pure-Rust runtime on a single node.
+pure-Rust runtime on a single node. **Current result (session H, below): the full
+model serves at 2.46 tok/s steady state via the CPU-experts inversion, a x10.2 gain
+over the 0.24 tok/s disk-offload baseline. The sections below are the chronological
+measured journey to it.**
 
 Prompt:  "The capital of France is"
 Output:  " Paris. Paris is located in northern France and is known for its iconic
@@ -49,14 +52,14 @@ Output:  " Paris. Paris is located in northern France and is known for its iconi
 Measured numbers (raw logs in `runpod_logs/r1_671b_export.log` and
 `runpod_logs/r1_671b_first_run.log`):
 
-- **Export**: 1.34 TB bf16 checkpoint -> **326 GB** 4-bit CBKR artifact, produced by
+- **Export**: 1.34 TB bf16 checkpoint -> **350 GB** 4-bit CBKR artifact, produced by
   the torch-free streaming exporter (`model/export_deepseek_stream.py`): bounded RAM,
   resumable via a progress sidecar, ~7 h on one A100 80GB pod.
 - **Load**: 43.3 s for all 61 layers (q_lora path: q_a 7168->1536, RMSNorm, q_b 1536->24576).
 - **Memory**: **73 GB peak host RAM**. Routed experts are not loaded: their packed 4-bit
   indices stay mmap-backed on disk and are paged in on demand per token
   (`PackedBytes::Mmap`), while the f32 codebooks stay in RAM. Before the mmap path the
-  same load needed 326 GB and died at layer 44 under the pod's 250 GB cgroup cap.
+  same load needed 350 GB and died at layer 44 under the pod's 250 GB cgroup cap.
 - **Speed**: 0.2 tok/s on the first pass (5.9 s/token), entirely first-touch disk paging
   on network-attached storage. Steady-state measured July 6 on local NVMe (64 tokens,
   per-token timing, immediate warm rerun): **~0.1 tok/s** (10.2 s/token), warm rerun
@@ -81,14 +84,15 @@ host with 48 GB RAM and local NVMe:
 - Same fully coherent 64-token continuation (Paris, Eiffel Tower, Louvre...). Raw logs:
   `runpod_logs/r1_671b_4090.log` and `r1_671b_4090_warm.log`.
 
-Headline: **DeepSeek-R1 671B, the largest open-source model, decodes coherently on one
-consumer RTX 4090** in a from-scratch pure-Rust runtime. Throughput is disk-bound
-(~0.24 tok/s): a proof of reach, not a serving speed; RAM or expert prefetch is the lever.
+Headline (July 7, historical): **DeepSeek-R1 671B decodes coherently on one consumer
+RTX 4090** in a from-scratch pure-Rust runtime. Throughput here is disk-bound (~0.24
+tok/s): a proof of reach, not a serving speed. **Superseded by the inversion (session H
+below): the same 671B serves at 2.46 tok/s steady state on one 64-vCPU node, x10.2.**
 
 ## What this establishes
 The largest open-source model runs end to end in a from-scratch Rust runtime with no
 Python, no PyTorch, and no GPU requirement for the expert weights: one box, 73 GB of
-RAM, and 326 GB of disk. The V3-specific machinery validated on the way: q_lora MLA,
+RAM, and 350 GB of disk. The V3-specific machinery validated on the way: q_lora MLA,
 noaux_tc sigmoid routing with e_score_correction_bias and group top-k (n_group 8,
 topk_group 4, routed_scaling 2.5, raw-sigmoid weight renormalization), first 3 layers
 dense, 2048-dim expert FFNs.

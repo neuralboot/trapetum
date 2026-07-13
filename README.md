@@ -34,7 +34,7 @@ Y[m, j]     = sum_i  X[m, i] * W_deq[i, j]
   Nine architectures run end-to-end in pure Rust, including Gemma-2-9B, Phi-4 and
   DeepSeek-V2-Lite (MLA + MoE); see [`bench/RESULTS_models.md`](bench/RESULTS_models.md).
   Scale result: **DeepSeek-R1 671B** (full V3 architecture), 1.34 TB bf16 compressed to
-  a 326 GB 4-bit artifact, serves the **full model at 2.46 tok/s** on a single commodity
+  a 350 GB 4-bit artifact, serves the **full model at 2.46 tok/s** on a single commodity
   node (64 vCPU, one L40S, 497 GB RAM), a **x10.2** gain over the 0.24 tok/s disk-offload
   baseline. The lever is **inversion**: the routed experts stay resident in host RAM and
   are decoded in place on the CPU (one `vpshufb` per 32 weights on AVX2), while the GPU
