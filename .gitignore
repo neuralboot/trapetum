@@ -25,3 +25,16 @@ __pycache__/
 # compressed drafter/target model blobs (large)
 drafters/**/*.cbk
 drafters/**/*.bin
+
+# stray working reports / drafts (never part of the repo)
+/EXPERT_ULTRATHINK_PROJECT_VERIFICATION_REPORT.txt
+/RESPONSE_TO_REVIEW.txt
+/lossless_report*.html
+/model/modeling_deepseek_reference.py
+# latex build artifacts
+paper/*.aux
+paper/*.log
+paper/*.out
+# local cpu microbench binaries + sources
+bench/cpu_codebook_neon
+bench/cpu_codebook_neon_v2
