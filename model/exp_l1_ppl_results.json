@@ -1,0 +1,13 @@
+{
+  "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "K": 16,
+  "bits": 4,
+  "ppl_samples": 20,
+  "seqlen": 2048,
+  "ppl_fp32": 8.346740586854942,
+  "ppl_L0": 9.909027113111854,
+  "ppl_L1": 9.329704641122557,
+  "delta_L0": 1.5622865262569121,
+  "delta_L1": 0.9829640542676152,
+  "L1_vs_L0_ppl_gap_reduction": 0.37081704428271406
+}
