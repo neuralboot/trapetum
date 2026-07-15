@@ -18,10 +18,36 @@ ap.add_argument("log")
 ap.add_argument("--moe-layers", type=int, default=58, help="MoE calls per token (R1: 61-3 dense)")
 ap.add_argument("--n-routed", type=int, default=256)
 ap.add_argument("--expert-mb", type=float, default=22.4, help="bytes of one 4-bit expert, MB")
+# mtp_shadow demux: the log interleaves main-model and MTP-module rows. Write order is
+# prefill: [58 main][1 mtp] x (prompt_len-1) then [58 main]; decode: ([1 mtp] x depth,
+# [58 main]) x ntok. --demux extracts the MAIN decode rows (the per-token routing the
+# hot-cache / overlap questions are about) and reports the MTP rows separately.
+ap.add_argument("--demux", nargs=3, type=int, metavar=("PROMPT_LEN", "NTOK", "DEPTH"),
+                help="demux an mtp_shadow log: prompt_len ntok mtp_depth")
 a = ap.parse_args()
 
 rows = [tuple(int(x) for x in ln.split(",")) for ln in open(a.log) if ln.strip()]
 L = a.moe_layers
+if a.demux:
+    plen, ntok, depth = a.demux
+    expect = plen * L + (plen - 1) + ntok * (depth + L)
+    if len(rows) != expect:
+        print(f"warning: {len(rows)} rows, expected {expect} for demux({plen},{ntok},{depth}); "
+              f"proceeding anyway", file=sys.stderr)
+    i = 0
+    main_rows, mtp_rows = [], []
+    for t in range(plen):                      # prefill
+        main_rows += rows[i:i+L]; i += L
+        if t < plen - 1: mtp_rows.append(rows[i]); i += 1
+    for _ in range(ntok):                      # decode
+        mtp_rows += rows[i:i+depth]; i += depth
+        main_rows += rows[i:i+L]; i += L
+    rows = main_rows[-(ntok * L):]             # decode-phase main rows only (steady state)
+    print(f"demux: {len(main_rows)//L} main tokens ({ntok} decode kept), {len(mtp_rows)} MTP rows")
+    mtp_c = collections.Counter()
+    for r in mtp_rows: mtp_c.update(r)
+    top8 = sum(c for _, c in mtp_c.most_common(8)) / max(sum(mtp_c.values()), 1)
+    print(f"MTP-layer routing: {len(mtp_c)} distinct experts used, top-8 coverage {top8:.3f}")
 if len(rows) % L:
     print(f"warning: {len(rows)} lines not divisible by {L} MoE layers; truncating", file=sys.stderr)
     rows = rows[: len(rows) // L * L]
