@@ -4316,10 +4316,11 @@ impl Mtp {
         rmsnorm(&self.emb_h, &self.enorm, &mut self.emb_n, self.eps);
         self.hid_raw.upload(prev_hidden);
         rmsnorm(&self.hid_raw, &self.hnorm, &mut self.hid_n, self.eps);
-        // concat(enorm(emb), hnorm(prev)) -> eh_proj. Host round-trip: 2*hidden floats, trivial
-        // next to the layer's expert work (the MLA path does the same for its q_a norm).
-        let mut cat = self.emb_n.to_host();
-        cat.extend(self.hid_n.to_host());
+        // DeepSeek-V3 MTP: h'_i = M_k [ RMSNorm(h_{i}) ; RMSNorm(Emb(t_{i+k})) ] -- HIDDEN norm
+        // FIRST, embedding norm SECOND (paper eq.; eh_proj's first `hidden` input columns are the
+        // hidden half). Host round-trip: 2*hidden floats, trivial next to the layer's expert work.
+        let mut cat = self.hid_n.to_host();
+        cat.extend(self.emb_n.to_host());
         self.cat.upload(&cat);
         self.eh_proj.forward_into(&self.cat, &mut self.proj);
         self.h.copy_cast_from(&self.proj);
