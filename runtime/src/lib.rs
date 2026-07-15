@@ -4204,6 +4204,136 @@ impl DeepSeekModel {
     }
 }
 
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl DeepSeekModel {
+    /// The hidden state after the last [`forward`] (post all layers, pre final norm), on host.
+    /// This is `h_i^{main}` in DeepSeek-V3's MTP formulation -- the MTP module's second input.
+    pub fn last_hidden(&self) -> Vec<f32> { self.h.to_host() }
+}
+
+/// DeepSeek-V3/R1 MTP (multi-token-prediction) module, loaded from the standalone `mtp.cbk`
+/// written by `model/export_deepseek_mtp.py` (magic `MTP1`). It is one full MLA+MoE decoder
+/// layer plus the MTP glue: `enorm`/`hnorm` (RMSNorm on the next token's embedding / the main
+/// model's last hidden), `eh_proj` (4-bit, `[2*hidden] -> [hidden]` on the concat) and
+/// `shared_head.norm`. Embedding and output head are TIED to the main model's on R1, so the
+/// draft borrows `DeepSeekModel`'s `embedding` and `lm_head` instead of loading copies.
+///
+/// `draft(model, tok, prev_hidden, pos)` returns the MTP's next-token logits: the candidate
+/// for position `pos+2` given token `tok` at `pos+1` and the main hidden at `pos`. Chained
+/// drafting feeds [`Mtp::last_hidden`] back as the next `prev_hidden`.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub struct Mtp {
+    enorm: DevF32,
+    hnorm: DevF32,
+    eh_proj: QuantLinear,        // ic = 2*hidden, oc = hidden
+    layer: DsLayer,              // one full MLA+MoE decoder block (own KV cache)
+    head_norm: DevF32,           // shared_head.norm
+    // scratch (all device buffers preallocated once)
+    emb_h: DevHalf, emb_n: DevHalf, hid_raw: DevHalf, hid_n: DevHalf,
+    cat: DevHalf, proj: DevF32, h: DevHalf, normed: DevHalf, logits: DevF32,
+    hidden: usize,
+    eps: f32,
+    // keep the mmap alive: the routed experts' packed nibbles are zero-copy ranges into it
+    _mmap: Arc<memmap2::Mmap>,
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl Mtp {
+    /// Load an `MTP1` file (see `export_deepseek_mtp.py` for the byte layout). `vocab` is the
+    /// parent model's vocab (for the logits scratch; the head itself is the parent's lm_head).
+    pub fn load_mtp1(path: &str, max_seq: usize, vocab: usize) -> std::io::Result<Mtp> {
+        let mut r = BufReader::new(File::open(path)?);
+        let mut magic = [0u8; 4]; r.read_exact(&mut magic)?;
+        assert!(&magic == b"MTP1", "not an mtp.cbk (expected MTP1)");
+        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&File::open(path)?)? });
+        let cfg: Vec<usize> = (0..16).map(|_| rd_i32(&mut r) as usize).collect();
+        let (hidden, n_heads, kv_lora, nope, rope, vhd, q_lora_rank, moe_inter,
+             n_routed, n_shared, top_k, n_group, topk_group, sigmoid_flag, tied_embed, tied_head) =
+            (cfg[0],cfg[1],cfg[2],cfg[3],cfg[4],cfg[5],cfg[6],cfg[7],cfg[8],cfg[9],cfg[10],cfg[11],cfg[12],cfg[13],cfg[14],cfg[15]);
+        assert!(tied_embed == 1 && tied_head == 1,
+            "mtp.cbk with untied embed/head not supported yet (R1 ties both; re-export without --force-own-head)");
+        let eps = rd_f32(&mut r); let softmax_scale = rd_f32(&mut r); let rscale = rd_f32(&mut r);
+        let inv_freq = rd_f32_vec(&mut r, rope/2);
+        let qdim = n_heads*(nope+rope);
+        // MTP glue
+        let enorm = rd_f32_vec(&mut r, hidden);
+        let hnorm = rd_f32_vec(&mut r, hidden);
+        let (ehp, ehc) = (rd_u8_vec(&mut r, (2*hidden)*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
+        // one standard CBKR MoE layer block (same order as load_deepseek_qlora)
+        let attn_norm = rd_f32_vec(&mut r, hidden);
+        let q_a_w = rd_f16_vec(&mut r, q_lora_rank*hidden);
+        let q_a_norm = rd_f32_vec(&mut r, q_lora_rank);
+        let (qbp, qbc) = (rd_u8_vec(&mut r, q_lora_rank*(qdim/2)), rd_f32_vec(&mut r, K*qdim));
+        let kv_a_w = rd_f16_vec(&mut r, (kv_lora+rope)*hidden);
+        let kv_a_norm = rd_f32_vec(&mut r, kv_lora);
+        let kv_b = rd_f16_vec(&mut r, n_heads*(nope+vhd)*kv_lora);
+        let (op, oc) = (rd_u8_vec(&mut r, (n_heads*vhd)*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
+        let post_norm = rd_f32_vec(&mut r, hidden);
+        let attn = MlaAttn::new_qlora(hidden, n_heads, kv_lora, rope, nope, vhd, max_seq, eps, softmax_scale,
+            q_lora_rank, &q_a_w, &q_a_norm, (&qbp, &qbc), &kv_a_w, &kv_a_norm, &kv_b, (&op, &oc), &inv_freq);
+        let score_bias = rd_f32_vec(&mut r, n_routed);
+        let rw = rd_f16_vec(&mut r, n_routed*hidden);
+        let mut hosts: Vec<ExpertHost> = Vec::with_capacity(n_routed);
+        for _ in 0..n_routed {
+            let gp = mmap_skip(&mut r, &mmap, hidden * (moe_inter / 2))?;
+            let gc = rd_f32_vec(&mut r, K * moe_inter);
+            let up = mmap_skip(&mut r, &mmap, hidden * (moe_inter / 2))?;
+            let uc = rd_f32_vec(&mut r, K * moe_inter);
+            let dp = mmap_skip(&mut r, &mmap, moe_inter * (hidden / 2))?;
+            let dc = rd_f32_vec(&mut r, K * hidden);
+            hosts.push(ExpertHost::Scalar { gp, gc, up, uc, dp, dc });
+        }
+        let si = ((n_shared*moe_inter + 255)/256)*256;
+        let sh = (rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
+                  rd_u8_vec(&mut r, hidden*(si/2)), rd_f32_vec(&mut r, K*si),
+                  rd_u8_vec(&mut r, si*(hidden/2)), rd_f32_vec(&mut r, K*hidden));
+        let shared = (sh.0.as_slice(), sh.1.as_slice(), sh.2.as_slice(), sh.3.as_slice(), sh.4.as_slice(), sh.5.as_slice());
+        let mut off = MoeBlockOffload::new_k(hidden, moe_inter, n_routed, top_k, top_k, eps, &post_norm, &rw, hosts, shared, 16);
+        off.set_rscale(rscale);
+        if sigmoid_flag != 0 { off.set_v3_scoring(score_bias, n_group, topk_group); }
+        let head_norm = rd_f32_vec(&mut r, hidden);
+        Ok(Mtp {
+            enorm: DevF32::from_host(&enorm),
+            hnorm: DevF32::from_host(&hnorm),
+            eh_proj: QuantLinear::new(&ehp, &ehc, 2*hidden, hidden),
+            layer: DsLayer { attn_norm: DevF32::from_host(&attn_norm), attn, ffn: DsFfn::MoeOffload(off) },
+            head_norm: DevF32::from_host(&head_norm),
+            emb_h: DevHalf::zeros(hidden), emb_n: DevHalf::zeros(hidden),
+            hid_raw: DevHalf::zeros(hidden), hid_n: DevHalf::zeros(hidden),
+            cat: DevHalf::zeros(2*hidden), proj: DevF32::zeros(hidden), h: DevHalf::zeros(hidden),
+            normed: DevHalf::zeros(hidden), logits: DevF32::zeros(vocab),
+            hidden, eps, _mmap: mmap,
+        })
+    }
+
+    /// One MTP draft step: logits for the token at `pos+2`, given token `tok` (at `pos+1`)
+    /// and `prev_hidden` = the main model's post-layers hidden at `pos` (or the MTP's own
+    /// [`Mtp::last_hidden`] when chaining depth > 1). `pos` indexes the MTP's own KV cache;
+    /// use the MAIN position (the MTP stream is the main stream shifted by one, consistently).
+    pub fn draft(&mut self, model: &DeepSeekModel, tok: usize, prev_hidden: &[f32], pos: usize) -> Vec<f32> {
+        let row = &model.embedding[tok*self.hidden..(tok+1)*self.hidden];
+        self.emb_h.upload(row);
+        rmsnorm(&self.emb_h, &self.enorm, &mut self.emb_n, self.eps);
+        self.hid_raw.upload(prev_hidden);
+        rmsnorm(&self.hid_raw, &self.hnorm, &mut self.hid_n, self.eps);
+        // concat(enorm(emb), hnorm(prev)) -> eh_proj. Host round-trip: 2*hidden floats, trivial
+        // next to the layer's expert work (the MLA path does the same for its q_a norm).
+        let mut cat = self.emb_n.to_host();
+        cat.extend(self.hid_n.to_host());
+        self.cat.upload(&cat);
+        self.eh_proj.forward_into(&self.cat, &mut self.proj);
+        self.h.copy_cast_from(&self.proj);
+        self.layer.forward(&mut self.h, pos);
+        rmsnorm(&self.h, &self.head_norm, &mut self.normed, self.eps);
+        model.lm_head.forward_into(&self.normed, &mut self.logits);
+        self.logits.to_host()
+    }
+
+    /// The MTP block's hidden after the last [`draft`] -- feed back as `prev_hidden` to chain
+    /// depth-2/3 drafts.
+    pub fn last_hidden(&self) -> Vec<f32> { self.h.to_host() }
+}
+
 /// Read a little-endian i32 binary file into a Vec<i32> (prompt.bin / cont.bin).
 pub fn read_i32s(path: &str) -> Vec<i32> {
     let mut f = BufReader::new(File::open(path).unwrap());
