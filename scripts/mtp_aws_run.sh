@@ -44,13 +44,13 @@ idx = json.load(open("model.safetensors.index.json"))
 wm = idx["weight_map"]
 need = [k for k in wm if ".layers.61." in k] + ["model.embed_tokens.weight", "lm_head.weight"]
 shards = sorted(set(wm[k] for k in need))
-open("shards_needed.txt","w").write("\n".join(shards))
+open("shards_needed.txt","w").write("".join(s + "\n" for s in shards))
 json.dump({"metadata": idx.get("metadata", {}),
            "weight_map": {k: v for k, v in wm.items() if v in shards}},
           open("model.safetensors.index.json","w"))
 print("shards needed:", shards)
 PY
-while read -r sh; do [ -f "$sh" ] || { echo "downloading $sh"; curl -sL -o "$sh" "$HF/$sh"; }; done < shards_needed.txt
+while read -r sh || [ -n "$sh" ]; do [ -z "$sh" ] && continue; [ -f "$sh" ] || { echo "downloading $sh"; curl -sL -o "$sh" "$HF/$sh"; }; done < shards_needed.txt
 
 echo "=== 4. export mtp.cbk + upload to S3 (persist the asset) ==="
 cd $REPO

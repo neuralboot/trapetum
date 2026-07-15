@@ -26,7 +26,7 @@ wm = idx["weight_map"]
 need_keys = [k for k in wm if ".layers.61." in k] + ["model.embed_tokens.weight", "lm_head.weight"]
 shards = sorted(set(wm[k] for k in need_keys))
 print("shards needed:", shards)
-open("shards_needed.txt", "w").write("\n".join(shards))
+open("shards_needed.txt", "w").write("".join(s + "\n" for s in shards))
 # filtered index: keep ONLY entries living in the shards we download (LazySafetensors
 # indexes every listed shard, so absent shards must not be referenced).
 wm2 = {k: v for k, v in wm.items() if v in shards}
@@ -34,7 +34,8 @@ json.dump({"metadata": idx.get("metadata", {}), "weight_map": wm2},
           open("model.safetensors.index.json", "w"))
 print("filtered index:", len(wm2), "tensors")
 PY
-while read -r sh; do
+while read -r sh || [ -n "$sh" ]; do
+  [ -z "$sh" ] && continue
   if [ ! -f "$sh" ]; then echo "downloading $sh"; curl -sL -o "$sh" "$HF/$sh"; fi
 done < shards_needed.txt
 ls -la $SNAP/*.safetensors | head
