@@ -55,6 +55,7 @@ const KERNELS: &[&str] = &[
     "gemv4_partial", "gemv_reduce",
     "gemv8", "gemv8_partial",
     "mla_absorb",
+    "rmsnorm_f32_k", "mla_kv_prep_k", "mla_q_prep_k",
 ];
 
 struct Ctx {
@@ -425,6 +426,52 @@ pub unsafe fn op_residual_add(h_half: *mut c_void, delta_f32: *const c_void, n: 
         &n.to_ne_bytes(),
         n as usize,
     );
+}
+
+pub unsafe fn op_rmsnorm_f32(x_f32: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32) {
+    let c = ctx();
+    let cb = cur_cb();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.pl["rmsnorm_f32_k"]);
+    enc.set_buffer(0, Some(bufref(x_f32)), 0);
+    enc.set_buffer(1, Some(bufref(w_f32)), 0);
+    enc.set_buffer(2, Some(bufref(out_half)), 0);
+    #[repr(C)]
+    struct P { n: i32, eps: f32 }
+    let p = P { n, eps };
+    enc.set_bytes(3, 8, &p as *const P as *const c_void);
+    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+    enc.end_encoding();
+}
+
+pub unsafe fn op_mla_kv_prep(kvf_f32: *const c_void, w_f32: *const c_void, inv_freq_f32: *const c_void,
+                             ckv_half: *mut c_void, kr_half: *mut c_void, dc: i32, dr: i32, pos: i32, eps: f32) {
+    let c = ctx();
+    let cb = cur_cb();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.pl["mla_kv_prep_k"]);
+    enc.set_buffer(0, Some(bufref(kvf_f32)), 0);
+    enc.set_buffer(1, Some(bufref(w_f32)), 0);
+    enc.set_buffer(2, Some(bufref(inv_freq_f32)), 0);
+    enc.set_buffer(3, Some(bufref(ckv_half)), 0);
+    enc.set_buffer(4, Some(bufref(kr_half)), 0);
+    #[repr(C)]
+    struct P { dc: i32, dr: i32, pos: i32, eps: f32 }
+    let p = P { dc, dr, pos, eps };
+    enc.set_bytes(5, 16, &p as *const P as *const c_void);
+    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+    enc.end_encoding();
+}
+
+pub unsafe fn op_mla_q_prep(qf_f32: *const c_void, inv_freq_f32: *const c_void,
+                            qnope_half: *mut c_void, qr_half: *mut c_void,
+                            nh: i32, nope: i32, dr: i32, pos: i32) {
+    #[repr(C)]
+    struct P { nh: i32, nope: i32, dr: i32, pos: i32 }
+    let p = P { nh, nope, dr, pos };
+    let total = (nh*nope + nh*(dr/2)) as usize;
+    let bytes = std::slice::from_raw_parts(&p as *const P as *const u8, 16);
+    dispatch1d("mla_q_prep_k", &[bufref(qf_f32), bufref(inv_freq_f32), bufref(qnope_half), bufref(qr_half)], bytes, total);
 }
 
 pub unsafe fn op_rope(x_half: *mut c_void, pos: i32, n_heads: i32, head_dim: i32, inv_freq: *const c_void) {

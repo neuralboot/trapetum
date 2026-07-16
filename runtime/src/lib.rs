@@ -68,6 +68,11 @@ pub fn op_gelu_mul(gate_f32: *const c_void, up_f32: *const c_void, out_half: *mu
                 pub fn op_gemv_fp16(w_half: *const c_void, x_half: *const c_void, y_f32: *mut c_void, ic: i32, oc: i32);
         pub fn op_mla_attn(q_half: *const c_void, qr_half: *const c_void, ckv_half: *const c_void, kr_half: *const c_void, out_half: *mut c_void, n_heads: i32, d_c: i32, d_rope: i32, seqlen: i32, scale: f32);
         pub fn op_mla_absorb(x_half: *const c_void, w_half: *const c_void, out_half: *mut c_void, nh: i32, in_dim: i32, out_dim: i32, s: i32, dc: i32, roff: i32, co: i32, ci: i32);
+        // MLA device prep (H-inc4): fused norm/rope/split kernels that keep the whole
+        // attention step on-device (no per-layer host round-trips).
+        pub fn op_rmsnorm_f32(x_f32: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32);
+        pub fn op_mla_kv_prep(kvf_f32: *const c_void, w_f32: *const c_void, inv_freq_f32: *const c_void, ckv_half: *mut c_void, kr_half: *mut c_void, dc: i32, dr: i32, pos: i32, eps: f32);
+        pub fn op_mla_q_prep(qf_f32: *const c_void, inv_freq_f32: *const c_void, qnope_half: *mut c_void, qr_half: *mut c_void, nh: i32, nope: i32, dr: i32, pos: i32);
         pub fn op_attn_m(
             q_half: *const c_void,
             ck_half: *const c_void,
@@ -3037,9 +3042,11 @@ pub struct MlaAttn {
     kv_a: DenseLinear,
     o_proj: Option<DenseLinear>,
     kv_a_norm: Vec<f32>,          // [d_c]
+    kv_a_norm_dev: DevF32,        // resident copy for the device kv-prep kernel (H-inc4)
     kv_b: Vec<f32>,               // [n_heads*(nope+v_head_dim)][d_c]  (W_UK ++ W_UV per head)
     kv_b_dev: DevHalf,            // resident fp16 copy of kv_b for the device `mla_absorb` GEMV (H)
     inv_freq: Vec<f32>,           // [d_rope/2]
+    inv_freq_dev: DevF32,         // resident copy for the device rope kernels (H-inc4)
     cache_ckv: DevHalf,           // [max_seq][d_c]
     cache_kr: DevHalf,            // [max_seq][d_rope]
     n_heads: usize, d_c: usize, d_rope: usize, nope: usize, v_head_dim: usize, hidden: usize,
@@ -3059,9 +3066,10 @@ pub struct MlaAttn {
 struct QLoraQ {
     q_a: DenseLinear,       // hidden -> q_lora_rank
     q_a_norm: Vec<f32>,     // [q_lora_rank], host RMSNorm weight
+    q_a_norm_dev: DevF32,   // resident copy for the device f32-in RMSNorm (H-inc4)
     q_b: QuantLinear,       // q_lora_rank -> qdim
     qa_dev: DevF32,         // [q_lora_rank] scratch (q_a output)
-    qa_normed: DevHalf,     // [q_lora_rank] scratch (normed, re-uploaded for q_b)
+    qa_normed: DevHalf,     // [q_lora_rank] scratch (normed on device, feeds q_b)
 }
 
 /// DeepSeek-V2 decoupled RoPE, INTERLEAVED convention: rotate each adjacent pair (2d, 2d+1)
@@ -3110,6 +3118,19 @@ fn mla_overlap() -> bool {
     *E.get_or_init(|| std::env::var("TRAPETUM_MLA_OVERLAP").map(|v| v == "1").unwrap_or(false))
 }
 
+/// `TRAPETUM_MLA_HOSTPREP=1`: fall back to the HOST norm/rope prep (the A/B lever for H-inc4).
+/// Default = DEVICE prep: the q_a RMSNorm, the ckv RMSNorm, both interleaved ropes and the qnope
+/// extract run as fused device kernels (`op_rmsnorm_f32` / `op_mla_kv_prep` / `op_mla_q_prep`),
+/// eliminating every per-layer host round-trip of `MlaAttn::forward` (3-4 stream drains + one
+/// thread-pool dispatch per layer -- ~half the 671B token budget in the July box logs). Host prep
+/// is forced when `TRAPETUM_MLA_HOST=1`, since that path consumes q/kv on the host anyway.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn mla_hostprep() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("TRAPETUM_MLA_HOSTPREP").map(|v| v == "1").unwrap_or(false))
+}
+
 /// Raw `*mut f32` wrapped Send+Sync so a `parallel_for` closure can write DISJOINT regions (one per
 /// head) without a borrow. Sound only because each parallel index writes a non-overlapping slice.
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -3129,8 +3150,9 @@ impl MlaAttn {
             q_proj: Some(DenseLinear::new(q_w, hidden, qdim)),
             kv_a: DenseLinear::new(kv_a_w, hidden, d_c + d_rope),
             o_proj: Some(DenseLinear::new(o_w, n_heads*v_head_dim, hidden)),
-            kv_a_norm: kv_a_norm.to_vec(), kv_b: kv_b.to_vec(),
+            kv_a_norm: kv_a_norm.to_vec(), kv_a_norm_dev: DevF32::from_host(kv_a_norm), kv_b: kv_b.to_vec(),
             kv_b_dev: DevHalf::from_host(kv_b), inv_freq: inv_freq.to_vec(),
+            inv_freq_dev: DevF32::from_host(inv_freq),
             cache_ckv: DevHalf::zeros(max_seq*d_c), cache_kr: DevHalf::zeros(max_seq*d_rope),
             n_heads, d_c, d_rope, nope, v_head_dim, hidden, eps, softmax_scale,
             qnope_dev: DevHalf::zeros(n_heads*nope),
@@ -3157,8 +3179,9 @@ impl MlaAttn {
             q_proj: None,
             kv_a: DenseLinear::new(kv_a_w, hidden, d_c + d_rope),
             o_proj: None,
-            kv_a_norm: kv_a_norm.to_vec(), kv_b: kv_b.to_vec(),
+            kv_a_norm: kv_a_norm.to_vec(), kv_a_norm_dev: DevF32::from_host(kv_a_norm), kv_b: kv_b.to_vec(),
             kv_b_dev: DevHalf::from_host(kv_b), inv_freq: inv_freq.to_vec(),
+            inv_freq_dev: DevF32::from_host(inv_freq),
             cache_ckv: DevHalf::zeros(max_seq*d_c), cache_kr: DevHalf::zeros(max_seq*d_rope),
             n_heads, d_c, d_rope, nope, v_head_dim, hidden, eps, softmax_scale,
             qnope_dev: DevHalf::zeros(n_heads*nope),
@@ -3171,6 +3194,7 @@ impl MlaAttn {
             q_lora: Some(QLoraQ {
                 q_a: DenseLinear::new(q_a_w, hidden, q_lora_rank),
                 q_a_norm: q_a_norm.to_vec(),
+                q_a_norm_dev: DevF32::from_host(q_a_norm),
                 q_b: QuantLinear::new(q_b.0, q_b.1, q_lora_rank, qdim),
                 qa_dev: DevF32::zeros(q_lora_rank),
                 qa_normed: DevHalf::zeros(q_lora_rank),
@@ -3186,6 +3210,45 @@ impl MlaAttn {
     /// `h_normed` = RMSNorm(h). Returns the attention output (hidden,), to be residual-added.
     pub fn forward(&mut self, h_normed: &DevHalf, pos: usize) -> &DevF32 {
         let (nh, dc, dr, nope, vhd) = (self.n_heads, self.d_c, self.d_rope, self.nope, self.v_head_dim);
+        if !mla_host() && !mla_hostprep() {
+            // H-inc4: the WHOLE attention step stays on-device -- zero host round-trips.
+            // Same math as the host path below (fused norm/rope/split kernels), so the two
+            // are A/B-comparable via TRAPETUM_MLA_HOSTPREP=1.
+            if let Some(ql) = self.q_lora.as_mut() {
+                ql.q_a.forward_into(h_normed, &mut ql.qa_dev);
+                unsafe { op_rmsnorm_f32(ql.qa_dev.ptr, ql.q_a_norm_dev.ptr, ql.qa_normed.ptr,
+                                        ql.qa_dev.n as i32, self.eps) };
+                ql.q_b.forward_into(&ql.qa_normed, &mut self.qf);
+            } else {
+                self.q_proj.as_ref().unwrap().forward_into(h_normed, &mut self.qf);
+            }
+            self.kv_a.forward_into(h_normed, &mut self.kvf);
+            unsafe {
+                op_mla_q_prep(self.qf.ptr, self.inv_freq_dev.ptr, self.qnope_dev.ptr, self.qr_dev.ptr,
+                              nh as i32, nope as i32, dr as i32, pos as i32);
+                op_mla_kv_prep(self.kvf.ptr, self.kv_a_norm_dev.ptr, self.inv_freq_dev.ptr,
+                               self.ckv_h.ptr, self.kr_h.ptr, dc as i32, dr as i32, pos as i32, self.eps);
+            }
+            mla_absorb(&self.qnope_dev, &self.kv_b_dev, &mut self.aq_dev,
+                       nh, nope, dc, nope+vhd, dc, 0, 1, dc);
+            unsafe {
+                op_cache_append(self.cache_ckv.ptr, self.ckv_h.ptr, pos as i32, dc as i32);
+                op_cache_append(self.cache_kr.ptr, self.kr_h.ptr, pos as i32, dr as i32);
+            }
+            mla_attention(&self.aq_dev, &self.qr_dev, &self.cache_ckv, &self.cache_kr,
+                          &mut self.outl_dev, nh, dc, dr, pos+1, self.softmax_scale);
+            mla_absorb(&self.outl_dev, &self.kv_b_dev, &mut self.attn_dev,
+                       nh, dc, vhd, nope+vhd, dc, nope, dc, 1);
+            if !mla_overlap() {
+                self.last_attn.copy_from_slice(&self.attn_dev.to_host());
+            }
+            if let Some(oq) = self.o_quant.as_ref() {
+                oq.forward_into(&self.attn_dev, &mut self.o_out);
+            } else {
+                self.o_proj.as_ref().unwrap().forward_into(&self.attn_dev, &mut self.o_out);
+            }
+            return &self.o_out;
+        }
         if let Some(ql) = self.q_lora.as_mut() {
             // q_lora path: h -> q_a (dense) -> host RMSNorm -> re-upload -> q_b (4-bit) -> self.qf
             ql.q_a.forward_into(h_normed, &mut ql.qa_dev);

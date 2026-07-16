@@ -785,3 +785,82 @@ kernel void argmax_stage2(
     }
     if (tid == 0) out[0] = sidx[0];
 }
+
+// ---- MLA device prep (kills the per-layer host round-trips of MlaAttn::forward) ----
+struct MlaKvParams { int dc; int dr; int pos; float eps; };
+struct MlaQParams  { int nh; int nope; int dr; int pos; };
+
+// f32-input RMSNorm (q_a latent normalization straight off the DevF32 GEMV output).
+kernel void rmsnorm_f32_k(
+    device const float* x  [[buffer(0)]],
+    device const float* w  [[buffer(1)]],
+    device half* out       [[buffer(2)]],
+    constant RmsParams& p  [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float red[256];
+    float ss = 0;
+    for (int i = tid; i < p.n; i += 256) { float v = x[i]; ss += v*v; }
+    red[tid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 128; s > 0; s >>= 1) {
+        if ((int)tid < s) red[tid] += red[tid+s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float scale = rsqrt(red[0]/p.n + p.eps);
+    for (int i = tid; i < p.n; i += 256) out[i] = (half)(x[i] * scale * w[i]);
+}
+
+// kv prep: RMSNorm first dc of kvf -> ckv, interleaved-rope the dr tail -> kr. One dispatch.
+kernel void mla_kv_prep_k(
+    device const float* kvf      [[buffer(0)]],
+    device const float* w        [[buffer(1)]],
+    device const float* inv_freq [[buffer(2)]],
+    device half* ckv             [[buffer(3)]],
+    device half* kr              [[buffer(4)]],
+    constant MlaKvParams& p      [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float red[256];
+    float ss = 0;
+    for (int i = tid; i < p.dc; i += 256) { float v = kvf[i]; ss += v*v; }
+    red[tid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 128; s > 0; s >>= 1) {
+        if ((int)tid < s) red[tid] += red[tid+s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float scale = rsqrt(red[0]/p.dc + p.eps);
+    for (int i = tid; i < p.dc; i += 256) ckv[i] = (half)(kvf[i] * scale * w[i]);
+    for (int d = tid; d < p.dr/2; d += 256) {
+        float ang = (float)p.pos * inv_freq[d];
+        float c = cos(ang), s = sin(ang);
+        float x0 = kvf[p.dc + 2*d], x1 = kvf[p.dc + 2*d + 1];
+        kr[2*d]   = (half)(x0*c - x1*s);
+        kr[2*d+1] = (half)(x1*c + x0*s);
+    }
+}
+
+// q prep: split qf into qnope (first nope per head) + interleaved-roped qr (dr tail per head).
+kernel void mla_q_prep_k(
+    device const float* qf       [[buffer(0)]],
+    device const float* inv_freq [[buffer(1)]],
+    device half* qnope           [[buffer(2)]],
+    device half* qr              [[buffer(3)]],
+    constant MlaQParams& p       [[buffer(4)]],
+    uint t [[thread_position_in_grid]])
+{
+    int hd = p.nope + p.dr;
+    int total_n = p.nh*p.nope, total_r = p.nh*(p.dr/2);
+    if ((int)t < total_n) {
+        int h = t / p.nope, i = t % p.nope;
+        qnope[t] = (half)(qf[h*hd + i]);
+    } else if ((int)t < total_n + total_r) {
+        int u = t - total_n; int h = u / (p.dr/2), d = u % (p.dr/2);
+        float ang = (float)p.pos * inv_freq[d];
+        float c = cos(ang), s = sin(ang);
+        float x0 = qf[h*hd + p.nope + 2*d], x1 = qf[h*hd + p.nope + 2*d + 1];
+        qr[h*p.dr + 2*d]   = (half)(x0*c - x1*s);
+        qr[h*p.dr + 2*d+1] = (half)(x1*c + x0*s);
+    }
+}

@@ -841,6 +841,79 @@ void op_attn(const void* q_half, const void* ck_half, const void* cv_half, void*
         (const __half*)cv_half, (__half*)out_half, n_heads, n_kv, head_dim, seqlen, softcap);
 }
 
+// --- MLA device prep (kills the per-layer host round-trips of MlaAttn::forward) ---
+// f32-input RMSNorm (the q_a latent lives in a DevF32 GEMV output; no host round-trip).
+__global__ void rmsnorm_f32_k(const float* __restrict__ x, const float* __restrict__ w,
+                              __half* __restrict__ out, int n, float eps) {
+    __shared__ float red[256];
+    int tid = threadIdx.x;
+    float ss = 0;
+    for (int i = tid; i < n; i += 256) { float v = x[i]; ss += v*v; }
+    red[tid] = ss; __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid+s]; __syncthreads(); }
+    float scale = rsqrtf(red[0]/n + eps);
+    for (int i = tid; i < n; i += 256) out[i] = __float2half(x[i] * scale * w[i]);
+}
+// kv prep: RMSNorm the first dc of kvf (f32) -> ckv (half), and interleaved-rope the dr
+// tail -> kr (half). One launch replaces two host norms + a host rope + two uploads.
+__global__ void mla_kv_prep_k(const float* __restrict__ kvf, const float* __restrict__ w,
+                              const float* __restrict__ inv_freq, __half* __restrict__ ckv,
+                              __half* __restrict__ kr, int dc, int dr, int pos, float eps) {
+    __shared__ float red[256];
+    int tid = threadIdx.x;
+    float ss = 0;
+    for (int i = tid; i < dc; i += 256) { float v = kvf[i]; ss += v*v; }
+    red[tid] = ss; __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid+s]; __syncthreads(); }
+    float scale = rsqrtf(red[0]/dc + eps);
+    for (int i = tid; i < dc; i += 256) ckv[i] = __float2half(kvf[i] * scale * w[i]);
+    for (int d = tid; d < dr/2; d += 256) {
+        float ang = (float)pos * inv_freq[d];
+        float c = cosf(ang), s = sinf(ang);
+        float x0 = kvf[dc + 2*d], x1 = kvf[dc + 2*d + 1];
+        kr[2*d]   = __float2half(x0*c - x1*s);
+        kr[2*d+1] = __float2half(x1*c + x0*s);
+    }
+}
+// q prep: split qf (f32, nh*(nope+dr)) into qnope (half, per-head first nope) and the
+// interleaved-roped qr (half, per-head dr tail). One launch replaces a host per-head
+// rope (thread-pool dispatch) + an extract loop + two uploads.
+__global__ void mla_q_prep_k(const float* __restrict__ qf, const float* __restrict__ inv_freq,
+                             __half* __restrict__ qnope, __half* __restrict__ qr,
+                             int nh, int nope, int dr, int pos) {
+    int hd = nope + dr;
+    int t = blockIdx.x*blockDim.x + threadIdx.x;
+    int total_n = nh*nope, total_r = nh*(dr/2);
+    if (t < total_n) {
+        int h = t / nope, i = t % nope;
+        qnope[t] = __float2half(qf[h*hd + i]);
+    } else if (t < total_n + total_r) {
+        int u = t - total_n; int h = u / (dr/2), d = u % (dr/2);
+        float ang = (float)pos * inv_freq[d];
+        float c = cosf(ang), s = sinf(ang);
+        float x0 = qf[h*hd + nope + 2*d], x1 = qf[h*hd + nope + 2*d + 1];
+        qr[h*dr + 2*d]   = __float2half(x0*c - x1*s);
+        qr[h*dr + 2*d+1] = __float2half(x1*c + x0*s);
+    }
+}
+void op_rmsnorm_f32(const void* x_f32, const void* w_f32, void* out_half, int n, float eps) {
+    ensure_stream();
+    rmsnorm_f32_k<<<1, 256, 0, g_stream>>>((const float*)x_f32, (const float*)w_f32, (__half*)out_half, n, eps);
+}
+void op_mla_kv_prep(const void* kvf_f32, const void* w_f32, const void* inv_freq_f32,
+                    void* ckv_half, void* kr_half, int dc, int dr, int pos, float eps) {
+    ensure_stream();
+    mla_kv_prep_k<<<1, 256, 0, g_stream>>>((const float*)kvf_f32, (const float*)w_f32,
+        (const float*)inv_freq_f32, (__half*)ckv_half, (__half*)kr_half, dc, dr, pos, eps);
+}
+void op_mla_q_prep(const void* qf_f32, const void* inv_freq_f32, void* qnope_half, void* qr_half,
+                   int nh, int nope, int dr, int pos) {
+    ensure_stream();
+    int total = nh*nope + nh*(dr/2);
+    mla_q_prep_k<<<(total+255)/256, 256, 0, g_stream>>>((const float*)qf_f32,
+        (const float*)inv_freq_f32, (__half*)qnope_half, (__half*)qr_half, nh, nope, dr, pos);
+}
+
 // --- batched (M-token) ops for speculative decoding -------------------------------
 void qlinear_forward_m(void* handle, const void* d_x, void* d_y, int M) {
     QLinear* q = (QLinear*)handle;
