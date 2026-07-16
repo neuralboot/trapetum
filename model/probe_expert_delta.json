@@ -1,0 +1,84 @@
+{
+  "layers": {
+    "10": {
+      "gate_proj": {
+        "shape": [
+          2048,
+          7168
+        ],
+        "r95_delta_median": 1564,
+        "r99_delta_median": 1908,
+        "r95_W_median": 1560,
+        "rank_ratio": 1.0025641025641026,
+        "deltaF_over_WF_median": 0.9911206066608429,
+        "delta_bytes_ratio_at_r95": 0.9818638392857143
+      },
+      "up_proj": {
+        "shape": [
+          2048,
+          7168
+        ],
+        "r95_delta_median": 1576,
+        "r99_delta_median": 1910,
+        "r95_W_median": 1570,
+        "rank_ratio": 1.0038216560509554,
+        "deltaF_over_WF_median": 0.9920769035816193,
+        "delta_bytes_ratio_at_r95": 0.9893973214285714
+      },
+      "down_proj": {
+        "shape": [
+          7168,
+          2048
+        ],
+        "r95_delta_median": 1637,
+        "r99_delta_median": 1934,
+        "r95_W_median": 1627,
+        "rank_ratio": 1.0061462814996927,
+        "deltaF_over_WF_median": 0.99204221367836,
+        "delta_bytes_ratio_at_r95": 1.0276925223214286
+      }
+    },
+    "45": {
+      "gate_proj": {
+        "shape": [
+          2048,
+          7168
+        ],
+        "r95_delta_median": 1697,
+        "r99_delta_median": 1956,
+        "r95_W_median": 1691,
+        "rank_ratio": 1.0035481963335304,
+        "deltaF_over_WF_median": 0.9896567463874817,
+        "delta_bytes_ratio_at_r95": 1.0653599330357142
+      },
+      "up_proj": {
+        "shape": [
+          2048,
+          7168
+        ],
+        "r95_delta_median": 1698,
+        "r99_delta_median": 1955,
+        "r95_W_median": 1694,
+        "rank_ratio": 1.0023612750885478,
+        "deltaF_over_WF_median": 0.9922584295272827,
+        "delta_bytes_ratio_at_r95": 1.0659877232142858
+      },
+      "down_proj": {
+        "shape": [
+          7168,
+          2048
+        ],
+        "r95_delta_median": 1690,
+        "r99_delta_median": 1953,
+        "r95_W_median": 1690,
+        "rank_ratio": 1.0,
+        "deltaF_over_WF_median": 0.9922031164169312,
+        "delta_bytes_ratio_at_r95": 1.0609654017857142
+      }
+    }
+  },
+  "config": {
+    "n_base": 64,
+    "n_analyze": 32
+  }
+}
