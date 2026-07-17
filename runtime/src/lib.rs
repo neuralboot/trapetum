@@ -3118,17 +3118,20 @@ fn mla_overlap() -> bool {
     *E.get_or_init(|| std::env::var("TRAPETUM_MLA_OVERLAP").map(|v| v == "1").unwrap_or(false))
 }
 
-/// `TRAPETUM_MLA_HOSTPREP=1`: fall back to the HOST norm/rope prep (the A/B lever for H-inc4).
-/// Default = DEVICE prep: the q_a RMSNorm, the ckv RMSNorm, both interleaved ropes and the qnope
-/// extract run as fused device kernels (`op_rmsnorm_f32` / `op_mla_kv_prep` / `op_mla_q_prep`),
-/// eliminating every per-layer host round-trip of `MlaAttn::forward` (3-4 stream drains + one
-/// thread-pool dispatch per layer -- ~half the 671B token budget in the July box logs). Host prep
-/// is forced when `TRAPETUM_MLA_HOST=1`, since that path consumes q/kv on the host anyway.
+/// `TRAPETUM_MLA_DEVPREP=1`: run the norm/rope prep as fused DEVICE kernels (`op_rmsnorm_f32` /
+/// `op_mla_kv_prep` / `op_mla_q_prep`), eliminating every per-layer host round-trip of
+/// `MlaAttn::forward`. Measured on the 671B box (g6e/L40S): attention 174 -> 143 ms/token,
+/// total 415 -> 380 (+9.5% tok/s). OPT-IN for now: on the 671B the device prep flips near-tie
+/// greedy argmaxes from the 2nd generated token (selftests are bit-exact on both backends, so
+/// the kernels compute the intended math -- the divergence is fp accumulation-order noise at
+/// 61-layer scale), and the published numbers were produced by the host path. Flip the default
+/// once logit-margin analysis (TRAPETUM_LOGIT_DEBUG=1) classifies the flips as near-ties.
+/// Host prep is forced when `TRAPETUM_MLA_HOST=1` (that path consumes q/kv on the host anyway).
 #[cfg(any(feature = "cuda", feature = "metal"))]
 fn mla_hostprep() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("TRAPETUM_MLA_HOSTPREP").map(|v| v == "1").unwrap_or(false))
+    *E.get_or_init(|| !std::env::var("TRAPETUM_MLA_DEVPREP").map(|v| v == "1").unwrap_or(false))
 }
 
 /// Raw `*mut f32` wrapped Send+Sync so a `parallel_for` closure can write DISJOINT regions (one per
