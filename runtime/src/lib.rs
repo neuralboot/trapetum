@@ -3210,6 +3210,38 @@ impl MlaAttn {
         mla_rope_interleaved(v, pos, &self.inv_freq);
     }
 
+    /// Per-op timing of the DEVICE-PREP attention step: each stage is followed by a full
+    /// `dev_sync()` and wall-timed, so the vector tells you which op eats the layer budget
+    /// (kernel time + its launch overhead; the sum exceeds the async pipelined `forward`).
+    /// Order: [q_a, qa_norm, q_b, kv_a, q_prep, kv_prep, absorb_qk, cache_x2, attention,
+    /// absorb_v, o_proj]. Used by `bin/mla_prof` at the exact R1 dims -- profiling only.
+    pub fn forward_profiled_us(&mut self, h_normed: &DevHalf, pos: usize) -> Vec<(&'static str, u64)> {
+        let (nh, dc, dr, nope, vhd) = (self.n_heads, self.d_c, self.d_rope, self.nope, self.v_head_dim);
+        let mut out: Vec<(&'static str, u64)> = Vec::with_capacity(11);
+        macro_rules! stage { ($name:expr, $body:expr) => {{
+            let t = std::time::Instant::now();
+            $body;
+            unsafe { dev_sync(); }
+            out.push(($name, t.elapsed().as_micros() as u64));
+        }}; }
+        let ql = self.q_lora.as_mut().expect("forward_profiled_us needs the q_lora path");
+        stage!("q_a", ql.q_a.forward_into(h_normed, &mut ql.qa_dev));
+        stage!("qa_norm", unsafe { op_rmsnorm_f32(ql.qa_dev.ptr, ql.q_a_norm_dev.ptr, ql.qa_normed.ptr, ql.qa_dev.n as i32, self.eps) });
+        stage!("q_b", ql.q_b.forward_into(&ql.qa_normed, &mut self.qf));
+        stage!("kv_a", self.kv_a.forward_into(h_normed, &mut self.kvf));
+        stage!("q_prep", unsafe { op_mla_q_prep(self.qf.ptr, self.inv_freq_dev.ptr, self.qnope_dev.ptr, self.qr_dev.ptr, nh as i32, nope as i32, dr as i32, pos as i32) });
+        stage!("kv_prep", unsafe { op_mla_kv_prep(self.kvf.ptr, self.kv_a_norm_dev.ptr, self.inv_freq_dev.ptr, self.ckv_h.ptr, self.kr_h.ptr, dc as i32, dr as i32, pos as i32, self.eps) });
+        stage!("absorb_qk", mla_absorb(&self.qnope_dev, &self.kv_b_dev, &mut self.aq_dev, nh, nope, dc, nope+vhd, dc, 0, 1, dc));
+        stage!("cache_x2", unsafe {
+            op_cache_append(self.cache_ckv.ptr, self.ckv_h.ptr, pos as i32, dc as i32);
+            op_cache_append(self.cache_kr.ptr, self.kr_h.ptr, pos as i32, dr as i32);
+        });
+        stage!("attention", mla_attention(&self.aq_dev, &self.qr_dev, &self.cache_ckv, &self.cache_kr, &mut self.outl_dev, nh, dc, dr, pos+1, self.softmax_scale));
+        stage!("absorb_v", mla_absorb(&self.outl_dev, &self.kv_b_dev, &mut self.attn_dev, nh, dc, vhd, nope+vhd, dc, nope, dc, 1));
+        stage!("o_proj", self.o_quant.as_ref().expect("q_lora path has o_quant").forward_into(&self.attn_dev, &mut self.o_out));
+        out
+    }
+
     /// `h_normed` = RMSNorm(h). Returns the attention output (hidden,), to be residual-added.
     pub fn forward(&mut self, h_normed: &DevHalf, pos: usize) -> &DevF32 {
         let (nh, dc, dr, nope, vhd) = (self.n_heads, self.d_c, self.d_rope, self.nope, self.v_head_dim);
