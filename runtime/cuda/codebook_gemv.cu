@@ -487,6 +487,35 @@ __global__ void gemv_fp16_k(const __half* __restrict__ W, const __half* __restri
     Y[o] = acc;
 }
 
+// Warp-per-row fp16 GEMV (H-inc5). The thread-per-row kernel above is catastrophic for the
+// skinny hidden-dim projections (q_a: oc=1536 -> 6 blocks on a 128-SM part, uncoalesced
+// 22KB-strided reads, scalar loop): measured 768 us for a 22 MB read whose byte bound is
+// ~25 us. Here each WARP owns one output row: lanes read consecutive float4s (8 halves,
+// fully coalesced), then a shuffle reduction. Requires ic % 8 == 0 (all model dims are);
+// the wrapper falls back to the scalar kernel otherwise.
+__global__ void gemv_fp16_warp_k(const __half* __restrict__ W, const __half* __restrict__ X, float* __restrict__ Y, int ic, int oc) {
+    int warp = (blockIdx.x*blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (warp >= oc) return;
+    const float4* row4 = (const float4*)(W + (size_t)warp*ic);
+    const float4* x4 = (const float4*)X;
+    int n8 = ic >> 3;                                   // 8 halves per float4
+    float acc = 0.f;
+    for (int i = lane; i < n8; i += 32) {
+        float4 wv = row4[i], xv = x4[i];
+        const __half2* wh = (const __half2*)&wv;
+        const __half2* xh = (const __half2*)&xv;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float2 wf = __half22float2(wh[j]), xf = __half22float2(xh[j]);
+            acc += wf.x*xf.x + wf.y*xf.y;
+        }
+    }
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, s);
+    if (lane == 0) Y[warp] = acc;
+}
+
 // Batched per-head MLA absorption (deliverable H). out[h][o] = sum_i x[h][i]*W[(h*S+roff)*dc + o*co + i*ci].
 __global__ void mla_absorb_k(const __half* __restrict__ x, const __half* __restrict__ W, __half* __restrict__ out,
                              int nh, int in_dim, int out_dim, int S, int dc, int roff, int co, int ci) {
@@ -969,7 +998,12 @@ void op_saxpy(void* acc_f32, const void* y_f32, float alpha, int n) {
 
 void op_gemv_fp16(const void* w_half, const void* x_half, void* y_f32, int ic, int oc) {
     ensure_stream();
-    gemv_fp16_k<<<(oc+255)/256, 256, 0, g_stream>>>((const __half*)w_half, (const __half*)x_half, (float*)y_f32, ic, oc);
+    if (ic % 8 == 0) {
+        // warp-per-row, coalesced float4 loads (H-inc5); 8 warps per 256-thread block.
+        gemv_fp16_warp_k<<<(oc+7)/8, 256, 0, g_stream>>>((const __half*)w_half, (const __half*)x_half, (float*)y_f32, ic, oc);
+    } else {
+        gemv_fp16_k<<<(oc+255)/256, 256, 0, g_stream>>>((const __half*)w_half, (const __half*)x_half, (float*)y_f32, ic, oc);
+    }
 }
 
 void op_mla_absorb(const void* x_half, const void* w_half, void* out_half,
