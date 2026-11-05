@@ -74,14 +74,25 @@ fn main() {
 
     // reproduce HF greedy continuation + time it. Device argmax: the next token is
     // reduced on the GPU, so the full vocab is never copied to the host per step.
+    // TRAPETUM_GRAPH=1 replays the decode step as one captured CUDA graph per token
+    // (Model::forward_argmax_graph); the continuation check then validates that path too.
+    let use_graph = env::var("TRAPETUM_GRAPH").map(|v| v == "1").unwrap_or(false);
+    println!("decode mode                             : {}", if use_graph { "CUDA graph" } else { "eager" });
+    let step = |m: &mut Model, t: usize, p: usize| -> usize {
+        if use_graph { m.forward_argmax_graph(t, p, vocab) as usize } else { m.forward_argmax(t, p, vocab) as usize }
+    };
+    // The first step is kept out of the timer in both modes: in graph mode it is the one-time
+    // eager step + capture, which is setup, not decode.
     let mut tok = argmax(&last_logits);
     let mut got = Vec::new();
-    let t0 = Instant::now();
+    let mut t0 = Instant::now();
+    let mut timed = 0usize;
     for i in 0..cont.len() {
         got.push(tok);
-        tok = model.forward_argmax(tok, prompt.len() + i, vocab) as usize;
+        tok = step(&mut model, tok, prompt.len() + i);
+        if i == 0 { t0 = Instant::now(); } else { timed += 1; }
     }
-    let ms = t0.elapsed().as_secs_f64() * 1e3 / cont.len() as f64;
+    let ms = if timed > 0 { t0.elapsed().as_secs_f64() * 1e3 / timed as f64 } else { f64::NAN };
     let matched = got.iter().zip(&cont).take_while(|(a, b)| a == b).count();
 
     println!("greedy continuation matches HF          : {matched}/{} tokens", cont.len());
@@ -101,13 +112,13 @@ fn main() {
         let mut pos = prompt.len() + cont.len();
         let mut t = tok;
         for _ in 0..8 {
-            t = model.forward_argmax(t, pos, vocab) as usize;
+            t = step(&mut model, t, pos);
             pos += 1;
         } // warmup
         println!("READY_DECODE");
         let t0 = Instant::now();
         for _ in 0..nb {
-            t = model.forward_argmax(t, pos, vocab) as usize;
+            t = step(&mut model, t, pos);
             pos += 1;
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / nb as f64;

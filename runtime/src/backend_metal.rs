@@ -540,6 +540,39 @@ pub unsafe fn op_attn(
 // The CUDA path records the decode chain into a replayable graph. The Metal
 // equivalent (encoding the whole step into one command buffer) lands with the
 // host-layer work package; the direct per-op path above is fully functional.
+// CUDA-graph decode entry points (token/position read from device memory). The Metal backend
+// has no graph capture yet, so these exist only to keep the backend seam complete.
+pub unsafe fn op_rope_dk(_x_half: *mut c_void, _d_tp: *const c_void, _n_heads: i32, _head_dim: i32, _inv_freq: *const c_void) {
+    unimplemented!("graph decode (op_rope_dk) is CUDA-only for now")
+}
+pub unsafe fn op_cache_append_dk(_cache_half: *mut c_void, _src_half: *const c_void, _d_tp: *const c_void, _dim: i32) {
+    unimplemented!("graph decode (op_cache_append_dk) is CUDA-only for now")
+}
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn op_attn_dk(
+    _q_half: *const c_void,
+    _ck_half: *const c_void,
+    _cv_half: *const c_void,
+    _out_half: *mut c_void,
+    _n_heads: i32,
+    _n_kv: i32,
+    _head_dim: i32,
+    _d_tp: *const c_void,
+    _max_seq: i32,
+    _softcap: f32,
+) {
+    unimplemented!("graph decode (op_attn_dk) is CUDA-only for now")
+}
+pub unsafe fn dev_upload_i32(_d: *mut c_void, _x: *const i32, _n: i32) {
+    unimplemented!("graph decode (dev_upload_i32) is CUDA-only for now")
+}
+pub unsafe fn dev_argmax_enqueue(_logits: *const c_void, _n: i32) {
+    unimplemented!("graph decode (dev_argmax_enqueue) is CUDA-only for now")
+}
+pub unsafe fn dev_argmax_read() -> u32 {
+    unimplemented!("graph decode (dev_argmax_read) is CUDA-only for now")
+}
+
 pub unsafe fn graph_begin() {
     panic!("Metal backend: graph capture arrives with the host-layer work package; use the direct decode path")
 }

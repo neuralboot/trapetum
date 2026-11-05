@@ -6,8 +6,13 @@
 // a cast kernel converts it to half for the next layer. Host side speaks f32 + u8.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
+
+// Set once a CUDA graph has been captured: from then on, scratch buffers that a captured
+// graph may reference are never freed (see ypart), only superseded.
+static int g_graphs_captured = 0;
 
 #define K 16
 #define CPB 256
@@ -216,7 +221,10 @@ __global__ void resadd_k(__half* __restrict__ h, const float* __restrict__ delta
 
 // RoPE (HF Llama rotate-half): for each head and d in [0, head_dim/2), rotate the pair
 // (x[d], x[d+head_dim/2]) by angle = pos * base^(-2d/head_dim).
-__global__ void rope_k(__half* __restrict__ x, int pos, int n_heads, int head_dim, const float* __restrict__ inv_freq) {
+// Shared by rope_k (position as a kernel argument) and rope_dk (position read from device
+// memory, for the CUDA-graph decode), so both paths compute bit-identical results.
+__device__ __forceinline__ void rope_body(__half* __restrict__ x, int pos, int n_heads, int head_dim,
+                                          const float* __restrict__ inv_freq) {
     int t = blockIdx.x*blockDim.x + threadIdx.x;
     int half = head_dim/2;
     if (t >= n_heads*half) return;
@@ -228,6 +236,14 @@ __global__ void rope_k(__half* __restrict__ x, int pos, int n_heads, int head_di
     x[i] = __float2half(x0*c - x1*s);
     x[j] = __float2half(x1*c + x0*s);
 }
+__global__ void rope_k(__half* __restrict__ x, int pos, int n_heads, int head_dim, const float* __restrict__ inv_freq) {
+    rope_body(x, pos, n_heads, head_dim, inv_freq);
+}
+// d_tp[0] = token id, d_tp[1] = position (written by the host before each graph launch).
+__global__ void rope_dk(__half* __restrict__ x, const int* __restrict__ d_tp, int n_heads, int head_dim,
+                        const float* __restrict__ inv_freq) {
+    rope_body(x, d_tp[1], n_heads, head_dim, inv_freq);
+}
 
 // add a bias vector (f32) into an f32 accumulator: a[i] += b[i]
 __global__ void vadd_k(float* __restrict__ a, const float* __restrict__ b, int n) {
@@ -237,9 +253,30 @@ __global__ void vadd_k(float* __restrict__ a, const float* __restrict__ b, int n
 
 // Batch-1 decode attention. One block per query head, head_dim threads. Cache layout is
 // [t][kv_head*head_dim + d]. GQA: kv_head = h / (n_heads/n_kv); MHA: n_kv == n_heads.
+// The body is shared by attn_k (seqlen as an argument) and attn_dk (seqlen = position+1
+// read from device memory, for the CUDA-graph decode): identical arithmetic on both paths.
+__device__ __forceinline__ void attn_body(const __half* __restrict__ q, const __half* __restrict__ ck,
+                                          const __half* __restrict__ cv, __half* __restrict__ out,
+                                          int n_heads, int n_kv, int head_dim, int seqlen, float softcap);
 __global__ void attn_k(const __half* __restrict__ q, const __half* __restrict__ ck,
                        const __half* __restrict__ cv, __half* __restrict__ out,
                        int n_heads, int n_kv, int head_dim, int seqlen, float softcap) {
+    attn_body(q, ck, cv, out, n_heads, n_kv, head_dim, seqlen, softcap);
+}
+__global__ void attn_dk(const __half* __restrict__ q, const __half* __restrict__ ck,
+                        const __half* __restrict__ cv, __half* __restrict__ out,
+                        int n_heads, int n_kv, int head_dim, const int* __restrict__ d_tp, float softcap) {
+    attn_body(q, ck, cv, out, n_heads, n_kv, head_dim, d_tp[1] + 1, softcap);
+}
+// Graph-decode helper: the KV-cache append at row d_tp[1].
+__global__ void cache_append_dk(__half* __restrict__ cache, const __half* __restrict__ src,
+                                const int* __restrict__ d_tp, int dim) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < dim) cache[(size_t)d_tp[1]*dim + i] = src[i];
+}
+__device__ __forceinline__ void attn_body(const __half* __restrict__ q, const __half* __restrict__ ck,
+                                          const __half* __restrict__ cv, __half* __restrict__ out,
+                                          int n_heads, int n_kv, int head_dim, int seqlen, float softcap) {
     int h = blockIdx.x;
     int kvh = h / (n_heads / n_kv);
     int d = threadIdx.x;                 // blockDim.x == head_dim
@@ -698,8 +735,15 @@ static float* g_ypart = nullptr;
 static size_t g_ypart_cap = 0; // floats
 static float* ypart(size_t need_floats) {
     if (need_floats > g_ypart_cap) {
-        if (g_ypart) cudaFree(g_ypart);
-        cudaMalloc(&g_ypart, need_floats * sizeof(float));
+        // A captured graph keeps the old pointer in its kernel nodes: never free it once a
+        // graph exists (the superseded buffer is simply retired, a bounded one-off cost).
+        if (g_ypart && !g_graphs_captured) cudaFree(g_ypart);
+        g_ypart = nullptr;
+        cudaError_t e = cudaMalloc(&g_ypart, need_floats * sizeof(float));
+        if (e != cudaSuccess) {
+            fprintf(stderr, "trapetum: cudaMalloc(ypart, %zu floats) failed: %s\n", need_floats, cudaGetErrorString(e));
+            abort();
+        }
         g_ypart_cap = need_floats;
     }
     return g_ypart;
@@ -797,8 +841,17 @@ void avq_free(void* handle) {
 }
 
 // device buffer helpers
-void* dev_alloc_half(int n) { void* p; cudaMalloc(&p, (size_t)n*sizeof(__half)); return p; }
-void* dev_alloc_f32(int n)  { void* p; cudaMalloc(&p, (size_t)n*sizeof(float));  return p; }
+static void* dev_alloc_checked(size_t bytes, const char* what) {
+    void* p = nullptr;
+    cudaError_t e = cudaMalloc(&p, bytes);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "trapetum: cudaMalloc(%zu B, %s) failed: %s\n", bytes, what, cudaGetErrorString(e));
+        abort();
+    }
+    return p;
+}
+void* dev_alloc_half(int n) { return dev_alloc_checked((size_t)n*sizeof(__half), "half buffer"); }
+void* dev_alloc_f32(int n)  { return dev_alloc_checked((size_t)n*sizeof(float), "f32 buffer"); }
 void  dev_free(void* p)     { cudaFree(p); }
 
 // upload host f32 to a device half buffer (one-time input)
@@ -868,6 +921,34 @@ void op_attn(const void* q_half, const void* ck_half, const void* cv_half, void*
     size_t smem = ((size_t)head_dim + seqlen) * sizeof(float);
     attn_k<<<n_heads, head_dim, smem, g_stream>>>((const __half*)q_half, (const __half*)ck_half,
         (const __half*)cv_half, (__half*)out_half, n_heads, n_kv, head_dim, seqlen, softcap);
+}
+
+// --- CUDA-graph decode: the position comes from device memory (d_tp = [token, pos]), so one
+// captured graph replays every decode step. Same kernels/arithmetic as the M=1 path. (The
+// embedding row is uploaded into the residual buffer before each launch, as on the eager path.)
+void op_rope_dk(void* x_half, const void* d_tp, int n_heads, int head_dim, const void* inv_freq) {
+    ensure_stream();
+    int total = n_heads * (head_dim/2);
+    rope_dk<<<(total+127)/128, 128, 0, g_stream>>>((__half*)x_half, (const int*)d_tp, n_heads, head_dim,
+                                                   (const float*)inv_freq);
+}
+void op_cache_append_dk(void* cache_half, const void* src_half, const void* d_tp, int dim) {
+    ensure_stream();
+    cache_append_dk<<<(dim+255)/256, 256, 0, g_stream>>>((__half*)cache_half, (const __half*)src_half,
+                                                          (const int*)d_tp, dim);
+}
+// Shared memory is sized for max_seq (fixed at capture); the kernel reads seqlen = pos+1.
+void op_attn_dk(const void* q_half, const void* ck_half, const void* cv_half, void* out_half,
+                int n_heads, int n_kv, int head_dim, const void* d_tp, int max_seq, float softcap) {
+    ensure_stream();
+    size_t smem = ((size_t)head_dim + max_seq) * sizeof(float);
+    attn_dk<<<n_heads, head_dim, smem, g_stream>>>((const __half*)q_half, (const __half*)ck_half,
+        (const __half*)cv_half, (__half*)out_half, n_heads, n_kv, head_dim, (const int*)d_tp, softcap);
+}
+// Stream-ordered upload of a few ints (pageable source: staged before the call returns).
+void dev_upload_i32(void* d, const int* x, int n) {
+    ensure_stream();
+    cudaMemcpyAsync(d, x, (size_t)n*sizeof(int), cudaMemcpyHostToDevice, g_stream);
 }
 
 // --- MLA device prep (kills the per-layer host round-trips of MlaAttn::forward) ---
@@ -1034,7 +1115,9 @@ void dev_sync() { cudaDeviceSynchronize(); }
 static float*    g_am_val = 0;
 static unsigned* g_am_idx = 0;
 static unsigned* g_am_out = 0;
-unsigned dev_argmax(const void* d_logits, int n) {
+// Enqueue-only half (graph-capturable once the scratch exists; the eager dev_argmax that
+// precedes a capture allocates it), and the read-back half (D2H + sync, never captured).
+void dev_argmax_enqueue(const void* d_logits, int n) {
     ensure_stream();
     const int tpb = 256;
     int ntg = (n + tpb - 1) / tpb;
@@ -1047,10 +1130,22 @@ unsigned dev_argmax(const void* d_logits, int n) {
     }
     argmax_stage1<<<ntg, tpb, 0, g_stream>>>((const float*)d_logits, n, g_am_val, g_am_idx);
     argmax_stage2<<<1, tpb, 0, g_stream>>>(g_am_val, g_am_idx, ntg, g_am_out);
+}
+unsigned dev_argmax_read() {
+    ensure_stream();
     unsigned h_out = 0;
     cudaMemcpyAsync(&h_out, g_am_out, sizeof(unsigned), cudaMemcpyDeviceToHost, g_stream);
-    cudaStreamSynchronize(g_stream);
+    cudaError_t e = cudaStreamSynchronize(g_stream);
+    if (e == cudaSuccess) e = cudaGetLastError();
+    if (e != cudaSuccess) {  // never hand back a stale token from a failed step
+        fprintf(stderr, "trapetum: decode step failed: %s\n", cudaGetErrorString(e));
+        abort();
+    }
     return h_out;
+}
+unsigned dev_argmax(const void* d_logits, int n) {
+    dev_argmax_enqueue(d_logits, n);
+    return dev_argmax_read();
 }
 
 // --- CUDA graph capture of the decode chain ---------------------------------------
@@ -1062,17 +1157,33 @@ void graph_begin() {
     cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeThreadLocal);
 }
 
+// Returns nullptr (the Rust side asserts) if the capture was invalidated or cannot be
+// instantiated, instead of an uninitialized handle that would replay nothing.
 void* graph_end() {
-    cudaGraph_t graph;
-    cudaStreamEndCapture(g_stream, &graph);
-    cudaGraphExec_t exec;
-    cudaGraphInstantiate(&exec, graph, 0);
+    cudaGraph_t graph = nullptr;
+    cudaError_t e = cudaStreamEndCapture(g_stream, &graph);
+    if (e != cudaSuccess || graph == nullptr) {
+        fprintf(stderr, "trapetum: cudaStreamEndCapture failed: %s\n", cudaGetErrorString(e));
+        if (graph) cudaGraphDestroy(graph);
+        return nullptr;
+    }
+    cudaGraphExec_t exec = nullptr;
+    e = cudaGraphInstantiate(&exec, graph, 0);
     cudaGraphDestroy(graph);
+    if (e != cudaSuccess || exec == nullptr) {
+        fprintf(stderr, "trapetum: cudaGraphInstantiate failed: %s\n", cudaGetErrorString(e));
+        return nullptr;
+    }
+    g_graphs_captured = 1;
     return (void*)exec;
 }
 
 void graph_launch(void* exec) {
-    cudaGraphLaunch((cudaGraphExec_t)exec, g_stream);
+    cudaError_t e = cudaGraphLaunch((cudaGraphExec_t)exec, g_stream);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "trapetum: cudaGraphLaunch failed: %s\n", cudaGetErrorString(e));
+        abort();
+    }
 }
 
 void graph_free(void* exec) {

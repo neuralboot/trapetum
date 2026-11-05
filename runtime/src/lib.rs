@@ -58,6 +58,24 @@ mod backend {
             softcap: f32,
         );
         pub fn op_resadd_h(h_half: *mut c_void, d_half: *const c_void, n: i32);
+        // CUDA-graph decode: position read from device memory d_tp = [token, pos] (i32)
+        pub fn op_rope_dk(x_half: *mut c_void, d_tp: *const c_void, n_heads: i32, head_dim: i32, inv_freq: *const c_void);
+        pub fn op_cache_append_dk(cache_half: *mut c_void, src_half: *const c_void, d_tp: *const c_void, dim: i32);
+        pub fn op_attn_dk(
+            q_half: *const c_void,
+            ck_half: *const c_void,
+            cv_half: *const c_void,
+            out_half: *mut c_void,
+            n_heads: i32,
+            n_kv: i32,
+            head_dim: i32,
+            d_tp: *const c_void,
+            max_seq: i32,
+            softcap: f32,
+        );
+        pub fn dev_upload_i32(d: *mut c_void, x: *const i32, n: i32);
+        pub fn dev_argmax_enqueue(logits: *const c_void, n: i32);
+        pub fn dev_argmax_read() -> u32;
         // batched (M-token) ops for speculative decoding
         pub fn qlinear_forward_m(handle: *mut c_void, d_x: *const c_void, d_y: *mut c_void, m: i32);
         pub fn op_rmsnorm_m(x_half: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32, m: i32);
@@ -714,6 +732,42 @@ impl AttnBlock {
         self.o.forward_into(&self.attn_out, &mut self.ob);
         residual_add(h, &self.ob);
     }
+
+    /// KV-cache capacity in positions (the `max_seq` the block was built with).
+    fn max_seq(&self) -> usize {
+        self.cache_k.n / (self.n_kv * self.head_dim)
+    }
+
+    /// The same decode step for the CUDA-graph path: the position (RoPE angle, KV-cache row,
+    /// attention length) is read from device memory `d_tp = [token, pos]`, so one captured
+    /// graph serves every position. Same kernels and arithmetic as [`forward`](Self::forward).
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    fn forward_dk(&mut self, h: &mut DevHalf, d_tp: *const c_void) {
+        let kv_dim = self.n_kv * self.head_dim;
+        let max_seq = self.max_seq();
+        rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
+        self.q.forward_into(&self.norm, &mut self.qb);
+        if let Some(b) = &self.qbias { vadd(&mut self.qb, b); }
+        self.qh.copy_cast_from(&self.qb);
+        self.k.forward_into(&self.norm, &mut self.kb);
+        if let Some(b) = &self.kbias { vadd(&mut self.kb, b); }
+        self.kh.copy_cast_from(&self.kb);
+        self.v.forward_into(&self.norm, &mut self.vb);
+        if let Some(b) = &self.vbias { vadd(&mut self.vb, b); }
+        self.vh.copy_cast_from(&self.vb);
+        unsafe {
+            op_rope_dk(self.qh.ptr, d_tp, self.n_heads as i32, self.head_dim as i32, self.inv_freq.ptr);
+            op_rope_dk(self.kh.ptr, d_tp, self.n_kv as i32, self.head_dim as i32, self.inv_freq.ptr);
+            op_cache_append_dk(self.cache_k.ptr, self.kh.ptr, d_tp, kv_dim as i32);
+            op_cache_append_dk(self.cache_v.ptr, self.vh.ptr, d_tp, kv_dim as i32);
+            op_attn_dk(
+                self.qh.ptr, self.cache_k.ptr, self.cache_v.ptr, self.attn_out.ptr,
+                self.n_heads as i32, self.n_kv as i32, self.head_dim as i32, d_tp, max_seq as i32, 0.0,
+            );
+        }
+        self.o.forward_into(&self.attn_out, &mut self.ob);
+        residual_add(h, &self.ob);
+    }
 }
 
 /// A full Llama decoder layer: attention sub-block then MLP sub-block, both updating the
@@ -731,6 +785,13 @@ impl Layer {
     /// One decode step at position `pos`: `h += attn(h); h += mlp(h)`.
     pub fn forward(&mut self, h: &mut DevHalf, pos: usize) {
         self.attn.forward(h, pos);
+        self.mlp.forward(h);
+    }
+
+    /// Graph-decode twin of [`forward`](Self::forward): position read from device `d_tp`.
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    fn forward_dk(&mut self, h: &mut DevHalf, d_tp: *const c_void) {
+        self.attn.forward_dk(h, d_tp);
         self.mlp.forward(h);
     }
 }
@@ -841,6 +902,11 @@ pub struct Model {
     eps: f32,
     // cached batched-forward buffers (allocated once per M, reused every verify)
     mk_scratch: Option<(usize, DevHalf, DevHalf, DevF32)>,
+    // CUDA-graph decode (forward_argmax_graph): the captured step, the vocab its argmax
+    // covers, and the device [token, pos] slot it reads.
+    graph: Option<Graph>,
+    graph_vocab: usize,
+    tp_dev: Option<DevF32>,
 }
 
 impl Model {
@@ -882,7 +948,62 @@ impl Model {
             vocab,
             eps,
             mk_scratch: None,
+            graph: None,
+            graph_vocab: 0,
+            tp_dev: None,
         }
+    }
+
+    /// Greedy step through a captured CUDA graph. The decode step (every layer, final norm,
+    /// LM head, argmax) is captured once with the position read from device memory, then
+    /// replayed with a single launch per token instead of ~25 launches per layer. The token's
+    /// embedding row is uploaded into the residual buffer before each launch, exactly as on
+    /// the eager path (no device copy of the table). The first call (or a new `real_vocab`)
+    /// runs one eager step, which also allocates every lazily created scratch buffer, and
+    /// captures the graph. Same kernels and results as [`forward_argmax`](Self::forward_argmax).
+    /// Greedy only (the logits stay on device); `TRAPETUM_LOGIT_DEBUG` is not honoured on
+    /// the replayed steps. A failed capture or replay aborts loudly (see graph_end/graph_launch).
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    pub fn forward_argmax_graph(&mut self, token: usize, pos: usize, real_vocab: usize) -> u32 {
+        let max_seq = self.layers.first().map(|l| l.attn.max_seq()).unwrap_or(0);
+        assert!(pos < max_seq, "graph decode: position {pos} is past the KV cache ({max_seq})");
+        if self.graph.is_none() || self.graph_vocab != real_vocab {
+            for l in &self.layers {
+                let need = (l.attn.head_dim + l.attn.max_seq()) * 4;
+                assert!(need <= 48 * 1024, "graph decode: attention needs {need} B of shared memory (max_seq too large)");
+            }
+            let t = self.forward_argmax(token, pos, real_vocab); // eager step; allocates the scratch
+            // the argmax scratch must exist before capture even if TRAPETUM_LOGIT_DEBUG made the
+            // eager step take its host-side argmax (no allocation may happen while capturing)
+            let _ = self.logits.argmax_device(real_vocab);
+            if self.tp_dev.is_none() {
+                self.tp_dev = Some(DevF32::zeros(2)); // two i32 slots (same width as f32)
+            }
+            self.graph = None;
+            let g = Graph::capture(|| self.run_forward_dk(real_vocab));
+            self.graph = Some(g);
+            self.graph_vocab = real_vocab;
+            return t;
+        }
+        let row = &self.embedding[token * self.hidden..(token + 1) * self.hidden]; // bounds-checked
+        self.h.upload(row);
+        let tp = [token as i32, pos as i32];
+        unsafe { dev_upload_i32(self.tp_dev.as_ref().unwrap().ptr, tp.as_ptr(), 2) };
+        self.graph.as_ref().unwrap().launch();
+        unsafe { dev_argmax_read() }
+    }
+
+    /// The position-independent decode step captured by [`forward_argmax_graph`]. It starts
+    /// from the residual buffer `h`, which the caller fills with the token's embedding row.
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    fn run_forward_dk(&mut self, real_vocab: usize) {
+        let d_tp = self.tp_dev.as_ref().expect("tp_dev").ptr as *const c_void;
+        for l in &mut self.layers {
+            l.forward_dk(&mut self.h, d_tp);
+        }
+        rmsnorm(&self.h, &self.final_norm, &mut self.normed, self.eps);
+        self.lm_head.forward_into(&self.normed, &mut self.logits);
+        unsafe { dev_argmax_enqueue(self.logits.ptr, real_vocab as i32) };
     }
 
     /// Run one token at position `pos`, leaving the next-token logits in `self.logits`
