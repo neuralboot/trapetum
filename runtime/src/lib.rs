@@ -282,6 +282,25 @@ impl AvqLinear {
     pub fn shape(&self) -> (usize, usize) {
         (self.ic, self.oc)
     }
+
+    /// Batched decode: `y[M][oc] = x[M][ic] W^T` as M independent AVQ GEMVs (there is no
+    /// batched AVQ kernel yet, so each row re-reads the codes; correct, not bandwidth-optimal).
+    /// Only the speculative-decode verify (M <= 4) uses this path.
+    pub fn forward_m(&self, x: &DevHalf, y: &mut DevF32, m: usize) {
+        assert_eq!(x.n, m * self.ic, "x must be m*ic");
+        assert_eq!(y.n, m * self.oc, "y must be m*oc");
+        #[cfg(feature = "cuda")]
+        for r in 0..m {
+            // CUDA device pointers are plain addresses, so a row is a byte offset into the
+            // buffer (integer arithmetic: the pointer is never dereferenced on the host);
+            // avq_forward_dev zeroes and fills exactly `oc` floats at the row base.
+            let xr = (x.ptr as usize + r * self.ic * 2) as *const c_void;
+            let yr = (y.ptr as usize + r * self.oc * 4) as *mut c_void;
+            unsafe { avq_forward_dev(self.handle, xr, yr) };
+        }
+        #[cfg(not(feature = "cuda"))]
+        panic!("AvqLinear::forward_m: the AVQ decode kernel exists only on the CUDA backend");
+    }
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -311,6 +330,24 @@ impl Proj {
         match self {
             Proj::Scalar(q) => ProjRef::Scalar(q.handle),
             Proj::Avq(a) => ProjRef::Avq(a.handle),
+        }
+    }
+
+    /// `y` (device f32) = `x` (device fp16) W^T, dispatching on the weight format. This is
+    /// what lets the dense Llama blocks ([`MlpBlock`], [`AttnBlock`]) carry either scalar
+    /// 4-bit projections (CBK1-3) or additive-codebook 2/3-bit ones (CBK4).
+    fn forward_into(&self, x: &DevHalf, y: &mut DevF32) {
+        match self {
+            Proj::Scalar(q) => q.forward_into(x, y),
+            Proj::Avq(a) => a.forward_into(x, y),
+        }
+    }
+
+    /// Batched (M-row) variant of [`forward_into`](Self::forward_into).
+    fn forward_m(&self, x: &DevHalf, y: &mut DevF32, m: usize) {
+        match self {
+            Proj::Scalar(q) => q.forward_m(x, y, m),
+            Proj::Avq(a) => a.forward_m(x, y, m),
         }
     }
 }
@@ -365,10 +402,26 @@ pub fn residual_add(h: &mut DevHalf, delta: &DevF32) {
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl QuantLinear {
     /// Batched decode GEMM: `y[M][oc] = x[M][ic] W^T`, one weight read serves all M rows.
+    /// The batched kernel (gemm_mtile) decodes nibble-packed K=16 indices only. A K=256
+    /// (8-bit) layer, e.g. the LM head of a CBK4 model, falls back to M row GEMVs on CUDA
+    /// (correct, re-reads the weights per row) and refuses elsewhere instead of silently
+    /// reading 8-bit indices as nibbles.
     pub fn forward_m(&self, x: &DevHalf, y: &mut DevF32, m: usize) {
         assert_eq!(x.n, m * self.ic, "x must be m*ic");
         assert_eq!(y.n, m * self.oc, "y must be m*oc");
-        unsafe { qlinear_forward_m(self.handle, x.ptr, y.ptr, m as i32) };
+        if self.k == 16 {
+            unsafe { qlinear_forward_m(self.handle, x.ptr, y.ptr, m as i32) };
+            return;
+        }
+        #[cfg(feature = "cuda")]
+        for r in 0..m {
+            // CUDA device pointers are plain addresses: integer offsets, never dereferenced here.
+            let xr = (x.ptr as usize + r * self.ic * 2) as *const c_void;
+            let yr = (y.ptr as usize + r * self.oc * 4) as *mut c_void;
+            unsafe { qlinear_forward_dev(self.handle, xr, yr) };
+        }
+        #[cfg(not(feature = "cuda"))]
+        panic!("QuantLinear::forward_m: batched K={} is only implemented on CUDA (row fallback)", self.k);
     }
 }
 
@@ -403,7 +456,7 @@ pub fn attention_m(q: &DevHalf, ck: &DevHalf, cv: &DevHalf, out: &mut DevHalf,
 }
 
 /// Cached batched-decode scratch (allocated once per M value, then reused). The naive
-/// forward_m allocated ~10 device buffers per layer per call — hundreds of device mallocs
+/// forward_m allocated ~10 device buffers per layer per call: hundreds of device mallocs
 /// per verify step, each an implicit sync. The M=1 path never does this; neither should M<=4.
 struct MScratchMlp { m: usize, norm: DevHalf, g: DevF32, u: DevF32, act: DevHalf, mlp: DevF32 }
 
@@ -418,13 +471,14 @@ struct MScratchAttn {
 }
 
 /// A Llama-style gated MLP block: RMSNorm, then `down(SiLU(gate(h)) * up(h))`, plus a
-/// residual. The three projections use the codebook decode kernel; norm, activation and
-/// residual are on-device too, so the whole forward can be captured as one CUDA graph.
+/// residual. The three projections use a codebook decode kernel (scalar 4-bit, or additive
+/// 2/3-bit for CBK4 models, see [`Proj`]); norm, activation and residual are on-device too,
+/// so the whole forward can be captured as one CUDA graph.
 pub struct MlpBlock {
     norm_w: DevF32,
-    gate: QuantLinear,
-    up: QuantLinear,
-    down: QuantLinear,
+    gate: Proj,
+    up: Proj,
+    down: Proj,
     norm: DevHalf,
     g: DevF32,
     u: DevF32,
@@ -448,11 +502,24 @@ impl MlpBlock {
         down_cb: &[f32],
         eps: f32,
     ) -> Self {
+        Self::from_projs(
+            hidden,
+            inter,
+            norm_w,
+            Proj::Scalar(QuantLinear::new(gate_packed, gate_cb, hidden, inter)),
+            Proj::Scalar(QuantLinear::new(up_packed, up_cb, hidden, inter)),
+            Proj::Scalar(QuantLinear::new(down_packed, down_cb, inter, hidden)),
+            eps,
+        )
+    }
+
+    /// Same block from already-built projections (scalar or additive-codebook).
+    fn from_projs(hidden: usize, inter: usize, norm_w: &[f32], gate: Proj, up: Proj, down: Proj, eps: f32) -> Self {
         Self {
             norm_w: DevF32::from_host(norm_w),
-            gate: QuantLinear::new(gate_packed, gate_cb, hidden, inter),
-            up: QuantLinear::new(up_packed, up_cb, hidden, inter),
-            down: QuantLinear::new(down_packed, down_cb, inter, hidden),
+            gate,
+            up,
+            down,
             norm: DevHalf::zeros(hidden),
             g: DevF32::zeros(inter),
             u: DevF32::zeros(inter),
@@ -514,10 +581,10 @@ pub fn attention(
 /// RoPE angles change with `pos`, so capture per position).
 pub struct AttnBlock {
     norm_w: DevF32,
-    q: QuantLinear,
-    k: QuantLinear,
-    v: QuantLinear,
-    o: QuantLinear,
+    q: Proj,
+    k: Proj,
+    v: Proj,
+    o: Proj,
     cache_k: DevHalf,
     cache_v: DevHalf,
     norm: DevHalf,
@@ -563,12 +630,41 @@ impl AttnBlock {
     ) -> Self {
         let qdim = n_heads * head_dim; // = hidden for MHA
         let kv_dim = n_kv * head_dim;
+        Self::from_projs(
+            hidden, n_heads, n_kv, head_dim, max_seq, norm_w,
+            Proj::Scalar(QuantLinear::new(q.0, q.1, hidden, qdim)),
+            Proj::Scalar(QuantLinear::new(k.0, k.1, hidden, kv_dim)),
+            Proj::Scalar(QuantLinear::new(v.0, v.1, hidden, kv_dim)),
+            Proj::Scalar(QuantLinear::new(o.0, o.1, qdim, hidden)),
+            eps, inv_freq, biases,
+        )
+    }
+
+    /// Same block from already-built projections (scalar or additive-codebook).
+    #[allow(clippy::too_many_arguments)]
+    fn from_projs(
+        hidden: usize,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+        max_seq: usize,
+        norm_w: &[f32],
+        q: Proj,
+        k: Proj,
+        v: Proj,
+        o: Proj,
+        eps: f32,
+        inv_freq: &[f32],
+        biases: Option<(&[f32], &[f32], &[f32])>,
+    ) -> Self {
+        let qdim = n_heads * head_dim; // = hidden for MHA
+        let kv_dim = n_kv * head_dim;
         Self {
             norm_w: DevF32::from_host(norm_w),
-            q: QuantLinear::new(q.0, q.1, hidden, qdim),
-            k: QuantLinear::new(k.0, k.1, hidden, kv_dim),
-            v: QuantLinear::new(v.0, v.1, hidden, kv_dim),
-            o: QuantLinear::new(o.0, o.1, qdim, hidden),
+            q,
+            k,
+            v,
+            o,
             cache_k: DevHalf::zeros(max_seq * kv_dim),
             cache_v: DevHalf::zeros(max_seq * kv_dim),
             norm: DevHalf::zeros(hidden),
@@ -757,12 +853,28 @@ impl Model {
         lm_head: (&[u8], &[f32]),
         eps: f32,
     ) -> Self {
+        let lm = QuantLinear::new(lm_head.0, lm_head.1, hidden, vocab);
+        Self::from_parts(hidden, vocab, embedding, layers, final_norm_w, lm, eps)
+    }
+
+    /// Same model with an already-built LM head (any scalar codebook size, e.g. the 8-bit
+    /// K=256 head a CBK4 file may carry).
+    fn from_parts(
+        hidden: usize,
+        vocab: usize,
+        embedding: Vec<f32>,
+        layers: Vec<Layer>,
+        final_norm_w: &[f32],
+        lm_head: QuantLinear,
+        eps: f32,
+    ) -> Self {
         assert_eq!(embedding.len(), vocab * hidden, "embedding must be vocab*hidden");
+        assert_eq!(lm_head.shape(), (hidden, vocab), "lm_head must be hidden x vocab");
         Self {
             embedding,
             layers,
             final_norm: DevF32::from_host(final_norm_w),
-            lm_head: QuantLinear::new(lm_head.0, lm_head.1, hidden, vocab),
+            lm_head,
             h: DevHalf::zeros(hidden),
             normed: DevHalf::zeros(hidden),
             logits: DevF32::zeros(vocab),
@@ -1053,12 +1165,18 @@ impl Model {
     /// Load a model exported in the `.cbk` format (see `model/export_runtime.py`):
     /// magic, config, fp16 embedding, then per layer the RMSNorm weights and the seven
     /// codebook-quantized projections, then the final norm and codebook LM head.
+    ///
+    /// `CBK4` (see `model/export_aqlm.py`) is the CBK3 header plus `avq_m` and `lm_k`
+    /// (two i32 after the RoPE frequencies); its seven per-layer projections are CBKA
+    /// additive-codebook records (AQLM-style, `avq_m` codebooks of 256 x 8), decoded by
+    /// [`AvqLinear`], and its LM head is a scalar codebook with `lm_k` entries (16 or 256).
     pub fn load_cbk(path: &str, max_seq: usize) -> std::io::Result<Model> {
         let mut r = BufReader::new(File::open(path)?);
         let mut magic = [0u8; 4];
         r.read_exact(&mut magic)?;
         let v2 = &magic == b"CBK2";
-        let v3 = &magic == b"CBK3";
+        let v4 = &magic == b"CBK4";
+        let v3 = &magic == b"CBK3" || v4; // CBK4 shares the CBK3 header
         assert!(&magic == b"CBK1" || v2 || v3, "bad magic (not a .cbk file)");
         let c: Vec<usize> = (0..7).map(|_| rd_i32(&mut r) as usize).collect();
         let (n_layers, hidden, n_heads, n_kv, head_dim, inter, vocab) =
@@ -1074,6 +1192,13 @@ impl Model {
         } else {
             (0..halfd).map(|d| base.powf(-2.0 * d as f32 / head_dim as f32) / scale).collect()
         };
+        if v4 {
+            let avq_m = rd_i32(&mut r) as usize;
+            let lm_k = rd_i32(&mut r) as usize;
+            let embedding = rd_f16_vec(&mut r, vocab * hidden);
+            return Self::load_cbk4_body(path, r, max_seq, [n_layers, hidden, n_heads, n_kv, head_dim, inter, vocab],
+                                        eps, has_bias, &inv_freq, avq_m, lm_k, embedding);
+        }
         let embedding = rd_f16_vec(&mut r, vocab * hidden);
         let qdim = n_heads * head_dim;
         let kvdim = n_kv * head_dim;
@@ -1105,6 +1230,67 @@ impl Model {
         let final_norm = rd_f32_vec(&mut r, hidden);
         let (lmp, lmc) = (rd_u8_vec(&mut r, hidden * vocab / 2), rd_f32_vec(&mut r, K * vocab));
         Ok(Model::new(hidden, vocab, embedding, layers, &final_norm, (&lmp, &lmc), eps))
+    }
+
+    /// Rest of a CBK4 file after the embedding: per layer the two RMSNorm weights and seven
+    /// CBKA records (q, k, v, o, gate, up, down; optional f32 q/k/v biases right after their
+    /// records, as in CBK3), then the final norm and the `lm_k` scalar-codebook LM head.
+    /// The CBKA index bytes are mmap-backed until uploaded, never copied through host RAM.
+    #[allow(clippy::too_many_arguments)]
+    fn load_cbk4_body(
+        path: &str,
+        mut r: BufReader<File>,
+        max_seq: usize,
+        c: [usize; 7],
+        eps: f32,
+        has_bias: bool,
+        inv_freq: &[f32],
+        avq_m: usize,
+        lm_k: usize,
+        embedding: Vec<f32>,
+    ) -> std::io::Result<Model> {
+        let [n_layers, hidden, n_heads, n_kv, head_dim, inter, vocab] = c;
+        assert!(avq_m == 2 || avq_m == 3, "CBK4: avq_m must be 2 or 3 (got {avq_m})");
+        assert!(lm_k == 16 || lm_k == 256, "CBK4: lm_k must be 16 or 256 (got {lm_k})");
+        // SAFETY: read-only mapping of the file being loaded, only used for the CBKA index
+        // ranges recorded by read_cbka; nothing writes the file while the model loads.
+        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&File::open(path)?)? });
+        let qdim = n_heads * head_dim;
+        let kvdim = n_kv * head_dim;
+        let avq = |r: &mut BufReader<File>, rows: usize, cols: usize| -> std::io::Result<Proj> {
+            Ok(Proj::Avq(read_cbka(r, &mmap, avq_m, rows, cols)?.to_linear()))
+        };
+        let mut layers = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            let an = rd_f32_vec(&mut r, hidden);
+            let q = avq(&mut r, qdim, hidden)?;
+            let qb = if has_bias { Some(rd_f32_vec(&mut r, qdim)) } else { None };
+            let k = avq(&mut r, kvdim, hidden)?;
+            let kb = if has_bias { Some(rd_f32_vec(&mut r, kvdim)) } else { None };
+            let v = avq(&mut r, kvdim, hidden)?;
+            let vb = if has_bias { Some(rd_f32_vec(&mut r, kvdim)) } else { None };
+            let o = avq(&mut r, hidden, qdim)?;
+            let pn = rd_f32_vec(&mut r, hidden);
+            let gate = avq(&mut r, inter, hidden)?;
+            let up = avq(&mut r, inter, hidden)?;
+            let down = avq(&mut r, hidden, inter)?;
+            let biases = match (&qb, &kb, &vb) {
+                (Some(q), Some(k), Some(v)) => Some((q.as_slice(), k.as_slice(), v.as_slice())),
+                _ => None,
+            };
+            let attn = AttnBlock::from_projs(hidden, n_heads, n_kv, head_dim, max_seq, &an,
+                                             q, k, v, o, eps, inv_freq, biases);
+            let mlp = MlpBlock::from_projs(hidden, inter, &pn, gate, up, down, eps);
+            layers.push(Layer::new(attn, mlp));
+        }
+        let final_norm = rd_f32_vec(&mut r, hidden);
+        let nbytes = if lm_k == 256 { hidden * vocab } else { hidden * vocab / 2 };
+        let lmp = rd_u8_vec(&mut r, nbytes);
+        let lmc = rd_f32_vec(&mut r, lm_k * vocab);
+        let mut probe = [0u8; 1];
+        assert_eq!(r.read(&mut probe)?, 0, "CBK4: trailing bytes after the LM head (writer/reader mismatch)");
+        let lm = QuantLinear::new_k(&lmp, &lmc, hidden, vocab, lm_k);
+        Ok(Model::from_parts(hidden, vocab, embedding, layers, &final_norm, lm, eps))
     }
 }
 
