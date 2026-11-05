@@ -34,7 +34,9 @@ Notes on the numbers above (labeled so cross-doc figures do not read as contradi
 - **AQLM 2-bit = 6.34 PPL** here is the AQLM **1x16** checkpoint (K = 65536). The
   codebook README loads the AQLM **2x8** checkpoint (PPL **7.63**) because 2x8 is the
   config a shared-memory LUT can decode; these are *different* AQLM checkpoints, so the
-  6.34-vs-7.63 gap is expected, not a contradiction.
+  6.34-vs-7.63 gap is expected, not a contradiction. The PV-tuned 2x8 checkpoint
+  (`ISTA-DASLab/Llama-2-7b-AQLM-PV-2Bit-2x8-hf`) measures 6.26 in this harness (6.67 in the
+  custom one) and is the 2x8 checkpoint the runtime serves (CBK4, see the main README).
 
 At 7B on an H100, every quantized method is **slower** than fp16 at single-stream
 decode. Quantization here buys memory (15 GB to 4-6 GB), not latency: on a GPU with
@@ -126,7 +128,8 @@ calibration), `llama_awq.py` / `llama_awq_full.py` (AWQ scale search + clipping)
 decode that realizes x2.0 end-to-end; `SERVE_MODEL` env selects 7B/13B), `llama_ac.py`
 (served-model quality check + incoherence experiment), `llama_aqlm.py` (loads a real
 AQLM-2Bit-2x8 checkpoint: PPL 7.63 + confirms its codebooks/codes/scales map exactly onto
-the `avq_gemv` kernel), `llama_advq.py` (greedy residual additive-VQ, ties scalar at
+the `avq_gemv` kernel), `export_aqlm.py` (writes a 2x8 checkpoint as a CBK4 file the Rust
+runtime serves; the PV-tuned 2x8 gives PPL 6.67, 2.05 GB, 16/16 greedy vs HF), `llama_advq.py` (greedy residual additive-VQ, ties scalar at
 4-bit), `llama_aqlm_train.py` (reproduces AQLM's beam-search + least-squares training:
 M=4 reaches PPL 6.13, **beating the scalar 4-bit codebook 6.34** at equal bits, while the
 kernel decodes it at x2.39; `CALIB=1` tries naive diagonal-Hessian calibration, a negative

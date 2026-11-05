@@ -238,10 +238,40 @@ Reproduce with `nvcc -O3 -arch=sm_86 -DGT=16 kernels/avq_gemv3.cu -lcublas -o av
 format. Loading the real `ISTA-DASLab/Llama-2-7b-AQLM-2Bit-2x8-hf` checkpoint, its
 `codebooks` are `[2, 256, 1, 8]` (M=2, K=256, group 8), `codes` `[4096, 512, 2]`, with a
 per-output `scales` `[4096]`, all mapping one-to-one onto this kernel (add the per-output
-scale at the end). So the kernel decodes **real AQLM weights**, not just random data. The
-honest tension: that 2x8 config (the one a shared-memory LUT can decode) gives PPL 7.63
-on Llama-2 7B, worse than scalar 4-bit (6.34) though at *half* the bits, and far better
-than scalar *2-bit* which diverges. The accuracy-competitive AQLM is `1x16`
+scale at the end). So the kernel decodes **real AQLM weights**, not just random data.
+
+**Served end to end (CBK4).** The 7.63 we first measured for 2x8 came from the non-PV
+`ISTA-DASLab/Llama-2-7b-AQLM-2Bit-2x8-hf` checkpoint (custom 30-window harness, fp16 5.83).
+Its PV-tuned version in the same 2x8 format, `ISTA-DASLab/Llama-2-7b-AQLM-PV-2Bit-2x8-hf`,
+measures **PPL 6.67** in that harness (6.26 on the full wikitext-2 test set, fp16 5.47), and
+the Rust runtime now serves it end to end: `model/export_aqlm.py` copies the AQLM codes,
+codebooks and scales byte for byte into a `CBK4` file (CBK3 header plus one CBKA record
+per projection, LM head as an 8-bit scalar codebook), and the dense Llama blocks dispatch
+each projection to the scalar or the additive kernel. `generate` reproduces the Hugging Face
+greedy continuation 16/16. Llama-2 7B on one RTX 4090, batch 1:
+
+| Llama-2 7B in the runtime | file | peak VRAM | PPL (custom harness) | tok/s eager | tok/s CUDA graph | tok/s graph, 256-token window |
+|---|---|---|---|---|---|---|
+| scalar 4-bit (CBK3) | 3.66 GB | 4.2 GB | 6.34 | 143 | 157 | 111 |
+| **AQLM PV 2x8 (CBK4)** | **2.05 GB** | **2.7 GB** | **6.67** | **182** | **205** | **132** |
+
+So 2-bit trades +0.33 PPL for 44% less disk, 35% less GPU memory and 1.2x to 1.3x the decode
+speed (256-token window to short context). `TRAPETUM_GRAPH=1` replays the whole decode step as one CUDA graph (position read
+from device memory); it saves about 0.6 ms per token in both formats, and the remaining
+fixed cost is small kernels plus the batch-1 attention, which grows with context. Only four
+PV checkpoints exist in the 2x8 format (Llama-2 7B, Llama-3.1 8B Instruct, Llama-3.2 3B and
+3B Instruct); the 2-bit path is CUDA only (no Metal AVQ kernel yet), and its decode sums
+partials with atomics, so its logits vary in the last digits from run to run.
+
+```sh
+python model/export_aqlm.py --model ISTA-DASLab/Llama-2-7b-AQLM-PV-2Bit-2x8-hf --out /root/cbk4 --gen 16
+cd runtime && TRAPETUM_GRAPH=1 cargo run --release --bin generate \
+  /root/cbk4/model.cbk /root/cbk4/prompt.bin /root/cbk4/ref.bin /root/cbk4/cont.bin 256
+```
+
+Before PV tuning, the 2x8 config (the one a shared-memory LUT can decode) was worse than
+scalar 4-bit (7.63 vs 6.34) though at *half* the bits, and far better than scalar *2-bit*,
+which diverges. The accuracy-competitive AQLM is `1x16`
 (K = 65536), whose 256 KB-per-group LUT does not fit shared memory and needs a different,
 slower kernel (which is why AQLM decode is slow). We tested the `4x8` path (M=4, 4 bits). The kernel stays fast (M=4 decodes at **x2.39**
 on the A40, GT=4, verified). On accuracy, a *greedy* additive fit only ties the scalar
