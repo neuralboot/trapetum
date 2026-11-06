@@ -24,9 +24,9 @@ echo "### (#1,#3,#4) LOSSLESS validation of batched forward + K>1 + confidence o
 runtime/target/release/spec_check || { echo "SPEC_CHECK FAILED"; exit 1; }
 
 echo "### compress target + drafters ###"
-python model/export_runtime.py --model "$TARGET"   --out "$OUT/target"  --prompt "$PROMPT" --gen 16
-python model/export_runtime.py --model "$DRAFTER1" --out "$OUT/draft1" --prompt "$PROMPT" --gen 16
-python model/export_runtime.py --model "$DRAFTER2" --out "$OUT/draft2" --prompt "$PROMPT" --gen 16
+python model/export_runtime.py --model "$TARGET"   --out "$OUT/target"  --prompt "$PROMPT" --gen 16 --recipe legacy --lm-k 16
+python model/export_runtime.py --model "$DRAFTER1" --out "$OUT/draft1" --prompt "$PROMPT" --gen 16 --recipe legacy --lm-k 16
+python model/export_runtime.py --model "$DRAFTER2" --out "$OUT/draft2" --prompt "$PROMPT" --gen 16 --recipe legacy --lm-k 16
 
 echo "### validate target reproduces HF ###"
 runtime/target/release/generate "$OUT/target/model.cbk" "$OUT/target/prompt.bin" "$OUT/target/ref.bin" "$OUT/target/cont.bin"

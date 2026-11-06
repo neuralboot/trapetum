@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Trapetum speculative decoding K=1 — REAL alpha + speedup measurement on a
+# Trapetum speculative decoding K=1: REAL alpha + speedup measurement on a
 # CUDA pod (RunPod / any 24GB+ NVIDIA box). Compresses a Llama-2-7B target and
 # a TinyLlama-1.1B drafter to 4-bit .cbk, validates the target against HF, then
 # measures the acceptance rate alpha and each model's latency to derive the
@@ -33,10 +33,10 @@ pip install -q torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
 pip install -q transformers==4.44.2 accelerate sentencepiece numpy $PIN
 
 echo "### 2/6  compress TARGET  ($TARGET_MODEL) -> 4-bit .cbk ###"
-python "$ROOT/model/export_runtime.py" --model "$TARGET_MODEL" --out "$OUT/target" --prompt "$PROMPT" --gen 16
+python "$ROOT/model/export_runtime.py" --model "$TARGET_MODEL" --out "$OUT/target" --prompt "$PROMPT" --gen 16 --recipe legacy --lm-k 16
 
 echo "### 3/6  compress DRAFTER ($DRAFTER_MODEL) -> 4-bit .cbk ###"
-python "$ROOT/model/export_runtime.py" --model "$DRAFTER_MODEL" --out "$OUT/drafter" --prompt "$PROMPT" --gen 16
+python "$ROOT/model/export_runtime.py" --model "$DRAFTER_MODEL" --out "$OUT/drafter" --prompt "$PROMPT" --gen 16 --recipe legacy --lm-k 16
 
 echo "### 4/6  build the CUDA runtime + validate the target reproduces HF ###"
 cd "$ROOT/runtime"

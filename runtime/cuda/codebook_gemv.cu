@@ -704,6 +704,22 @@ extern "C" {
 // upload the quantized weights once; activations are external device buffers.
 // k=16: nibble-packed 4-bit (IC*(OC/2) bytes, gemv4). k=256: 8-bit uint8 indices (IC*OC bytes, gemv8).
 void* qlinear_create(const unsigned char* packed, const float* cb_f32, int IC, int OC, int k) {
+    if (k == 256) {
+        // gemv8 stages a K8 x CPB8 half codebook plus the TY x CPB8 f32 reduction in shared
+        // memory (gemv8_smem(): 69,632 B per block), above what Turing (sm_75: 65,536 B) and
+        // older GPUs allow. Refuse at load time: a launch over the limit fails silently and the
+        // layer would return stale or zero outputs. The caller asserts a non-null handle.
+        size_t need = (size_t)K8*CPB8*sizeof(__half) + (size_t)TY*CPB8*sizeof(float);
+        int dev = 0, optin = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        if ((size_t)optin < need) {
+            fprintf(stderr, "trapetum: this model has an 8-bit (K=256) layer, whose kernel needs %zu B of shared "
+                            "memory per block; this GPU allows %d B. Re-export the model with a 4-bit LM head "
+                            "(model/export_runtime.py --lm-k 16).\n", need, optin);
+            return nullptr;
+        }
+    }
     QLinear* q = (QLinear*)malloc(sizeof(QLinear));
     q->IC = IC; q->OC = OC; q->K_ = k;
     size_t np = (k == 256) ? (size_t)IC * OC : (size_t)IC * (OC/2);
@@ -725,8 +741,14 @@ static void ensure_gemv8_smem() {
     static bool once = false;
     if (once) return;
     int sm = (int)gemv8_smem();
-    cudaFuncSetAttribute(gemv8, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
-    cudaFuncSetAttribute(gemv8_partial, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    cudaError_t e1 = cudaFuncSetAttribute(gemv8, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    cudaError_t e2 = cudaFuncSetAttribute(gemv8_partial, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    if (e1 != cudaSuccess || e2 != cudaSuccess) {
+        // qlinear_create already refuses GPUs below the limit; never decode with a kernel that cannot launch
+        fprintf(stderr, "trapetum: cannot give gemv8 %d B of shared memory: %s\n", sm,
+                cudaGetErrorString(e1 != cudaSuccess ? e1 : e2));
+        abort();
+    }
     once = true;
 }
 

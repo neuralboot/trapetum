@@ -439,7 +439,9 @@ impl QuantLinear {
             unsafe { qlinear_forward_dev(self.handle, xr, yr) };
         }
         #[cfg(not(feature = "cuda"))]
-        panic!("QuantLinear::forward_m: batched K={} is only implemented on CUDA (row fallback)", self.k);
+        panic!("QuantLinear::forward_m: batched K={} is only implemented on CUDA (row fallback); for batched \
+                (speculative) decoding on this backend, export the model with a 4-bit LM head \
+                (model/export_runtime.py --lm-k 16)", self.k);
     }
 }
 
@@ -1242,7 +1244,7 @@ impl Model {
     /// Greedy speculative decode, K=1. `drafter(prefix) -> proposed next token`. Emits
     /// `n` tokens after the prompt. LOSSLESS by construction: every emitted token is the
     /// target's greedy argmax, so the output equals plain greedy decode regardless of the
-    /// drafter's accuracy — a good drafter just emits more tokens per target forward.
+    /// drafter's accuracy: a good drafter just emits more tokens per target forward.
     /// Returns `(tokens, target_forwards)` so callers can see the speedup (fewer forwards).
     #[cfg(any(feature = "cuda", feature = "metal"))]
     pub fn spec_decode_greedy(
@@ -1287,10 +1289,12 @@ impl Model {
     /// magic, config, fp16 embedding, then per layer the RMSNorm weights and the seven
     /// codebook-quantized projections, then the final norm and codebook LM head.
     ///
-    /// `CBK4` (see `model/export_aqlm.py`) is the CBK3 header plus `avq_m` and `lm_k`
-    /// (two i32 after the RoPE frequencies); its seven per-layer projections are CBKA
-    /// additive-codebook records (AQLM-style, `avq_m` codebooks of 256 x 8), decoded by
-    /// [`AvqLinear`], and its LM head is a scalar codebook with `lm_k` entries (16 or 256).
+    /// `CBK4` is the CBK3 header plus `avq_m` and `lm_k` (two i32 after the RoPE
+    /// frequencies), and its LM head is a scalar codebook with `lm_k` entries (16 or 256).
+    /// With `avq_m` 2 or 3 (see `model/export_aqlm.py`) the seven per-layer projections are
+    /// CBKA additive-codebook records (AQLM-style, `avq_m` codebooks of 256 x 8), decoded by
+    /// [`AvqLinear`]. With `avq_m` 0 (see `model/export_runtime.py`, 8-bit head) the body is
+    /// exactly CBK3's, 4-bit scalar projections, only the LM head differs.
     pub fn load_cbk(path: &str, max_seq: usize) -> std::io::Result<Model> {
         let mut r = BufReader::new(File::open(path)?);
         let mut magic = [0u8; 4];
@@ -1313,13 +1317,21 @@ impl Model {
         } else {
             (0..halfd).map(|d| base.powf(-2.0 * d as f32 / head_dim as f32) / scale).collect()
         };
-        if v4 {
+        // LM head codebook size: 16 for CBK1-3, read from the header for CBK4
+        let lm_k = if v4 {
             let avq_m = rd_i32(&mut r) as usize;
             let lm_k = rd_i32(&mut r) as usize;
-            let embedding = rd_f16_vec(&mut r, vocab * hidden);
-            return Self::load_cbk4_body(path, r, max_seq, [n_layers, hidden, n_heads, n_kv, head_dim, inter, vocab],
-                                        eps, has_bias, &inv_freq, avq_m, lm_k, embedding);
-        }
+            if avq_m != 0 {
+                let embedding = rd_f16_vec(&mut r, vocab * hidden);
+                return Self::load_cbk4_body(path, r, max_seq, [n_layers, hidden, n_heads, n_kv, head_dim, inter, vocab],
+                                            eps, has_bias, &inv_freq, avq_m, lm_k, embedding);
+            }
+            // avq_m == 0: scalar 4-bit projections in the CBK3 layout, read below
+            assert!(lm_k == 16 || lm_k == 256, "CBK4 (scalar projections): lm_k must be 16 or 256 (got {lm_k})");
+            lm_k
+        } else {
+            K
+        };
         let embedding = rd_f16_vec(&mut r, vocab * hidden);
         let qdim = n_heads * head_dim;
         let kvdim = n_kv * head_dim;
@@ -1349,8 +1361,18 @@ impl Model {
             layers.push(Layer::new(attn, mlp));
         }
         let final_norm = rd_f32_vec(&mut r, hidden);
-        let (lmp, lmc) = (rd_u8_vec(&mut r, hidden * vocab / 2), rd_f32_vec(&mut r, K * vocab));
-        Ok(Model::new(hidden, vocab, embedding, layers, &final_norm, (&lmp, &lmc), eps))
+        if !v4 {
+            let (lmp, lmc) = (rd_u8_vec(&mut r, hidden * vocab / 2), rd_f32_vec(&mut r, K * vocab));
+            return Ok(Model::new(hidden, vocab, embedding, layers, &final_norm, (&lmp, &lmc), eps));
+        }
+        // CBK4 with scalar projections: LM head with lm_k entries (K=256: one uint8 index per weight)
+        let nbytes = if lm_k == 256 { hidden * vocab } else { hidden * vocab / 2 };
+        let lmp = rd_u8_vec(&mut r, nbytes);
+        let lmc = rd_f32_vec(&mut r, lm_k * vocab);
+        let mut probe = [0u8; 1];
+        assert_eq!(r.read(&mut probe)?, 0, "CBK4: trailing bytes after the LM head (writer/reader mismatch)");
+        let lm = QuantLinear::new_k(&lmp, &lmc, hidden, vocab, lm_k);
+        Ok(Model::from_parts(hidden, vocab, embedding, layers, &final_norm, lm, eps))
     }
 
     /// Rest of a CBK4 file after the embedding: per layer the two RMSNorm weights and seven
