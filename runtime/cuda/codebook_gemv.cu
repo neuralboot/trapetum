@@ -477,13 +477,13 @@ static __host__ __device__ __forceinline__ int attn_chunks(int seqlen) { return 
 // part layout: [n_heads][stride_chunks][2 + HD] floats = (m, l, o[HD]) per (head, chunk).
 // The seqlen is seqlen_arg on the eager path, d_tp[1] + 1 on the CUDA-graph path (whose grid
 // covers max_seq, so chunks past the current length exit at once).
+// The body is shared with the batch-invariant verify kernel (attn_split_v), which calls it once
+// per query row with that row's q, partial buffer and length: the same code, hence the same bits.
 template <int PER>   // PER = head_dim / 32 values per lane
-__global__ void attn_split_k(const __half* __restrict__ q, const __half* __restrict__ ck,
-                             const __half* __restrict__ cv, float* __restrict__ part,
-                             int n_heads, int n_kv, int seqlen_arg, const int* __restrict__ d_tp,
-                             float softcap, int stride_chunks) {
+__device__ __forceinline__ void attn_split_body(const __half* __restrict__ q, const __half* __restrict__ ck,
+                                                const __half* __restrict__ cv, float* __restrict__ part,
+                                                int n_heads, int n_kv, int seqlen, float softcap, int stride_chunks) {
     const int HD = PER * 32;
-    int seqlen = d_tp ? d_tp[1] + 1 : seqlen_arg;
     int h = blockIdx.x, c = blockIdx.y;
     int t0 = c * ATTN_CHUNK;
     if (t0 >= seqlen) return;                    // block-uniform: no barrier is skipped by part of a block
@@ -557,11 +557,19 @@ __global__ void attn_split_k(const __half* __restrict__ q, const __half* __restr
         dst[1] = L;
     }
 }
+template <int PER>
+__global__ void attn_split_k(const __half* __restrict__ q, const __half* __restrict__ ck,
+                             const __half* __restrict__ cv, float* __restrict__ part,
+                             int n_heads, int n_kv, int seqlen_arg, const int* __restrict__ d_tp,
+                             float softcap, int stride_chunks) {
+    int seqlen = d_tp ? d_tp[1] + 1 : seqlen_arg;
+    attn_split_body<PER>(q, ck, cv, part, n_heads, n_kv, seqlen, softcap, stride_chunks);
+}
 
 // One block per head, one thread per output dimension: chunks in a fixed order (0, 1, 2, ...).
-__global__ void attn_merge_k(const float* __restrict__ part, __half* __restrict__ out, int head_dim,
-                             int seqlen_arg, const int* __restrict__ d_tp, int stride_chunks) {
-    int seqlen = d_tp ? d_tp[1] + 1 : seqlen_arg;
+// The body is shared with the verify kernel attn_merge_v, as for the split kernel.
+__device__ __forceinline__ void attn_merge_body(const float* __restrict__ part, __half* __restrict__ out, int head_dim,
+                                                int seqlen, int stride_chunks) {
     int nch = attn_chunks(seqlen);
     int h = blockIdx.x;
     const size_t rec = (size_t)head_dim + 2;
@@ -575,6 +583,11 @@ __global__ void attn_merge_k(const float* __restrict__ part, __half* __restrict_
         for (int c = 0; c < nch; c++) od += base[c * rec + 2 + d] * expf(base[c * rec] - M);
         out[(size_t)h * head_dim + d] = __float2half(od / L);
     }
+}
+__global__ void attn_merge_k(const float* __restrict__ part, __half* __restrict__ out, int head_dim,
+                             int seqlen_arg, const int* __restrict__ d_tp, int stride_chunks) {
+    int seqlen = d_tp ? d_tp[1] + 1 : seqlen_arg;
+    attn_merge_body(part, out, head_dim, seqlen, stride_chunks);
 }
 
 // ============================================================================
@@ -966,9 +979,623 @@ __global__ void avq_gemv_t(const __half* __restrict__ X, const unsigned char* __
     }
 }
 
+// ============================================================================
+// Batch-invariant verify (speculative decoding): M tokens at positions base .. base+M-1 in one
+// forward whose logits are, row by row, the SAME BITS as M sequential decode steps on the default
+// deterministic path (two-stage GEMVs, split-KV attention). Each reduction keeps its decode order:
+//  - GEMV: a column's sum depends only on the IC split (gridDim.y slices of ceil(IC/gridDim.y)
+//    rows), the TY interleave of rows inside a slice (same ty, same FMA chain), the sum of the TY
+//    partials from 0 in y order, and the sum of the slices from 0 in slice order. The verify
+//    kernels keep all four; they only give each thread 4 columns instead of 8 when M > 4, so
+//    that 16 rows of accumulators fit in registers. One weight read serves the M rows.
+//  - RMSNorm, RoPE and the KV append, the attention chunks and their merge, the reduce
+//    epilogues (bias and cast, SiLU times up, residual add): the decode kernels' arithmetic
+//    with one row per block (grid y or z), at position base + row.
+// M is 1, 2, 4, 8 or 16 (VMAX). Scalar 4-bit (K=16) body projections; the head may be K=16 or 256.
+// ============================================================================
+#define VMAX 16
+
+template <int M, int CPT>   // CPT columns per thread: 8 (M <= 4) or 4
+__global__ void __launch_bounds__(32*TY)
+gemv4_partial_v(const __half* __restrict__ X,                   // [M][IC]
+                const unsigned char* __restrict__ p0, const unsigned char* __restrict__ p1,
+                const unsigned char* __restrict__ p2,
+                const __half* __restrict__ c0, const __half* __restrict__ c1, const __half* __restrict__ c2,
+                int oc0, int oc1, int oc2, float* __restrict__ Ypart, int IC, int OCt) {   // Ypart [gy][M][OCt]
+    constexpr int CPBV = 32 * CPT;                  // columns per block
+    constexpr int MG = M < TY ? M : TY;             // rows reduced per pass (M is a multiple of MG)
+    extern __shared__ char sm[];
+    __half* s_cb = (__half*)sm;                     // [K][CPBV]
+    float* red = (float*)(s_cb + K*CPBV);           // [MG][TY][CPBV]
+    int tx = threadIdx.x, ty = threadIdx.y, tid = ty*32 + tx, nth = 32*TY;
+    int jg = blockIdx.x*CPBV;                       // first column, concatenated space
+    int s = jg < oc0 ? 0 : (jg < oc0 + oc1 ? 1 : 2);
+    const unsigned char* packed = s == 0 ? p0 : (s == 1 ? p1 : p2);
+    const __half* cb = s == 0 ? c0 : (s == 1 ? c1 : c2);
+    int OC = s == 0 ? oc0 : (s == 1 ? oc1 : oc2);
+    int j0 = jg - (s == 0 ? 0 : (s == 1 ? oc0 : oc0 + oc1));
+    for (int t = tid; t < K*CPBV/2; t += nth) {
+        int idx = t*2, k = idx/CPBV, jj = j0 + (idx%CPBV);
+        *reinterpret_cast<__half2*>(&s_cb[idx]) = *reinterpret_cast<const __half2*>(&cb[(size_t)k*OC + jj]);
+    }
+    __syncthreads();
+    int per = (IC + gridDim.y - 1)/gridDim.y, ic0 = blockIdx.y*per, ic1 = min(IC, ic0 + per);
+    int jbase = j0 + tx*CPT; size_t OCp = OC/2;
+    float acc[M][CPT];
+    #pragma unroll
+    for (int m = 0; m < M; m++)
+        #pragma unroll
+        for (int c = 0; c < CPT; c++) acc[m][c] = 0.f;
+    for (int ic = ic0 + ty; ic < ic1; ic += TY) {
+        unsigned f;
+        if (CPT == 8) f = __ldg((const unsigned*)&packed[(size_t)ic*OCp + jbase/2]);
+        else f = __ldg((const unsigned short*)&packed[(size_t)ic*OCp + jbase/2]);
+        float xx[M];
+        #pragma unroll
+        for (int m = 0; m < M; m++) xx[m] = __half2float(__ldg(&X[(size_t)m*IC + ic]));
+        #pragma unroll
+        for (int c = 0; c < CPT; c++) {
+            unsigned char id = (f >> (4*c)) & 0xF;
+            float w = __half2float(s_cb[id*CPBV + tx*CPT + c]);
+            #pragma unroll
+            for (int m = 0; m < M; m++) acc[m][c] += xx[m]*w;   // gemv4_partial: acc[c] += xx*w
+        }
+    }
+    // each row's TY partials, summed from 0 in y order as in gemv4_partial, MG rows per pass
+    #pragma unroll
+    for (int mb = 0; mb < M; mb += MG) {
+        #pragma unroll
+        for (int mm = 0; mm < MG; mm++)
+            #pragma unroll
+            for (int c = 0; c < CPT; c++) red[((size_t)mm*TY + ty)*CPBV + tx*CPT + c] = acc[mb + mm][c];
+        __syncthreads();
+        if (ty < MG) {
+            #pragma unroll
+            for (int c = 0; c < CPT; c++) {
+                float s2 = 0;
+                for (int y = 0; y < TY; y++) s2 += red[((size_t)ty*TY + y)*CPBV + tx*CPT + c];
+                Ypart[((size_t)blockIdx.y*M + mb + ty)*OCt + (jg + tx*CPT + c)] = s2;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// 8-bit (K=256) twin for the LM head: gemv8_partial's tiling (4 columns per thread, CPB8), the
+// reduction space reusing the codebook's once every thread has left the main loop.
+template <int M>
+__global__ void __launch_bounds__(32*TY)
+gemv8_partial_v(const __half* __restrict__ X, const unsigned char* __restrict__ idx,
+                const __half* __restrict__ cb, float* __restrict__ Ypart, int IC, int OC) {   // Ypart [gy][M][OC]
+    constexpr int MG = M < TY ? M : TY;
+    extern __shared__ char sm[];
+    __half* s_cb = (__half*)sm;                     // [K8][CPB8]
+    float* red = (float*)sm;                        // [MG][TY][CPB8], after the main loop
+    int tx = threadIdx.x, ty = threadIdx.y, tid = ty*32 + tx, nth = 32*TY;
+    int j0 = blockIdx.x*CPB8;
+    for (int t = tid; t < K8*CPB8; t += nth) { int k = t/CPB8, jj = j0 + (t%CPB8); s_cb[t] = __ldg(&cb[(size_t)k*OC + jj]); }
+    __syncthreads();
+    int per = (IC + gridDim.y - 1)/gridDim.y, ic0 = blockIdx.y*per, ic1 = min(IC, ic0 + per);
+    int jbase = j0 + tx*4;
+    float acc[M][4];
+    #pragma unroll
+    for (int m = 0; m < M; m++)
+        #pragma unroll
+        for (int c = 0; c < 4; c++) acc[m][c] = 0.f;
+    for (int ic = ic0 + ty; ic < ic1; ic += TY) {
+        unsigned f = __ldg((const unsigned*)&idx[(size_t)ic*OC + jbase]);
+        float xx[M];
+        #pragma unroll
+        for (int m = 0; m < M; m++) xx[m] = __half2float(__ldg(&X[(size_t)m*IC + ic]));
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            unsigned char id = (f >> (8*c)) & 0xFF;
+            float w = __half2float(s_cb[id*CPB8 + tx*4 + c]);
+            #pragma unroll
+            for (int m = 0; m < M; m++) acc[m][c] += xx[m]*w;   // gemv8_partial: acc[c] += xx*w
+        }
+    }
+    __syncthreads();                                 // the codebook space becomes the reduction space
+    #pragma unroll
+    for (int mb = 0; mb < M; mb += MG) {
+        #pragma unroll
+        for (int mm = 0; mm < MG; mm++)
+            #pragma unroll
+            for (int c = 0; c < 4; c++) red[((size_t)mm*TY + ty)*CPB8 + tx*4 + c] = acc[mb + mm][c];
+        __syncthreads();
+        if (ty < MG) {
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                float s2 = 0;
+                for (int y = 0; y < TY; y++) s2 += red[((size_t)ty*TY + y)*CPB8 + tx*4 + c];
+                Ypart[((size_t)blockIdx.y*M + mb + ty)*OC + (j0 + tx*4 + c)] = s2;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// Reduces over the slices, row m = blockIdx.y, with the decode reduces' order and epilogues.
+__global__ void gemv_reduce_v(const float* __restrict__ Ypart, float* __restrict__ Y, int OC, int GSy, int M) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x, m = blockIdx.y;
+    if (i >= OC) return;
+    float s = 0;
+    for (int g = 0; g < GSy; g++) s += Ypart[((size_t)g*M + m)*OC + i];
+    Y[(size_t)m*OC + i] = s;
+}
+__global__ void gemv_reduce_half3_v(const float* __restrict__ Ypart,
+                                    __half* __restrict__ q, __half* __restrict__ k, __half* __restrict__ v,
+                                    const float* __restrict__ bq, const float* __restrict__ bk,
+                                    const float* __restrict__ bv, int oq, int ok, int OCt, int GSy, int M) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x, m = blockIdx.y;
+    if (i >= OCt) return;
+    float s = 0;
+    for (int g = 0; g < GSy; g++) s += Ypart[((size_t)g*M + m)*OCt + i];
+    int ov = OCt - oq - ok;
+    if (i < oq) {
+        if (bq) s += bq[i];
+        q[(size_t)m*oq + i] = __float2half(s);
+    } else if (i < oq + ok) {
+        int li = i - oq;
+        if (bk) s += bk[li];
+        k[(size_t)m*ok + li] = __float2half(s);
+    } else {
+        int li = i - oq - ok;
+        if (bv) s += bv[li];
+        v[(size_t)m*ov + li] = __float2half(s);
+    }
+}
+__global__ void gemv_reduce_silu_v(const float* __restrict__ Ypart, __half* __restrict__ out, int n, int GSy, int M) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x, m = blockIdx.y;
+    if (i >= n) return;
+    size_t OCt = (size_t)2*n;
+    float g = 0, u = 0;
+    for (int y = 0; y < GSy; y++) g += Ypart[((size_t)y*M + m)*OCt + i];
+    for (int y = 0; y < GSy; y++) u += Ypart[((size_t)y*M + m)*OCt + n + i];
+    float s = g / (1.f + expf(-g));
+    out[(size_t)m*n + i] = __float2half(s * u);
+}
+__global__ void gemv_reduce_resadd_v(const float* __restrict__ Ypart, __half* __restrict__ h, int OC, int GSy, int M) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x, m = blockIdx.y;
+    if (i >= OC) return;
+    float s = 0;
+    for (int g = 0; g < GSy; g++) s += Ypart[((size_t)g*M + m)*OC + i];
+    __half* hr = h + (size_t)m*OC;
+    hr[i] = __float2half(__half2float(hr[i]) + s);
+}
+
+
+// ============================================================================
+// Tensor-core 4-bit codebook GEMV (sm_80 and newer), shared by the decode (M = 1) and the
+// batch-invariant verify (M up to 16). mma.sync m16n8k16, f16 inputs, f32 accumulation.
+// Weights are the A operand (16 output columns x 16 input channels), read straight from the
+// [IC][OC/2] nibble bytes; the M token rows are the B operand (16 channels x 8 tokens per mma),
+// token n in B column n & 7 of mma n >> 3; tokens >= M are zero columns and are never stored.
+// What fixes the bits of an output: GS_TC slices of the k16-steps, TC_KC chains per slice
+// (chain c takes steps c, c+8, ...), each chain one mma accumulator chain in increasing step
+// order, the chains summed in order 0..7, the slices summed in order 0..3 by the *_v reduce
+// kernels, the k-slot permutation (slots 2t,2t+1,2t+8,2t+9 = channels 4t..4t+3 of the step) and
+// the column mapping (tile b of a 64-column group: A row g = column 8g+2b, row g+8 = 8g+2b+1).
+// None of these depends on M, on fusion, on the GPU, or on the scheduling knobs TC_CG, TC_U,
+// TC_WLOAD and the launch bounds, which can be tuned freely without changing a single bit.
+// ============================================================================
+#define TC_COLS 64      // columns per column group (one K-warp set)
+#define TC_KC 8         // accumulation chains (K-warps) per slice: fixes the bits
+#define GS_TC 4         // IC slices (grid.y): fixes the bits
+#ifndef TC_CG
+#define TC_CG 1         // column groups per CTA (1 or 2): scheduling only
+#endif
+#ifndef TC_U
+#define TC_U 4          // weight ring depth in k16-steps (2..6): scheduling only
+#endif
+#ifndef TC_WLOAD
+#define TC_WLOAD 1      // weight load form (0..3, see tc_ldw): scheduling only
+#endif
+
+__device__ __forceinline__ void tc_mma(float* d, unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                       unsigned b0, unsigned b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+}
+// Weights: streamed once per token, never reused by the SM: no L1 allocation; 1 = 128-B L2 fill.
+__device__ __forceinline__ unsigned tc_ldw(const unsigned char* p, unsigned long long pol) {
+    unsigned v;
+#if TC_WLOAD == 0
+    asm volatile("ld.global.nc.L1::no_allocate.b32 %0, [%1];" : "=r"(v) : "l"(p));
+#elif TC_WLOAD == 1
+    asm volatile("ld.global.nc.L1::no_allocate.L2::128B.b32 %0, [%1];" : "=r"(v) : "l"(p));
+#elif TC_WLOAD == 2
+    asm volatile("ld.global.nc.L1::no_allocate.L2::256B.b32 %0, [%1];" : "=r"(v) : "l"(p));
+#else
+    asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::128B.b32 %0, [%1], %2;" : "=r"(v) : "l"(p), "l"(pol));
+#endif
+    return v;
+}
+__device__ __forceinline__ unsigned long long tc_policy() {
+    unsigned long long pol = 0;
+#if TC_WLOAD == 3 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+#endif
+    return pol;
+}
+// Activations: 4 halves (8 bytes) through the read-only L1 path.
+__device__ __forceinline__ uint2 tc_ldx(const __half* p) {
+    uint2 v;
+    asm volatile("ld.global.nc.v2.b32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ unsigned tc_pack(unsigned lo, unsigned hi) {   // = __byte_perm(lo, hi, 0x5410)
+    unsigned r;
+    asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(r) : "r"(lo), "r"(hi));
+    return r;
+}
+
+// One k16-step of one warp: the 4 index words of rows 16s+4t+j (j = 0..3) -> 4 tiles x NH mma.
+template <int NH>
+__device__ __forceinline__ void tc_step(const unsigned (&w)[4], const uint2 (&xb)[NH], const unsigned char* lut,
+                                        const unsigned (&base)[4], float (&acc)[4][NH][4]) {
+    #pragma unroll
+    for (int b = 0; b < 4; b++) {
+        unsigned ev[4], od[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            // nibble of column 8g+2b (low, A row g) and of 8g+2b+1 (high, A row g+8), moved to bits 8..11
+            unsigned xe = b == 0 ? (w[j] << 8) : (b == 1 ? w[j] : (w[j] >> (8 * b - 8)));
+            unsigned xo = b == 0 ? (w[j] << 4) : (w[j] >> (8 * b - 4));
+            ev[j] = *(const unsigned short*)(lut + ((xe & 0xF00u) | base[b]));
+            od[j] = *(const unsigned short*)(lut + ((xo & 0xF00u) | base[b]) + 2);
+        }
+        const unsigned a0 = tc_pack(ev[0], ev[1]);   // A[g][slots 2t, 2t+1]     = channels 4t, 4t+1
+        const unsigned a1 = tc_pack(od[0], od[1]);   // A[g+8][slots 2t, 2t+1]
+        const unsigned a2 = tc_pack(ev[2], ev[3]);   // A[g][slots 2t+8, 2t+9]   = channels 4t+2, 4t+3
+        const unsigned a3 = tc_pack(od[2], od[3]);   // A[g+8][slots 2t+8, 2t+9]
+        #pragma unroll
+        for (int h = 0; h < NH; h++) tc_mma(acc[b][h], a0, a1, a2, a3, xb[h].x, xb[h].y);
+    }
+}
+
+// Ypart [GS_TC][M][OCt] (partial of slice y, row m, concatenated column j). NH = 1 for M <= 8, 2 for M <= 16.
+// Up to three projections sharing IC (q, k, v or gate, up) run as one launch over their concatenated
+// columns; a CTA finds its projection from its first column (every OC is a multiple of 256).
+template <int NH, int CG, int U>
+__global__ void __launch_bounds__(CG * TC_KC * 32, CG == 1 ? (NH == 1 ? 3 : 2) : 1)
+gemv4_tc(const __half* __restrict__ X, int M,
+         const unsigned char* __restrict__ p0, const unsigned char* __restrict__ p1,
+         const unsigned char* __restrict__ p2,
+         const __half* __restrict__ c0, const __half* __restrict__ c1, const __half* __restrict__ c2,
+         int oc0, int oc1, int oc2, float* __restrict__ Ypart, int IC, int OCt) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __shared__ __align__(16) unsigned tc_lut[CG * 2048];       // 4 rotated codebook copies per group, 8 KB
+    extern __shared__ __align__(16) float4 tc_red[];           // [CG][TC_KC][NH][4 tiles][32 lanes]
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int cg = CG == 1 ? 0 : (warp >> 3), kw = warp & 7, g = lane >> 2, t = lane & 3;
+    const int jb = blockIdx.x * (TC_COLS * CG);                 // CTA's first column, concatenated space
+    const int sg = jb < oc0 ? 0 : (jb < oc0 + oc1 ? 1 : 2);
+    const unsigned char* packed = sg == 0 ? p0 : (sg == 1 ? p1 : p2);
+    const __half* cb = sg == 0 ? c0 : (sg == 1 ? c1 : c2);
+    const int OC = sg == 0 ? oc0 : (sg == 1 ? oc1 : oc2);
+    const int jp = jb - (sg == 0 ? 0 : (sg == 1 ? oc0 : oc0 + oc1));   // CTA's first column inside projection sg
+    const int j0 = jp + cg * TC_COLS;                           // this warp's column group
+    const size_t OCp = (size_t)(OC >> 1);
+    const int NS = IC >> 4, y = blockIdx.y;                     // k16-steps; slice y = [s0, s1)
+    const int s0 = (y * NS) / GS_TC, s1 = ((y + 1) * NS) / GS_TC;
+    const int n = s1 - s0 > kw ? (s1 - s0 - kw + TC_KC - 1) / TC_KC : 0;   // steps of chain kw
+    const unsigned char* wp = packed + (size_t)(16 * (s0 + kw) + 4 * t) * OCp + (j0 >> 1) + 4 * g;
+    const size_t wstep = (size_t)(16 * TC_KC) * OCp;            // a chain advances 128 rows per step
+    const unsigned long long pol = tc_policy();
+    // 1) the weight ring first (DRAM latency), 2) step 0 activations, 3) the codebook tables
+    unsigned ring[U][4];
+    #pragma unroll
+    for (int u = 0; u < U; u++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) ring[u][j] = u < n ? tc_ldw(wp + (size_t)u * wstep + (size_t)j * OCp, pol) : 0u;
+    const __half* xp = X + (size_t)g * IC + 16 * (s0 + kw) + 4 * t;   // token g (+8h), channels 16s+4t..+3
+    uint2 xb[NH];
+    #pragma unroll
+    for (int h = 0; h < NH; h++) {
+        xb[h] = make_uint2(0u, 0u);
+        if (8 * h + g < M && n > 0) xb[h] = tc_ldx(xp + (size_t)(8 * h) * IC);
+    }
+    {   // thread r of group cgs: entry k = r >> 4, column pairs jj, jj + 1 (columns 2jj .. 2jj+3)
+        const int cgs = tid >> 8, r = tid & 255, k = r >> 4, jj = 2 * (r & 15);
+        const uint2 pr = *(const uint2*)(cb + (size_t)k * OC + jp + cgs * TC_COLS + 2 * jj);
+        unsigned* L = tc_lut + cgs * 2048;
+        #pragma unroll
+        for (int u = 0; u < 4; u++) {   // word (u>>1)*1024 + k*64 + (u&1)*32 + 4*(j>>2) + ((j&3)+u)&3
+            const int wb = (u >> 1) * 1024 + k * 64 + (u & 1) * 32 + 4 * (jj >> 2);
+            L[wb + (((jj & 3) + u) & 3)] = pr.x;
+            L[wb + ((((jj + 1) & 3) + u) & 3)] = pr.y;
+        }
+    }
+    unsigned base[4];   // byte offset of the lane's word for tile b, entry 0, inside tc_lut (bits 2..7, 12, 13)
+    #pragma unroll
+    for (int b = 0; b < 4; b++) base[b] = cg * 8192 + (t >> 1) * 4096 + (t & 1) * 128 + 16 * g + 4 * ((b + t) & 3);
+    const unsigned char* lut = (const unsigned char*)tc_lut;
+    float acc[4][NH][4];
+    #pragma unroll
+    for (int b = 0; b < 4; b++)
+        #pragma unroll
+        for (int h = 0; h < NH; h++) acc[b][h][0] = acc[b][h][1] = acc[b][h][2] = acc[b][h][3] = 0.f;
+    __syncthreads();
+    // chain kw: steps s0 + kw + 8i, i = 0 .. n-1, in increasing order
+    for (int i0 = 0; i0 < n; i0 += U) {
+        #pragma unroll
+        for (int u = 0; u < U; u++) {
+            const int i = i0 + u;
+            if (i < n) {
+                uint2 xn[NH];                                   // activations of step i + 1
+                #pragma unroll
+                for (int h = 0; h < NH; h++) {
+                    xn[h] = make_uint2(0u, 0u);
+                    if (8 * h + g < M && i + 1 < n) xn[h] = tc_ldx(xp + (size_t)(8 * h) * IC + (size_t)(i + 1) * (16 * TC_KC));
+                }
+                tc_step<NH>(ring[u], xb, lut, base, acc);
+                if (i + U < n) {
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) ring[u][j] = tc_ldw(wp + (size_t)(i + U) * wstep + (size_t)j * OCp, pol);
+                }
+                #pragma unroll
+                for (int h = 0; h < NH; h++) xb[h] = xn[h];
+            }
+        }
+    }
+    // chain partials to shared memory: unit ((cg*8 + kw)*NH + h)*128 + b*32 + (lane ^ b)
+    #pragma unroll
+    for (int h = 0; h < NH; h++)
+        #pragma unroll
+        for (int b = 0; b < 4; b++)
+            tc_red[((cg * TC_KC + kw) * NH + h) * 128 + b * 32 + (lane ^ b)] =
+                make_float4(acc[b][h][0], acc[b][h][1], acc[b][h][2], acc[b][h][3]);
+    __syncthreads();
+    {   // thread (cgs, h, tt, gg, b): columns 8gg+2b, +1 of group cgs, tokens 8h+2tt, +1; chains summed 0..7
+        const int cgs = tid >> 8, r = tid & 255;
+        const int h = r >> 7, tt = (r >> 5) & 3, q = r & 31, gg = q >> 2, b = q & 3;
+        const int tok = 8 * h + 2 * tt;
+        if (h < NH && tok < M) {
+            const int unit = (cgs * TC_KC * NH + h) * 128 + b * 32 + ((4 * gg + tt) ^ b);
+            float4 v = tc_red[unit];
+            #pragma unroll
+            for (int c = 1; c < TC_KC; c++) {
+                const float4 e = tc_red[unit + c * NH * 128];
+                v.x += e.x; v.y += e.y; v.z += e.z; v.w += e.w;
+            }
+            float* yr = Ypart + ((size_t)y * M + tok) * OCt + jb + cgs * TC_COLS + 8 * gg + 2 * b;
+            *(float2*)yr = make_float2(v.x, v.z);                          // token tok: d0, d2
+            if (tok + 1 < M) *(float2*)(yr + OCt) = make_float2(v.y, v.w); // token tok+1: d1, d3
+        }
+    }
+#else
+    __trap();   // sm_70/75 fatbin entries: never launched (tc_enabled checks the device and the binary)
+#endif
+}
+
+// rmsnorm_k (thr 0) on row blockIdx.x.
+__global__ void rmsnorm_v(const __half* __restrict__ x, const float* __restrict__ w,
+                          __half* __restrict__ out, int n, float eps) {
+    __shared__ float red[256];
+    int tid = threadIdx.x;
+    const __half* xr = x + (size_t)blockIdx.x*n;
+    __half* orow = out + (size_t)blockIdx.x*n;
+    float ss = 0;
+    for (int i = tid; i < n; i += 256) { float v = __half2float(xr[i]); ss += v*v; }
+    red[tid] = ss; __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid+s]; __syncthreads(); }
+    float scale = rsqrtf(red[0]/n + eps);
+    for (int i = tid; i < n; i += 256) orow[i] = __float2half(__half2float(xr[i]) * scale * w[i]);
+}
+
+// rope_append_k on row m = blockIdx.y at position base + m (base = d_tp[1] on the graph path).
+__global__ void rope_append_v(__half* __restrict__ q, __half* __restrict__ k, const __half* __restrict__ v,
+                              __half* __restrict__ cache_k, __half* __restrict__ cache_v, int base_arg,
+                              const int* __restrict__ d_tp, int n_heads, int n_kv, int head_dim,
+                              const float* __restrict__ inv_freq) {
+    int t = blockIdx.x*blockDim.x + threadIdx.x, m = blockIdx.y;
+    int half = head_dim/2;
+    int pos = (d_tp ? d_tp[1] : base_arg) + m;
+    int nq = n_heads*half, nk = n_kv*half, kvdim = n_kv*head_dim, qdim = n_heads*head_dim;
+    __half* qr = q + (size_t)m*qdim;
+    __half* kr = k + (size_t)m*kvdim;
+    const __half* vr = v + (size_t)m*kvdim;
+    if (t < nq) {
+        rope_pair(qr, qr, t / half, t % half, pos, head_dim, inv_freq);
+    } else if (t < nq + nk) {
+        int u = t - nq, h = u / half, d = u % half;
+        rope_pair(kr, kr, h, d, pos, head_dim, inv_freq);
+        __half* row = cache_k + (size_t)pos*kvdim;
+        int i = h*head_dim + d, j = i + half;
+        row[i] = kr[i];
+        row[j] = kr[j];
+    } else if (t < nq + nk + kvdim) {
+        int i = t - nq - nk;
+        cache_v[(size_t)pos*kvdim + i] = vr[i];
+    }
+}
+
+// Split-KV attention for query row m = blockIdx.z (position base + m, length base + m + 1): the
+// decode bodies on that row's q, partial records and output.
+template <int PER>
+__global__ void attn_split_v(const __half* __restrict__ q, const __half* __restrict__ ck,
+                             const __half* __restrict__ cv, float* __restrict__ part,
+                             int n_heads, int n_kv, int base_arg, const int* __restrict__ d_tp,
+                             float softcap, int stride_chunks) {
+    const int HD = PER * 32;
+    int m = blockIdx.z;
+    int seqlen = (d_tp ? d_tp[1] : base_arg) + m + 1;
+    attn_split_body<PER>(q + (size_t)m*n_heads*HD, ck, cv, part + (size_t)m*n_heads*stride_chunks*(HD + 2),
+                         n_heads, n_kv, seqlen, softcap, stride_chunks);
+}
+__global__ void attn_merge_v(const float* __restrict__ part, __half* __restrict__ out, int n_heads, int head_dim,
+                             int base_arg, const int* __restrict__ d_tp, int stride_chunks) {
+    int m = blockIdx.y;
+    int seqlen = (d_tp ? d_tp[1] : base_arg) + m + 1;
+    attn_merge_body(part + (size_t)m*n_heads*stride_chunks*((size_t)head_dim + 2), out + (size_t)m*n_heads*head_dim,
+                    head_dim, seqlen, stride_chunks);
+}
+
+// Row-wise argmax (row m = blockIdx.y in stage 1, blockIdx.x in stage 2), argmax_stage1/2's rules:
+// the largest value, the smallest index on a tie.
+__global__ void argmax_v_stage1(const float* __restrict__ x, int n, int ld,
+                                float* __restrict__ out_val, unsigned* __restrict__ out_idx) {
+    __shared__ float sval[256];
+    __shared__ unsigned sidx[256];
+    int tid = threadIdx.x;
+    const float* xr = x + (size_t)blockIdx.y*ld;
+    unsigned stride = blockDim.x * gridDim.x;
+    float bv = -INFINITY; unsigned bi = 0;
+    for (unsigned i = blockIdx.x*blockDim.x + tid; i < (unsigned)n; i += stride) {
+        float v = xr[i];
+        if (v > bv) { bv = v; bi = i; }
+    }
+    sval[tid] = bv; sidx[tid] = bi;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = sval[tid+s]; unsigned oi = sidx[tid+s];
+            if (ov > sval[tid] || (ov == sval[tid] && oi < sidx[tid])) { sval[tid] = ov; sidx[tid] = oi; }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) { out_val[blockIdx.y*gridDim.x + blockIdx.x] = sval[0]; out_idx[blockIdx.y*gridDim.x + blockIdx.x] = sidx[0]; }
+}
+__global__ void argmax_v_stage2(const float* __restrict__ in_val, const unsigned* __restrict__ in_idx,
+                                int np, unsigned* __restrict__ out) {
+    __shared__ float sval[256];
+    __shared__ unsigned sidx[256];
+    int tid = threadIdx.x, m = blockIdx.x;
+    float bv = -INFINITY; unsigned bi = 0xffffffffu;
+    for (int i = tid; i < np; i += blockDim.x) {
+        float v = in_val[m*np + i]; unsigned id = in_idx[m*np + i];
+        if (v > bv || (v == bv && id < bi)) { bv = v; bi = id; }
+    }
+    sval[tid] = bv; sidx[tid] = bi;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = sval[tid+s]; unsigned oi = sidx[tid+s];
+            if (ov > sval[tid] || (ov == sval[tid] && oi < sidx[tid])) { sval[tid] = ov; sidx[tid] = oi; }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out[m] = sidx[0];
+}
+
 struct AvqLin { unsigned char* d_codes; __half* d_cb; __half* d_scale; int M, IC, OC; };
 
 struct QLinear { unsigned char* d_packed; __half* d_cb; int IC, OC, K_; };
+
+// Host helpers of the verify path (templates: outside the extern "C" block).
+static void verify_need_t(bool ok, const char* what) {
+    if (!ok) { fprintf(stderr, "trapetum: batch-invariant verify: %s\n", what); abort(); }
+}
+template <int M>
+static void launch_partial_v_m(const __half* X, QLinear* a, QLinear* b, QLinear* c, int o0, int o1, int o2,
+                               float* yp, int OCt, int gy) {
+    constexpr int CPT = M <= 4 ? 8 : 4;
+    constexpr int CPBV = 32 * CPT;
+    constexpr int MG = M < TY ? M : TY;
+    size_t smem = (size_t)K*CPBV*sizeof(__half) + (size_t)MG*TY*CPBV*sizeof(float);   // at most 40 KB
+    dim3 grid(OCt/CPBV, gy), block(32, TY);
+    gemv4_partial_v<M, CPT><<<grid, block, smem, g_stream>>>(X, a->d_packed, b->d_packed, c->d_packed,
+                                                             a->d_cb, b->d_cb, c->d_cb, o0, o1, o2, yp, a->IC, OCt);
+}
+// One verify GEMV over up to three projections' concatenated columns (each OC a multiple of CPB).
+static void launch_partial_v(int M, QLinear* const* ps, int n, const void* d_x, float* yp, int OCt, int gy) {
+    QLinear* a = ps[0];
+    QLinear* b = n > 1 ? ps[1] : ps[0];
+    QLinear* c = n > 2 ? ps[2] : b;              // unused third projection: oc 0, never selected
+    int o0 = a->OC, o1 = n > 1 ? b->OC : 0, o2 = n > 2 ? c->OC : 0;
+    const __half* X = (const __half*)d_x;
+    switch (M) {
+        case 1: launch_partial_v_m<1>(X, a, b, c, o0, o1, o2, yp, OCt, gy); break;
+        case 2: launch_partial_v_m<2>(X, a, b, c, o0, o1, o2, yp, OCt, gy); break;
+        case 4: launch_partial_v_m<4>(X, a, b, c, o0, o1, o2, yp, OCt, gy); break;
+        case 8: launch_partial_v_m<8>(X, a, b, c, o0, o1, o2, yp, OCt, gy); break;
+        case 16: launch_partial_v_m<16>(X, a, b, c, o0, o1, o2, yp, OCt, gy); break;
+        default: verify_need_t(false, "M must be 1, 2, 4, 8 or 16");
+    }
+}
+template <int M>
+static void launch_gemv8_v_m(const __half* X, QLinear* q, float* yp, int gy) {
+    size_t smem = (size_t)K8*CPB8*sizeof(__half);   // the codebook; the reduction (32 KB) reuses it
+    static bool once = false;                        // one per instantiation; set on the eager first call
+    if (!once) {
+        cudaError_t e = cudaFuncSetAttribute(gemv8_partial_v<M>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        verify_need_t(e == cudaSuccess, "cannot give the 8-bit verify GEMV its shared memory");
+        once = true;
+    }
+    dim3 grid(q->OC/CPB8, gy), block(32, TY);
+    gemv8_partial_v<M><<<grid, block, smem, g_stream>>>(X, q->d_packed, q->d_cb, yp, q->IC, q->OC);
+}
+
+
+// ---- Tensor-core GEMV, host side ----------------------------------------------------------------
+// Decided once, at the first qlinear_create (load time, never inside a capture): TRAPETUM_TC=0 turns
+// it off; it needs a compute capability 8.x+ device AND real sm_80+ code in the binary (a CUDA_ARCH=sm_75
+// build JIT-run on an sm_89 board reports binaryVersion 89 but ptxVersion 75, and its body is the trap).
+template <int NH>
+static bool tc_prepare_kernel() {
+    cudaFuncAttributes fa;
+    if (cudaFuncGetAttributes(&fa, gemv4_tc<NH, TC_CG, TC_U>) != cudaSuccess) { cudaGetLastError(); return false; }
+    if (fa.binaryVersion < 80 || fa.ptxVersion < 80) return false;
+    size_t dyn = (size_t)TC_CG * TC_KC * NH * 128 * sizeof(float4);
+    if (fa.sharedSizeBytes + dyn > 48 * 1024 &&
+        cudaFuncSetAttribute(gemv4_tc<NH, TC_CG, TC_U>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    cudaFuncSetAttribute(gemv4_tc<NH, TC_CG, TC_U>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaGetLastError();               // the carveout is a hint; ignore a refusal
+    return true;
+}
+static int tc_compute() {
+    const char* e = getenv("TRAPETUM_TC");
+    if (e && e[0] == '0' && e[1] == 0) return 0;
+    int dev = 0, major = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    if (major < 8 || !tc_prepare_kernel<1>() || !tc_prepare_kernel<2>()) return 0;
+    return 1;
+}
+// A function-local static is initialized exactly once, thread-safely (C++11): a second thread that
+// loads a model at the same time waits for the final answer instead of reading a provisional one,
+// so every GEMV of the process takes the same path.
+static int tc_enabled() {
+    static const int v = tc_compute();
+    return v;
+}
+// The dispatch rule, the same for the decode and the verify: a group of K=16 projections sharing IC
+// (q/k/v, gate/up, o, down, a 4-bit head) takes the tensor-core path iff this holds.
+static bool tc_on() { return tc_enabled() && det_mode() == 2 && !g_sparse_rows; }
+static bool tc_group_ok(QLinear* const* ps, int n) {
+    if (!tc_on()) return false;
+    for (int i = 0; i < n; i++)
+        if (ps[i]->K_ != 16 || ps[i]->IC != ps[0]->IC || ps[i]->IC % 16 != 0 || ps[i]->OC % (TC_COLS * TC_CG) != 0)
+            return false;
+    return true;
+}
+// Partials of M rows (x [M][IC], 16-byte aligned) into yp [GS_TC][M][OCt]; the caller reduces with a *_v kernel.
+static void launch_tc(int M, QLinear* const* ps, int n, const void* d_x, float* yp, int OCt) {
+    verify_need_t(M >= 1 && M <= VMAX, "tensor-core GEMV: M must be 1 to 16");
+    verify_need_t(((size_t)d_x & 15) == 0, "tensor-core GEMV: the input must be 16-byte aligned");
+    QLinear* a = ps[0];
+    QLinear* b = n > 1 ? ps[1] : a;
+    QLinear* c = n > 2 ? ps[2] : b;              // unused third projection: oc 0, never selected
+    int o0 = a->OC, o1 = n > 1 ? b->OC : 0, o2 = n > 2 ? c->OC : 0;
+    dim3 grid(OCt / (TC_COLS * TC_CG), GS_TC), block(32 * TC_KC * TC_CG);
+    const __half* X = (const __half*)d_x;
+    if (M <= 8)
+        gemv4_tc<1, TC_CG, TC_U><<<grid, block, (size_t)TC_CG * TC_KC * 1 * 128 * sizeof(float4), g_stream>>>(
+            X, M, a->d_packed, b->d_packed, c->d_packed, a->d_cb, b->d_cb, c->d_cb, o0, o1, o2, yp, a->IC, OCt);
+    else
+        gemv4_tc<2, TC_CG, TC_U><<<grid, block, (size_t)TC_CG * TC_KC * 2 * 128 * sizeof(float4), g_stream>>>(
+            X, M, a->d_packed, b->d_packed, c->d_packed, a->d_cb, b->d_cb, c->d_cb, o0, o1, o2, yp, a->IC, OCt);
+}
 
 extern "C" {
 
@@ -1002,6 +1629,7 @@ void* qlinear_create(const unsigned char* packed, const float* cb_f32, int IC, i
     cudaMalloc(&q->d_cb, ncb*sizeof(__half));
     cudaMemcpy(q->d_cb, cb_h, ncb*sizeof(__half), cudaMemcpyHostToDevice);
     free(cb_h);
+    (void)tc_enabled();   // decided at load, never inside a capture
     return q;
 }
 
@@ -1063,6 +1691,13 @@ void qlinear_forward_dev(void* handle, const void* d_x, void* d_y) {
         cudaMemsetAsync(d_y, 0, (size_t)q->OC*sizeof(float), g_stream);
         dim3 grid(q->OC/CPB8, gy8), block(32, TY);
         gemv8<<<grid, block, smem8, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, (float*)d_y, q->IC, q->OC);
+        return;
+    }
+    QLinear* ps1[1] = {q};
+    if (tc_group_ok(ps1, 1)) {                       // tensor-core path (sm_80+, mode 2, no sparsity)
+        float* yp = ypart((size_t)GS_TC * q->OC);
+        launch_tc(1, ps1, 1, d_x, yp, q->OC);
+        gemv_reduce_v<<<dim3((q->OC + 255)/256, 1), 256, 0, g_stream>>>(yp, (float*)d_y, q->OC, GS_TC, 1);
         return;
     }
     size_t smem = (size_t)K*CPB*sizeof(__half) + (size_t)TY*CPB*sizeof(float);
@@ -1635,6 +2270,14 @@ void qlinear3_forward_half(void* hq, void* hk, void* hv, const void* d_x,
                            const void* bq, const void* bk, const void* bv) {
     ensure_stream();
     QLinear* ps[3] = {(QLinear*)hq, (QLinear*)hk, (QLinear*)hv};
+    if ((fuse_mask() & 4) && tc_group_ok(ps, 3)) {
+        int OCt = ps[0]->OC + ps[1]->OC + ps[2]->OC;
+        float* yp = ypart((size_t)GS_TC * OCt);
+        launch_tc(1, ps, 3, d_x, yp, OCt);
+        gemv_reduce_half3_v<<<dim3((OCt + 255)/256, 1), 256, 0, g_stream>>>(yp, (__half*)qh, (__half*)kh, (__half*)vh,
+            (const float*)bq, (const float*)bk, (const float*)bv, ps[0]->OC, ps[1]->OC, OCt, GS_TC, 1);
+        return;
+    }
     if (fuse_ok(ps, 3, 4)) {
         int gy = det_gs();
         int OCt = ps[0]->OC + ps[1]->OC + ps[2]->OC;
@@ -1660,6 +2303,13 @@ void qlinear3_forward_half(void* hq, void* hk, void* hv, const void* d_x,
 void qlinear2_forward_silu(void* hg, void* hu, const void* d_x, void* gf, void* uf, void* act_h, float thr) {
     ensure_stream();
     QLinear* ps[2] = {(QLinear*)hg, (QLinear*)hu};
+    if ((fuse_mask() & 8) && thr == 0.f && ps[0]->OC == ps[1]->OC && tc_group_ok(ps, 2)) {
+        int n = ps[0]->OC, OCt = 2*n;
+        float* yp = ypart((size_t)GS_TC * OCt);
+        launch_tc(1, ps, 2, d_x, yp, OCt);
+        gemv_reduce_silu_v<<<dim3((n + 255)/256, 1), 256, 0, g_stream>>>(yp, (__half*)act_h, n, GS_TC, 1);
+        return;
+    }
     if (fuse_ok(ps, 2, 8) && ps[0]->OC == ps[1]->OC) {
         int gy = det_gs();
         int n = ps[0]->OC, OCt = 2*n;
@@ -1679,6 +2329,13 @@ void qlinear2_forward_silu(void* hg, void* hu, const void* d_x, void* gf, void* 
 void qlinear_forward_resadd(void* handle, const void* d_x, void* yf, void* h_half) {
     ensure_stream();
     QLinear* ps[1] = {(QLinear*)handle};
+    if ((fuse_mask() & 2) && tc_group_ok(ps, 1)) {
+        QLinear* q = ps[0];
+        float* yp = ypart((size_t)GS_TC * q->OC);
+        launch_tc(1, ps, 1, d_x, yp, q->OC);
+        gemv_reduce_resadd_v<<<dim3((q->OC + 255)/256, 1), 256, 0, g_stream>>>(yp, (__half*)h_half, q->OC, GS_TC, 1);
+        return;
+    }
     if (fuse_ok(ps, 1, 2)) {
         QLinear* q = ps[0];
         int gy = det_gs();
@@ -1718,6 +2375,234 @@ void op_rope_append(void* q_half, void* k_half, const void* v_half, void* cache_
     int total = n_heads*(head_dim/2) + n_kv*(head_dim/2) + kvdim;
     rope_append_k<<<(total + 255)/256, 256, 0, g_stream>>>((__half*)q_half, (__half*)k_half, (const __half*)v_half,
         (__half*)cache_k, (__half*)cache_v, pos, (const int*)d_tp, n_heads, n_kv, head_dim, (const float*)inv_freq);
+}
+
+// ---- Batch-invariant verify, host side (see the kernels above gemv4_partial_v) ---------------
+// It reproduces the default deterministic decode path only: two-stage GEMVs (mode 2, more than
+// one IC slice) and the split-KV attention.
+int verify_supported(void) {
+    return det_mode() == 2 && det_gs() > 1 && det_gs8() > 1 && attn_mode() == 1;
+}
+static void verify_need(bool ok, const char* what) {
+    if (!ok) { fprintf(stderr, "trapetum: batch-invariant verify: %s\n", what); abort(); }
+}
+static void verify_check_projs(QLinear* const* ps, int n) {
+    verify_need(verify_supported(), "needs the default deterministic decode path (TRAPETUM_DETERMINISTIC=2, split-KV attention)");
+    for (int i = 0; i < n; i++)
+        verify_need(ps[i]->K_ == 16 && ps[i]->IC == ps[0]->IC && ps[i]->OC % CPB == 0,
+                    "needs 4-bit (K=16) projections that share their input width");
+}
+// q, k, v of M rows (x [M][IC]): one verify GEMV, then the reduce (bias, cast to half) into
+// q [M][oq], k [M][ok], v [M][ov].
+void qlinear3_forward_half_v(void* hq, void* hk, void* hv, const void* d_x, void* qh, void* kh, void* vh,
+                             const void* bq, const void* bk, const void* bv, int M) {
+    ensure_stream();
+    QLinear* ps[3] = {(QLinear*)hq, (QLinear*)hk, (QLinear*)hv};
+    int gy = det_gs();
+    if (tc_group_ok(ps, 3)) {                        // same rule as the decode: the same kernel and bits
+        verify_need(verify_supported(), "needs the default deterministic decode path");
+        gy = GS_TC;
+        int OCt = ps[0]->OC + ps[1]->OC + ps[2]->OC;
+        float* yp = ypart((size_t)gy * M * OCt);
+        launch_tc(M, ps, 3, d_x, yp, OCt);
+        dim3 grid((OCt + 255)/256, M);
+        gemv_reduce_half3_v<<<grid, 256, 0, g_stream>>>(yp, (__half*)qh, (__half*)kh, (__half*)vh,
+            (const float*)bq, (const float*)bk, (const float*)bv, ps[0]->OC, ps[1]->OC, OCt, gy, M);
+        return;
+    }
+    verify_check_projs(ps, 3);
+    int OCt = ps[0]->OC + ps[1]->OC + ps[2]->OC;
+    float* yp = ypart((size_t)gy * M * OCt);
+    launch_partial_v(M, ps, 3, d_x, yp, OCt, gy);
+    dim3 grid((OCt + 255)/256, M);
+    gemv_reduce_half3_v<<<grid, 256, 0, g_stream>>>(yp, (__half*)qh, (__half*)kh, (__half*)vh,
+        (const float*)bq, (const float*)bk, (const float*)bv, ps[0]->OC, ps[1]->OC, OCt, gy, M);
+}
+// gate, up of M rows: one verify GEMV, then both reductions and SiLU(gate) * up into act [M][n].
+void qlinear2_forward_silu_v(void* hg, void* hu, const void* d_x, void* act_h, int M) {
+    ensure_stream();
+    QLinear* ps[2] = {(QLinear*)hg, (QLinear*)hu};
+    verify_need(ps[0]->OC == ps[1]->OC, "gate and up must have the same width");
+    if (tc_group_ok(ps, 2)) {
+        verify_need(verify_supported(), "needs the default deterministic decode path");
+        int n = ps[0]->OC, OCt = 2*n;
+        float* yp = ypart((size_t)GS_TC * M * OCt);
+        launch_tc(M, ps, 2, d_x, yp, OCt);
+        dim3 grid((n + 255)/256, M);
+        gemv_reduce_silu_v<<<grid, 256, 0, g_stream>>>(yp, (__half*)act_h, n, GS_TC, M);
+        return;
+    }
+    verify_check_projs(ps, 2);
+    int gy = det_gs();
+    int n = ps[0]->OC, OCt = 2*n;
+    float* yp = ypart((size_t)gy * M * OCt);
+    launch_partial_v(M, ps, 2, d_x, yp, OCt, gy);
+    dim3 grid((n + 255)/256, M);
+    gemv_reduce_silu_v<<<grid, 256, 0, g_stream>>>(yp, (__half*)act_h, n, gy, M);
+}
+// o or down of M rows, the residual add into h [M][OC] folded into the reduce.
+void qlinear_forward_resadd_v(void* handle, const void* d_x, void* h_half, int M) {
+    ensure_stream();
+    QLinear* ps[1] = {(QLinear*)handle};
+    QLinear* q = ps[0];
+    if (tc_group_ok(ps, 1)) {
+        verify_need(verify_supported(), "needs the default deterministic decode path");
+        float* yp = ypart((size_t)GS_TC * M * q->OC);
+        launch_tc(M, ps, 1, d_x, yp, q->OC);
+        dim3 grid((q->OC + 255)/256, M);
+        gemv_reduce_resadd_v<<<grid, 256, 0, g_stream>>>(yp, (__half*)h_half, q->OC, GS_TC, M);
+        return;
+    }
+    verify_check_projs(ps, 1);
+    int gy = det_gs();
+    float* yp = ypart((size_t)gy * M * q->OC);
+    launch_partial_v(M, ps, 1, d_x, yp, q->OC, gy);
+    dim3 grid((q->OC + 255)/256, M);
+    gemv_reduce_resadd_v<<<grid, 256, 0, g_stream>>>(yp, (__half*)h_half, q->OC, gy, M);
+}
+// y [M][OC] f32 = x [M][IC] W^T for a 4-bit or 8-bit projection (the LM head).
+void qlinear_forward_v(void* handle, const void* d_x, void* d_y, int M) {
+    ensure_stream();
+    QLinear* q = (QLinear*)handle;
+    if (q->K_ == 256) {
+        verify_need(verify_supported(), "needs the default deterministic decode path");
+        int gy = det_gs8();
+        float* yp = ypart((size_t)gy * M * q->OC);
+        const __half* X = (const __half*)d_x;
+        switch (M) {
+            case 1: launch_gemv8_v_m<1>(X, q, yp, gy); break;
+            case 2: launch_gemv8_v_m<2>(X, q, yp, gy); break;
+            case 4: launch_gemv8_v_m<4>(X, q, yp, gy); break;
+            case 8: launch_gemv8_v_m<8>(X, q, yp, gy); break;
+            case 16: launch_gemv8_v_m<16>(X, q, yp, gy); break;
+            default: verify_need(false, "M must be 1, 2, 4, 8 or 16");
+        }
+        dim3 grid((q->OC + 255)/256, M);
+        gemv_reduce_v<<<grid, 256, 0, g_stream>>>(yp, (float*)d_y, q->OC, gy, M);
+        return;
+    }
+    QLinear* ps[1] = {q};
+    if (tc_group_ok(ps, 1)) {
+        verify_need(verify_supported(), "needs the default deterministic decode path");
+        float* yp = ypart((size_t)GS_TC * M * q->OC);
+        launch_tc(M, ps, 1, d_x, yp, q->OC);
+        dim3 grid((q->OC + 255)/256, M);
+        gemv_reduce_v<<<grid, 256, 0, g_stream>>>(yp, (float*)d_y, q->OC, GS_TC, M);
+        return;
+    }
+    verify_check_projs(ps, 1);
+    int gy = det_gs();
+    float* yp = ypart((size_t)gy * M * q->OC);
+    launch_partial_v(M, ps, 1, d_x, yp, q->OC, gy);
+    dim3 grid((q->OC + 255)/256, M);
+    gemv_reduce_v<<<grid, 256, 0, g_stream>>>(yp, (float*)d_y, q->OC, gy, M);
+}
+void op_rmsnorm_v(const void* x_half, const void* w_f32, void* out_half, int n, float eps, int M) {
+    ensure_stream();
+    rmsnorm_v<<<M, 256, 0, g_stream>>>((const __half*)x_half, (const float*)w_f32, (__half*)out_half, n, eps);
+}
+// RoPE on q and k of M rows and their KV-cache rows base .. base+M-1 (base = d_tp[1] when d_tp is set).
+void op_rope_append_v(void* q_half, void* k_half, const void* v_half, void* cache_k, void* cache_v,
+                      int base, const void* d_tp, int n_heads, int n_kv, int head_dim, const void* inv_freq, int M) {
+    ensure_stream();
+    int total = n_heads*(head_dim/2) + n_kv*(head_dim/2) + n_kv*head_dim;
+    dim3 grid((total + 255)/256, M);
+    rope_append_v<<<grid, 256, 0, g_stream>>>((__half*)q_half, (__half*)k_half, (const __half*)v_half,
+        (__half*)cache_k, (__half*)cache_v, base, (const int*)d_tp, n_heads, n_kv, head_dim, (const float*)inv_freq);
+}
+// The verify path's attention partial records: M rows of n_heads x chunks(max_seq), reserved on
+// the eager first call (never during a capture), never freed once a graph may hold it.
+static float* g_attn_part_v = nullptr;
+static size_t g_attn_part_v_cap = 0;
+void attn_reserve_v(int n_heads, int head_dim, int max_seq, int M) {
+    ensure_stream();
+    size_t need = (size_t)M * n_heads * attn_chunks(max_seq) * ((size_t)head_dim + 2);
+    if (need <= g_attn_part_v_cap) return;
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(g_stream, &st);
+    verify_need(st == cudaStreamCaptureStatusNone, "attention buffer reserved during a capture");
+    if (g_attn_part_v && !g_graphs_captured) cudaFree(g_attn_part_v);
+    g_attn_part_v = nullptr;
+    verify_need(cudaMalloc(&g_attn_part_v, need * sizeof(float)) == cudaSuccess, "cannot allocate the attention buffer");
+    g_attn_part_v_cap = need;
+}
+// Attention of M query rows (row m at position base + m over base + m + 1 cached positions).
+void op_attn_v(const void* q_half, const void* ck_half, const void* cv_half, void* out_half,
+               int n_heads, int n_kv, int head_dim, int base, const void* d_tp, int max_seq, float softcap, int M) {
+    ensure_stream();
+    verify_need(attn_split_ok(head_dim), "needs the split-KV attention (head_dim 64, 128 or 256)");
+    int nch = d_tp ? attn_chunks(max_seq) : attn_chunks(base + M);   // graph: the grid covers max_seq
+    size_t need = (size_t)M * n_heads * nch * ((size_t)head_dim + 2);
+    verify_need(need <= g_attn_part_v_cap, "attention buffer not reserved (attn_reserve_v)");
+    dim3 grid(n_heads, nch, M), block(32 * ATTN_WARPS);
+    const __half* qh = (const __half*)q_half;
+    const __half* kh = (const __half*)ck_half;
+    const __half* vh = (const __half*)cv_half;
+    const int* tp = (const int*)d_tp;
+    if (head_dim == 64)
+        attn_split_v<2><<<grid, block, 0, g_stream>>>(qh, kh, vh, g_attn_part_v, n_heads, n_kv, base, tp, softcap, nch);
+    else if (head_dim == 128)
+        attn_split_v<4><<<grid, block, 0, g_stream>>>(qh, kh, vh, g_attn_part_v, n_heads, n_kv, base, tp, softcap, nch);
+    else
+        attn_split_v<8><<<grid, block, 0, g_stream>>>(qh, kh, vh, g_attn_part_v, n_heads, n_kv, base, tp, softcap, nch);
+    dim3 gm(n_heads, M);
+    attn_merge_v<<<gm, head_dim, 0, g_stream>>>(g_attn_part_v, (__half*)out_half, n_heads, head_dim, base, tp, nch);
+}
+// Row-wise device argmax over the first n logits of M rows (row stride ld): enqueue, then read.
+static float*    g_amv_val = 0;
+static unsigned* g_amv_idx = 0;
+static unsigned* g_amv_out = 0;
+void dev_argmax_v_enqueue(const void* d_logits, int n, int ld, int M) {
+    ensure_stream();
+    const int tpb = 256;
+    int ntg = (n + tpb - 1) / tpb;
+    if (ntg > ARGMAX_NTG_MAX) ntg = ARGMAX_NTG_MAX;
+    if (ntg < 1) ntg = 1;
+    if (!g_amv_val) {
+        cudaMalloc(&g_amv_val, (size_t)VMAX*ARGMAX_NTG_MAX*sizeof(float));
+        cudaMalloc(&g_amv_idx, (size_t)VMAX*ARGMAX_NTG_MAX*sizeof(unsigned));
+        cudaMalloc(&g_amv_out, (size_t)VMAX*sizeof(unsigned));
+    }
+    dim3 g1(ntg, M);
+    argmax_v_stage1<<<g1, tpb, 0, g_stream>>>((const float*)d_logits, n, ld, g_amv_val, g_amv_idx);
+    argmax_v_stage2<<<M, tpb, 0, g_stream>>>(g_amv_val, g_amv_idx, ntg, g_amv_out);
+}
+void dev_argmax_v_read(unsigned* out, int M) {
+    ensure_stream();
+    cudaMemcpyAsync(out, g_amv_out, (size_t)M*sizeof(unsigned), cudaMemcpyDeviceToHost, g_stream);
+    cudaError_t e = cudaStreamSynchronize(g_stream);
+    if (e == cudaSuccess) e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        fprintf(stderr, "trapetum: verify step failed: %s\n", cudaGetErrorString(e));
+        abort();
+    }
+}
+
+// 1 when the 4-bit GEMVs take the tensor-core path (for the tools' mode line).
+int gemv_tc_active(void) { return tc_on() ? 1 : 0; }
+
+// Test helper: fill the GEMV partials, both attention partial buffers and both argmax scratches with
+// 0xFF bytes (NaN), so that a read of a slot the checked call did not write shows up as a mismatch.
+// Never during a capture.
+void dev_debug_scramble(void) {
+    ensure_stream();
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(g_stream, &st);
+    if (st != cudaStreamCaptureStatusNone) return;
+    if (g_ypart) cudaMemsetAsync(g_ypart, 0xFF, g_ypart_cap * sizeof(float), g_stream);
+    if (g_attn_part) cudaMemsetAsync(g_attn_part, 0xFF, g_attn_part_cap * sizeof(float), g_stream);
+    if (g_attn_part_v) cudaMemsetAsync(g_attn_part_v, 0xFF, g_attn_part_v_cap * sizeof(float), g_stream);
+    if (g_am_val) {
+        cudaMemsetAsync(g_am_val, 0xFF, (size_t)ARGMAX_NTG_MAX * sizeof(float), g_stream);
+        cudaMemsetAsync(g_am_idx, 0xFF, (size_t)ARGMAX_NTG_MAX * sizeof(unsigned), g_stream);
+        cudaMemsetAsync(g_am_out, 0xFF, sizeof(unsigned), g_stream);
+    }
+    if (g_amv_val) {
+        cudaMemsetAsync(g_amv_val, 0xFF, (size_t)VMAX * ARGMAX_NTG_MAX * sizeof(float), g_stream);
+        cudaMemsetAsync(g_amv_idx, 0xFF, (size_t)VMAX * ARGMAX_NTG_MAX * sizeof(unsigned), g_stream);
+        cudaMemsetAsync(g_amv_out, 0xFF, (size_t)VMAX * sizeof(unsigned), g_stream);
+    }
+    cudaStreamSynchronize(g_stream);
 }
 
 } // extern "C"

@@ -124,6 +124,27 @@ pub fn op_gelu_mul(gate_f32: *const c_void, up_f32: *const c_void, out_half: *mu
             base: i32,
             m: i32,
         );
+        // batch-invariant verify (speculative decoding): M rows in one forward, the same bits per
+        // row as M decode steps (see the kernels above gemv4_partial_v in codebook_gemv.cu)
+        pub fn verify_supported() -> i32;
+        pub fn qlinear3_forward_half_v(hq: *mut c_void, hk: *mut c_void, hv: *mut c_void, d_x: *const c_void,
+            qh: *mut c_void, kh: *mut c_void, vh: *mut c_void, bq: *const c_void, bk: *const c_void, bv: *const c_void, m: i32);
+        pub fn qlinear2_forward_silu_v(hg: *mut c_void, hu: *mut c_void, d_x: *const c_void, act_h: *mut c_void, m: i32);
+        pub fn qlinear_forward_resadd_v(h: *mut c_void, d_x: *const c_void, h_half: *mut c_void, m: i32);
+        pub fn qlinear_forward_v(h: *mut c_void, d_x: *const c_void, d_y: *mut c_void, m: i32);
+        pub fn op_rmsnorm_v(x_half: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32, m: i32);
+        pub fn op_rope_append_v(q_half: *mut c_void, k_half: *mut c_void, v_half: *const c_void, cache_k: *mut c_void,
+            cache_v: *mut c_void, base: i32, d_tp: *const c_void, n_heads: i32, n_kv: i32, head_dim: i32,
+            inv_freq: *const c_void, m: i32);
+        pub fn attn_reserve_v(n_heads: i32, head_dim: i32, max_seq: i32, m: i32);
+        pub fn op_attn_v(q_half: *const c_void, ck_half: *const c_void, cv_half: *const c_void, out_half: *mut c_void,
+            n_heads: i32, n_kv: i32, head_dim: i32, base: i32, d_tp: *const c_void, max_seq: i32, softcap: f32, m: i32);
+        pub fn dev_argmax_v_enqueue(d_logits: *const c_void, n: i32, ld: i32, m: i32);
+        pub fn dev_argmax_v_read(out: *mut u32, m: i32);
+        // tensor-core 4-bit GEMV: whether it is in use, and a test helper that fills the GEMV and
+        // attention partial buffers and the argmax scratch with 0xFF bytes (NaN)
+        pub fn gemv_tc_active() -> i32;
+        pub fn dev_debug_scramble();
     }
 }
 
@@ -138,6 +159,25 @@ use backend::*;
 
 /// Number of codebook entries (4-bit indices).
 pub const K: usize = 16;
+
+/// The 4-bit GEMV path in use: "tensor-core" (sm_80 or newer, TRAPETUM_TC unset or not "0", the
+/// default deterministic mode, no activation sparsity) or "fma"; "metal" on the Metal backend.
+#[cfg(feature = "cuda")]
+pub fn gemv_mode() -> &'static str {
+    if unsafe { gemv_tc_active() } == 1 { "tensor-core" } else { "fma" }
+}
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub fn gemv_mode() -> &'static str {
+    "metal"
+}
+
+/// Test helper (verify_check): fill the GEMV partials, the attention partial records and the argmax
+/// scratch with 0xFF bytes (NaN), so that a checked call that reads a slot it did not write shows up
+/// as a bit mismatch. Never while a CUDA graph is being captured (the call then does nothing).
+#[cfg(feature = "cuda")]
+pub fn debug_scramble_scratch() {
+    unsafe { dev_debug_scramble() }
+}
 
 /// A device fp16 activation buffer (kernel input).
 pub struct DevHalf {
@@ -538,6 +578,23 @@ pub struct MlpBlock {
     // activation-sparsity thresholds (0 = dense): the gate/up input (RMSNorm output) and the down input
     sp_gu: f32,
     sp_down: f32,
+    // batch-invariant verify scratch (VERIFY_MAX rows), allocated on the first verify step
+    v_scratch: Option<VScratchMlp>,
+}
+
+/// Rows the batch-invariant verify path takes in one forward: 1, 2, 4, 8 or 16.
+pub const VERIFY_M: [usize; 5] = [1, 2, 4, 8, 16];
+const VERIFY_MAX: usize = 16;
+struct VScratchMlp {
+    norm: DevHalf,
+    act: DevHalf,
+}
+struct VScratchAttn {
+    norm: DevHalf,
+    qh: DevHalf,
+    kh: DevHalf,
+    vh: DevHalf,
+    out: DevHalf,
 }
 
 impl MlpBlock {
@@ -581,6 +638,7 @@ impl MlpBlock {
             m_scratch: None,
             sp_gu: 0.0,
             sp_down: 0.0,
+            v_scratch: None,
         }
     }
 
@@ -678,6 +736,8 @@ pub struct AttnBlock {
     // activation-sparsity thresholds (0 = dense): the q/k/v input (RMSNorm output) and the o input
     sp_qkv: f32,
     sp_o: f32,
+    // batch-invariant verify scratch (VERIFY_MAX rows), allocated on the first verify step
+    v_scratch: Option<VScratchAttn>,
 }
 
 impl AttnBlock {
@@ -762,6 +822,7 @@ impl AttnBlock {
             m_scratch: None,
             sp_qkv: 0.0,
             sp_o: 0.0,
+            v_scratch: None,
         }
     }
 
@@ -970,6 +1031,87 @@ impl Layer {
     }
 }
 
+// ---- batch-invariant verify (speculative decoding) ---------------------------
+// The tokens at positions base..base+m (m in VERIFY_M) go through ONE forward whose outputs are,
+// row by row, the same bits as m sequential decode steps (`forward`), so a speculative decoder
+// that verifies with it emits exactly what plain greedy decoding emits. CUDA, default
+// deterministic path, scalar 4-bit projections (the LM head may be 8-bit); no activation sparsity.
+#[cfg(feature = "cuda")]
+impl MlpBlock {
+    /// Rows 0..m of `h` (VERIFY_MAX x hidden) updated in place: `h = h + MLP(RMSNorm(h))`.
+    fn forward_v(&mut self, h: &mut DevHalf, m: usize) {
+        assert!(self.sp_gu == 0.0 && self.sp_down == 0.0, "activation sparsity is not supported on the verify path");
+        let (g, u, d) = match (&self.gate, &self.up, &self.down) {
+            (Proj::Scalar(g), Proj::Scalar(u), Proj::Scalar(d)) => (g.handle, u.handle, d.handle),
+            _ => panic!("the verify path needs scalar 4-bit projections"),
+        };
+        let hidden = self.norm_w.len();
+        let inter = self.g.n;
+        let s = self.v_scratch.get_or_insert_with(|| VScratchMlp {
+            norm: DevHalf::zeros(VERIFY_MAX * hidden),
+            act: DevHalf::zeros(VERIFY_MAX * inter),
+        });
+        unsafe {
+            op_rmsnorm_v(h.ptr, self.norm_w.ptr, s.norm.ptr, hidden as i32, self.eps, m as i32);
+            qlinear2_forward_silu_v(g, u, s.norm.ptr, s.act.ptr, m as i32);
+            qlinear_forward_resadd_v(d, s.act.ptr, h.ptr, m as i32);
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl AttnBlock {
+    /// Rows 0..m of `h` are the tokens at positions base..base+m (base read from d_tp[1] when
+    /// d_tp is not null, for the CUDA graph): appends their KV rows and updates `h` in place.
+    fn forward_v(&mut self, h: &mut DevHalf, base: usize, d_tp: *const c_void, m: usize) {
+        assert!(self.sp_qkv == 0.0 && self.sp_o == 0.0, "activation sparsity is not supported on the verify path");
+        let (q, k, v, o) = match (&self.q, &self.k, &self.v, &self.o) {
+            (Proj::Scalar(q), Proj::Scalar(k), Proj::Scalar(v), Proj::Scalar(o)) => (q.handle, k.handle, v.handle, o.handle),
+            _ => panic!("the verify path needs scalar 4-bit projections"),
+        };
+        let max_seq = self.max_seq();
+        if d_tp.is_null() {
+            assert!(base + m <= max_seq, "verify positions {base}..{} are past the KV cache ({max_seq})", base + m);
+        }
+        let bp = |b: &Option<DevF32>| b.as_ref().map(|b| b.ptr as *const c_void).unwrap_or(std::ptr::null());
+        let (bq, bk, bv) = (bp(&self.qbias), bp(&self.kbias), bp(&self.vbias));
+        let hidden = self.norm_w.len();
+        let (nh, nkv, hd) = (self.n_heads, self.n_kv, self.head_dim);
+        if self.v_scratch.is_none() {
+            // reserved eagerly on the first verify step, never during a capture
+            unsafe { attn_reserve_v(nh as i32, hd as i32, max_seq as i32, VERIFY_MAX as i32) };
+        }
+        let s = self.v_scratch.get_or_insert_with(|| VScratchAttn {
+            norm: DevHalf::zeros(VERIFY_MAX * hidden),
+            qh: DevHalf::zeros(VERIFY_MAX * nh * hd),
+            kh: DevHalf::zeros(VERIFY_MAX * nkv * hd),
+            vh: DevHalf::zeros(VERIFY_MAX * nkv * hd),
+            out: DevHalf::zeros(VERIFY_MAX * nh * hd),
+        });
+        unsafe {
+            op_rmsnorm_v(h.ptr, self.norm_w.ptr, s.norm.ptr, hidden as i32, self.eps, m as i32);
+            qlinear3_forward_half_v(q, k, v, s.norm.ptr, s.qh.ptr, s.kh.ptr, s.vh.ptr, bq, bk, bv, m as i32);
+            op_rope_append_v(
+                s.qh.ptr, s.kh.ptr, s.vh.ptr, self.cache_k.ptr, self.cache_v.ptr, base as i32, d_tp,
+                nh as i32, nkv as i32, hd as i32, self.inv_freq.ptr, m as i32,
+            );
+            op_attn_v(
+                s.qh.ptr, self.cache_k.ptr, self.cache_v.ptr, s.out.ptr, nh as i32, nkv as i32, hd as i32,
+                base as i32, d_tp, max_seq as i32, 0.0, m as i32,
+            );
+            qlinear_forward_resadd_v(o, s.out.ptr, h.ptr, m as i32);
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Layer {
+    fn forward_v(&mut self, h: &mut DevHalf, base: usize, d_tp: *const c_void, m: usize) {
+        self.attn.forward_v(h, base, d_tp, m);
+        self.mlp.forward_v(h, m);
+    }
+}
+
 /// A full decoder model: token embedding, a stack of [`Layer`]s with a shared growing KV
 /// cache, a final RMSNorm, and a codebook-quantized LM head. `forward(token, pos)` returns
 /// the next-token logits. Pure Rust, on-device, no Python.
@@ -994,6 +1136,11 @@ pub struct Model {
     // opt-in activation sparsity (load_sparsity): the per-layer [q/k/v, o, gate/up, down]
     // thresholds; positions below SPARSE_DENSE_FIRST run dense (the attention sink)
     sparsity: Option<Vec<[f32; 4]>>,
+    // batch-invariant verify: residual, normed and logits buffers of VERIFY_MAX rows, the device
+    // [token, base] slot its graphs read, and one captured graph per (m, real_vocab)
+    v_bufs: Option<(DevHalf, DevHalf, DevF32)>,
+    v_tp: Option<DevF32>,
+    v_graphs: Vec<(usize, usize, Graph)>,
 }
 
 /// Positions kept dense under activation sparsity: position 0 is the attention sink, whose
@@ -1001,6 +1148,128 @@ pub struct Model {
 /// would zero (measured on Llama-2-7B 4-bit: keeping it dense cuts the perplexity cost of 25%
 /// sparsity from +0.66 to +0.12). Must match teal_sparsity.py --dense-first.
 pub const SPARSE_DENSE_FIRST: usize = 1;
+
+/// Batch-invariant verify (speculative decoding). `tokens[i]` is processed at position
+/// `base + i` (its KV rows are written), for `tokens.len()` in [`VERIFY_M`], in ONE forward whose
+/// logits are, row by row, the same bits as `forward(tokens[i], base + i)` called in sequence.
+#[cfg(feature = "cuda")]
+impl Model {
+    /// Check the preconditions, allocate the verify buffers on first use and upload the m
+    /// embedding rows (converted to fp16 as `DevHalf::upload` does for the decode step).
+    /// Whether this model can take the verify path: the default deterministic CUDA decode with
+    /// the split-KV attention (head_dim 64, 128 or 256), scalar 4-bit projections in every layer
+    /// and no activation sparsity. Checked before any device work, so that a caller can fall back
+    /// to plain decoding instead of hitting a refusal inside a kernel launch.
+    pub fn verify_ok(&self) -> Result<(), String> {
+        if unsafe { verify_supported() } != 1 {
+            return Err("needs the default deterministic decode path (TRAPETUM_DETERMINISTIC=2, split-KV attention)".into());
+        }
+        if self.sparsity.is_some() {
+            return Err("activation sparsity is not supported on the verify path".into());
+        }
+        let scalar16 = |p: &Proj| matches!(p, Proj::Scalar(q) if q.k == 16);
+        for (i, l) in self.layers.iter().enumerate() {
+            let hd = l.attn.head_dim;
+            if hd != 64 && hd != 128 && hd != 256 {
+                return Err(format!("layer {i}: head_dim {hd} (the split-KV attention takes 64, 128 or 256)"));
+            }
+            let (a, f) = (&l.attn, &l.mlp);
+            if ![&a.q, &a.k, &a.v, &a.o, &f.gate, &f.up, &f.down].iter().all(|p| scalar16(p)) {
+                return Err(format!("layer {i}: the verify path needs scalar 4-bit (K=16) projections"));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_prepare(&mut self, tokens: &[usize], base: usize) -> usize {
+        let m = tokens.len();
+        assert!(VERIFY_M.contains(&m), "verify takes 1, 2, 4, 8 or 16 tokens, not {m}");
+        if let Err(e) = self.verify_ok() {
+            panic!("verify: {e}");
+        }
+        let max_seq = self.max_seq();
+        assert!(base + m <= max_seq, "verify positions {base}..{} are past the KV cache ({max_seq})", base + m);
+        let (hidden, vocab) = (self.hidden, self.vocab);
+        let bufs = self.v_bufs.get_or_insert_with(|| {
+            (DevHalf::zeros(VERIFY_MAX * hidden), DevHalf::zeros(VERIFY_MAX * hidden), DevF32::zeros(VERIFY_MAX * vocab))
+        });
+        let mut rows = vec![0f32; VERIFY_MAX * hidden];
+        for (i, &t) in tokens.iter().enumerate() {
+            rows[i * hidden..(i + 1) * hidden].copy_from_slice(&self.embedding[t * hidden..(t + 1) * hidden]);
+        }
+        bufs.0.upload(&rows);
+        m
+    }
+
+    /// The verify forward on the uploaded rows: every layer, the final norm and the LM head.
+    fn run_verify(&mut self, base: usize, d_tp: *const c_void, m: usize) {
+        let (h, normed, logits) = self.v_bufs.as_mut().expect("verify buffers");
+        for l in &mut self.layers {
+            l.forward_v(h, base, d_tp, m);
+        }
+        unsafe {
+            op_rmsnorm_v(h.ptr, self.final_norm.ptr, normed.ptr, self.hidden as i32, self.eps, m as i32);
+            qlinear_forward_v(self.lm_head.handle, normed.ptr, logits.ptr, m as i32);
+        }
+    }
+
+    fn verify_argmax_rows(&self, m: usize, real_vocab: usize) -> Vec<u32> {
+        let logits = &self.v_bufs.as_ref().expect("verify buffers").2;
+        let mut out = vec![0u32; m];
+        unsafe {
+            dev_argmax_v_enqueue(logits.ptr, real_vocab as i32, self.vocab as i32, m as i32);
+            dev_argmax_v_read(out.as_mut_ptr(), m as i32);
+        }
+        out
+    }
+
+    /// Verify, eager, returning the m rows of `vocab` logits (row i = position base + i).
+    pub fn verify_logits(&mut self, tokens: &[usize], base: usize) -> Vec<f32> {
+        let m = self.verify_prepare(tokens, base);
+        self.run_verify(base, std::ptr::null(), m);
+        self.verify_last_logits(m)
+    }
+
+    /// The logits rows left by the last verify step (eager or graph).
+    pub fn verify_last_logits(&self, m: usize) -> Vec<f32> {
+        let mut all = self.v_bufs.as_ref().expect("verify buffers").2.to_host();
+        all.truncate(m * self.vocab);
+        all
+    }
+
+    /// Verify, eager, returning each row's argmax over the first `real_vocab` logits (greedy
+    /// acceptance: draft token i + 1 is accepted while it equals the argmax of row i).
+    pub fn verify_argmax(&mut self, tokens: &[usize], base: usize, real_vocab: usize) -> Vec<u32> {
+        let m = self.verify_prepare(tokens, base);
+        self.run_verify(base, std::ptr::null(), m);
+        self.verify_argmax_rows(m, real_vocab)
+    }
+
+    /// The same through one captured CUDA graph per (m, real_vocab), base read from device
+    /// memory. The first call for a pair runs eagerly (allocating every buffer) and captures.
+    pub fn verify_argmax_graph(&mut self, tokens: &[usize], base: usize, real_vocab: usize) -> Vec<u32> {
+        let m = self.verify_prepare(tokens, base);
+        let tp_ptr = self.v_tp.get_or_insert_with(|| DevF32::zeros(2)).ptr; // two i32 slots
+        let tp = [0i32, base as i32];
+        unsafe { dev_upload_i32(tp_ptr, tp.as_ptr(), 2) };
+        if let Some(i) = self.v_graphs.iter().position(|(gm, gv, _)| *gm == m && *gv == real_vocab) {
+            self.v_graphs[i].2.launch();
+            let mut out = vec![0u32; m];
+            unsafe { dev_argmax_v_read(out.as_mut_ptr(), m as i32) };
+            return out;
+        }
+        self.run_verify(base, std::ptr::null(), m);
+        let out = self.verify_argmax_rows(m, real_vocab);
+        let d_tp = tp_ptr as *const c_void;
+        let (vocab, logits_ptr) = (self.vocab, self.v_bufs.as_ref().unwrap().2.ptr as *const c_void);
+        let g = Graph::capture(|| {
+            self.run_verify(0, d_tp, m);
+            unsafe { dev_argmax_v_enqueue(logits_ptr, real_vocab as i32, vocab as i32, m as i32) };
+        });
+        self.v_graphs.push((m, real_vocab, g));
+        out
+    }
+}
 
 impl Model {
     pub fn new(
@@ -1045,6 +1314,9 @@ impl Model {
             graph_vocab: 0,
             tp_dev: None,
             sparsity: None,
+            v_bufs: None,
+            v_tp: None,
+            v_graphs: Vec::new(),
         }
     }
 

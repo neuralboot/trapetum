@@ -72,6 +72,8 @@ fn main() {
         let s = model.load_sparsity(&p).unwrap_or_else(|e| panic!("TRAPETUM_SPARSITY: {e}"));
         println!("activation sparsity: target {:.0}% from {p}", s * 100.0);
     }
+    // after the sparsity block: loading thresholds switches the 4-bit GEMVs to the FMA kernels
+    println!("gemv mode                               : {}", trapetum::gemv_mode());
 
     // verify per-position logits against the HF-on-dequantized reference
     // (TRAPETUM_DUMP=<file> also writes these prompt logits, f32 little-endian, for bitwise A/B)
