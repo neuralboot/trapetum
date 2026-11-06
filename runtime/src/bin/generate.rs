@@ -50,17 +50,32 @@ fn main() {
     let cont: Vec<usize> = read_i32s(cp).iter().map(|&t| t as usize).collect();
     let refs = read_f32s(rp);
 
+    // TRAPETUM_SWEEP=<N>: after the checks, keep decoding greedily up to position N and print
+    // the mean decode time per bin of 128 positions (how the per-token cost grows with context).
+    let sweep: Option<usize> = env::var("TRAPETUM_SWEEP").ok().and_then(|s| s.parse::<usize>().ok());
+    // the KV cache must cover the farthest position any mode decodes: the continuation, the
+    // optional energy bench (5th argument, after 8 warm-up steps) and the sweep
+    let bench = a.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    let farthest = (prompt.len() + cont.len() + if bench > 0 { 8 + bench } else { 0 }).max(sweep.unwrap_or(0));
+    let max_seq = (farthest + 64).max(1024);
+
     let t0 = Instant::now();
-    let mut model = Model::load_cbk(mp, 1024).unwrap();
+    let mut model = Model::load_cbk(mp, max_seq).unwrap();
     let vocab = model.vocab();
     println!("loaded {mp} in {:.1}s, vocab={vocab}, prompt={} tokens", t0.elapsed().as_secs_f64(), prompt.len());
 
     // verify per-position logits against the HF-on-dequantized reference
+    // (TRAPETUM_DUMP=<file> also writes these prompt logits, f32 little-endian, for bitwise A/B)
+    let dump = env::var("TRAPETUM_DUMP").ok();
+    let mut dumped: Vec<u8> = Vec::new();
     let mut worst = 0f64;
     let mut top1 = 0usize;
     let mut last_logits = Vec::new();
     for (t, &tok) in prompt.iter().enumerate() {
         let lg = model.forward(tok, t);
+        if dump.is_some() {
+            dumped.extend(lg.iter().flat_map(|v| v.to_le_bytes()));
+        }
         let r = &refs[t * vocab..(t + 1) * vocab];
         let e = rel_err(&lg, r);
         worst = worst.max(e);
@@ -68,6 +83,10 @@ fn main() {
             top1 += 1;
         }
         last_logits = lg;
+    }
+    if let Some(p) = &dump {
+        std::fs::write(p, &dumped).expect("TRAPETUM_DUMP: cannot write the logits file");
+        println!("prompt logits written to {p} ({} bytes)", dumped.len());
     }
     println!("logits rel err vs HF (worst over prompt): {worst:.2e}");
     println!("top-1 agreement with HF                 : {top1}/{}", prompt.len());
@@ -108,9 +127,9 @@ fn main() {
 
     // optional energy bench (5th arg = #tokens): a long pure-decode window bracketed by
     // markers so an external power sampler can isolate steady-state decode energy.
+    let mut pos = prompt.len() + cont.len();
+    let mut t = tok;
     if let Some(nb) = a.get(5).and_then(|s| s.parse::<usize>().ok()) {
-        let mut pos = prompt.len() + cont.len();
-        let mut t = tok;
         for _ in 0..8 {
             t = step(&mut model, t, pos);
             pos += 1;
@@ -123,5 +142,34 @@ fn main() {
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / nb as f64;
         println!("DONE_DECODE {:.4} {:.2}", ms, 1e3 / ms);
+    }
+
+    // context sweep (TRAPETUM_SWEEP=<N>): each step returns the argmax token, which waits for the
+    // device, so the per-step wall time is the decode time at that position.
+    if let Some(n) = sweep {
+        const BIN: usize = 128;
+        let (mut bin, mut acc, mut cnt) = (pos / BIN, 0f64, 0usize);
+        while pos < n {
+            let ts = Instant::now();
+            t = step(&mut model, t, pos);
+            let dt = ts.elapsed().as_secs_f64() * 1e3;
+            if pos / BIN != bin {
+                if cnt > 0 {
+                    let ms = acc / cnt as f64;
+                    println!("SWEEP {} {} {:.4} {:.1}", bin * BIN, (bin + 1) * BIN, ms, 1e3 / ms);
+                }
+                bin = pos / BIN;
+                acc = 0.0;
+                cnt = 0;
+            }
+            acc += dt;
+            cnt += 1;
+            pos += 1;
+        }
+        if cnt > 0 {
+            let ms = acc / cnt as f64;
+            println!("SWEEP {} {} {:.4} {:.1}", bin * BIN, (bin + 1) * BIN, ms, 1e3 / ms);
+        }
+        println!("SWEEP_DONE {n}");
     }
 }

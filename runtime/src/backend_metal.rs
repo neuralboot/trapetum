@@ -517,6 +517,11 @@ pub unsafe fn op_attn(
     softcap: f32,
 ) {
     let c = ctx();
+    // attn_k keeps every score of the head in threadgroup memory; past the device limit (32 KB on
+    // Apple GPUs, about 8,000 positions) the dispatch would compute garbage without any error
+    let need = tg(head_dim as usize * 4) + tg(seqlen as usize * 4);
+    let cap = c._device.max_threadgroup_memory_length();
+    assert!(need <= cap, "Metal attention: {need} B of threadgroup memory for {seqlen} positions exceeds this GPU's {cap} B; use a shorter context");
     let cb = cur_cb();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&c.pl["attn_k"]);
@@ -540,6 +545,52 @@ pub unsafe fn op_attn(
 // The CUDA path records the decode chain into a replayable graph. The Metal
 // equivalent (encoding the whole step into one command buffer) lands with the
 // host-layer work package; the direct per-op path above is fully functional.
+// Split-KV attention scratch reservation: the Metal attention kernel needs no shared partial
+// buffer, so this is a no-op that keeps the backend seam complete.
+pub unsafe fn attn_reserve(_n_heads: i32, _head_dim: i32, _max_seq: i32) {}
+
+// Fused decode entry points of the CUDA backend. Metal has no fused kernels yet: each one runs
+// the same sequence of separate ops the Llama blocks called before, so Metal output is unchanged.
+fn qlin_oc(h: *mut c_void) -> i32 {
+    unsafe { (*(h as *const QLin)).oc }
+}
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn qlinear3_forward_half(
+    hq: *mut c_void, hk: *mut c_void, hv: *mut c_void, d_x: *const c_void,
+    qf: *mut c_void, kf: *mut c_void, vf: *mut c_void,
+    qh: *mut c_void, kh: *mut c_void, vh: *mut c_void,
+    bq: *const c_void, bk: *const c_void, bv: *const c_void,
+) {
+    for (h, f, o, b) in [(hq, qf, qh, bq), (hk, kf, kh, bk), (hv, vf, vh, bv)] {
+        qlinear_forward_dev(h, d_x, f);
+        if !b.is_null() {
+            op_vadd(f, b, qlin_oc(h));
+        }
+        dev_cast_f32_to_half(o, f, qlin_oc(h));
+    }
+}
+pub unsafe fn qlinear2_forward_silu(hg: *mut c_void, hu: *mut c_void, d_x: *const c_void,
+                                    gf: *mut c_void, uf: *mut c_void, act_h: *mut c_void) {
+    qlinear_forward_dev(hg, d_x, gf);
+    qlinear_forward_dev(hu, d_x, uf);
+    op_silu_mul(gf, uf, act_h, qlin_oc(hg));
+}
+pub unsafe fn qlinear_forward_resadd(h: *mut c_void, d_x: *const c_void, yf: *mut c_void, h_half: *mut c_void) {
+    qlinear_forward_dev(h, d_x, yf);
+    op_residual_add(h_half, yf, qlin_oc(h));
+}
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn op_rope_append(
+    q_half: *mut c_void, k_half: *mut c_void, v_half: *const c_void,
+    cache_k: *mut c_void, cache_v: *mut c_void, pos: i32, d_tp: *const c_void,
+    n_heads: i32, n_kv: i32, head_dim: i32, inv_freq: *const c_void,
+) {
+    assert!(d_tp.is_null(), "graph decode (op_rope_append with a device position) is CUDA-only for now");
+    op_rope(q_half, pos, n_heads, head_dim, inv_freq);
+    op_rope(k_half, pos, n_kv, head_dim, inv_freq);
+    op_cache_append(cache_k, k_half, pos, n_kv * head_dim);
+    op_cache_append(cache_v, v_half, pos, n_kv * head_dim);
+}
 // CUDA-graph decode entry points (token/position read from device memory). The Metal backend
 // has no graph capture yet, so these exist only to keep the backend seam complete.
 pub unsafe fn op_rope_dk(_x_half: *mut c_void, _d_tp: *const c_void, _n_heads: i32, _head_dim: i32, _inv_freq: *const c_void) {

@@ -71,9 +71,13 @@ pub unsafe extern "C" fn trapetum_generate(
         Err(_) => return 0,
     };
     let ids = enc.get_ids();
-    if ids.is_empty() {
+    // the KV cache holds `cap` positions: keep only the end of a longer prompt, and stop the
+    // decode below when the cache is full (a position past it would abort the host app)
+    let cap = sess.model.max_seq();
+    if ids.is_empty() || cap == 0 {
         return 0;
     }
+    let ids = if ids.len() > cap { &ids[ids.len() - cap..] } else { ids };
     let v = sess.vocab;
     // prefill: only the last token's logits are needed, and greedily as an argmax on
     // device (no full-vocab host copy). Earlier tokens just prime the KV cache.
@@ -105,6 +109,9 @@ pub unsafe extern "C" fn trapetum_generate(
                     break;
                 }
             }
+        }
+        if n >= max_tokens || pos >= cap {
+            break; // done, or the KV cache is full
         }
         next = sess.model.forward_argmax(next as usize, pos, v);
         pos += 1;

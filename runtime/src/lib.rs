@@ -58,6 +58,23 @@ mod backend {
             softcap: f32,
         );
         pub fn op_resadd_h(h_half: *mut c_void, d_half: *const c_void, n: i32);
+        // split-KV attention: reserve the shared partial buffer for a block of max_seq positions
+        pub fn attn_reserve(n_heads: i32, head_dim: i32, max_seq: i32);
+        // fused decode steps for the Llama blocks (fall back to the separate kernels by themselves)
+        pub fn qlinear3_forward_half(
+            hq: *mut c_void, hk: *mut c_void, hv: *mut c_void, d_x: *const c_void,
+            qf: *mut c_void, kf: *mut c_void, vf: *mut c_void,
+            qh: *mut c_void, kh: *mut c_void, vh: *mut c_void,
+            bq: *const c_void, bk: *const c_void, bv: *const c_void,
+        );
+        pub fn qlinear2_forward_silu(hg: *mut c_void, hu: *mut c_void, d_x: *const c_void,
+                                     gf: *mut c_void, uf: *mut c_void, act_h: *mut c_void);
+        pub fn qlinear_forward_resadd(h: *mut c_void, d_x: *const c_void, yf: *mut c_void, h_half: *mut c_void);
+        pub fn op_rope_append(
+            q_half: *mut c_void, k_half: *mut c_void, v_half: *const c_void,
+            cache_k: *mut c_void, cache_v: *mut c_void, pos: i32, d_tp: *const c_void,
+            n_heads: i32, n_kv: i32, head_dim: i32, inv_freq: *const c_void,
+        );
         // CUDA-graph decode: position read from device memory d_tp = [token, pos] (i32)
         pub fn op_rope_dk(x_half: *mut c_void, d_tp: *const c_void, n_heads: i32, head_dim: i32, inv_freq: *const c_void);
         pub fn op_cache_append_dk(cache_half: *mut c_void, src_half: *const c_void, d_tp: *const c_void, dim: i32);
@@ -551,13 +568,24 @@ impl MlpBlock {
     }
 
     /// `h` is the residual stream `(hidden,)`, updated in place: `h = h + MLP(RMSNorm(h))`.
+    /// With scalar 4-bit projections, gate and up run as one fused GEMV whose reduce applies
+    /// SiLU(gate) * up, and down's reduce adds into `h` (same bits as the separate kernels).
     pub fn forward(&mut self, h: &mut DevHalf) {
         rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
-        self.gate.forward_into(&self.norm, &mut self.g);
-        self.up.forward_into(&self.norm, &mut self.u);
-        silu_mul(&self.g, &self.u, &mut self.act);
-        self.down.forward_into(&self.act, &mut self.mlp);
-        residual_add(h, &self.mlp);
+        if let (Proj::Scalar(g), Proj::Scalar(u)) = (&self.gate, &self.up) {
+            unsafe { qlinear2_forward_silu(g.handle, u.handle, self.norm.ptr, self.g.ptr, self.u.ptr, self.act.ptr) };
+        } else {
+            self.gate.forward_into(&self.norm, &mut self.g);
+            self.up.forward_into(&self.norm, &mut self.u);
+            silu_mul(&self.g, &self.u, &mut self.act);
+        }
+        if let Proj::Scalar(d) = &self.down {
+            assert_eq!(h.n, d.oc);
+            unsafe { qlinear_forward_resadd(d.handle, self.act.ptr, self.mlp.ptr, h.ptr) };
+        } else {
+            self.down.forward_into(&self.act, &mut self.mlp);
+            residual_add(h, &self.mlp);
+        }
     }
 }
 
@@ -679,6 +707,9 @@ impl AttnBlock {
     ) -> Self {
         let qdim = n_heads * head_dim; // = hidden for MHA
         let kv_dim = n_kv * head_dim;
+        // split-KV attention scratch for this block's max_seq, reserved now so that no decode
+        // step, eager or CUDA-graph, ever allocates (allocation is not allowed during a capture)
+        unsafe { attn_reserve(n_heads as i32, head_dim as i32, max_seq as i32) };
         Self {
             norm_w: DevF32::from_host(norm_w),
             q,
@@ -711,9 +742,21 @@ impl AttnBlock {
         }
     }
 
-    /// One decode step at position `pos`: updates the cache and the residual stream `h`.
-    pub fn forward(&mut self, h: &mut DevHalf, pos: usize) {
-        rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
+    /// q, k and v into the fp16 buffers `qh`, `kh`, `vh`, biases added. With three scalar
+    /// 4-bit projections this is one fused GEMV and one reduce (the CUDA side falls back to the
+    /// separate kernels when fusion does not apply); other formats take the separate path.
+    fn qkv(&mut self) {
+        if let (Proj::Scalar(q), Proj::Scalar(k), Proj::Scalar(v)) = (&self.q, &self.k, &self.v) {
+            let bp = |b: &Option<DevF32>| b.as_ref().map(|b| b.ptr as *const c_void).unwrap_or(std::ptr::null());
+            unsafe {
+                qlinear3_forward_half(
+                    q.handle, k.handle, v.handle, self.norm.ptr,
+                    self.qb.ptr, self.kb.ptr, self.vb.ptr, self.qh.ptr, self.kh.ptr, self.vh.ptr,
+                    bp(&self.qbias), bp(&self.kbias), bp(&self.vbias),
+                )
+            };
+            return;
+        }
         self.q.forward_into(&self.norm, &mut self.qb);
         if let Some(b) = &self.qbias { vadd(&mut self.qb, b); }
         self.qh.copy_cast_from(&self.qb);
@@ -723,16 +766,36 @@ impl AttnBlock {
         self.v.forward_into(&self.norm, &mut self.vb);
         if let Some(b) = &self.vbias { vadd(&mut self.vb, b); }
         self.vh.copy_cast_from(&self.vb);
-        rope(&mut self.qh, pos, self.n_heads, self.head_dim, &self.inv_freq);
-        rope(&mut self.kh, pos, self.n_kv, self.head_dim, &self.inv_freq);
-        cache_append(&mut self.cache_k, &self.kh, pos);
-        cache_append(&mut self.cache_v, &self.vh, pos);
+    }
+
+    /// Output projection and residual add (`h += o(attn_out)`), fused for a scalar 4-bit `o`.
+    fn o_residual(&mut self, h: &mut DevHalf) {
+        if let Proj::Scalar(o) = &self.o {
+            assert_eq!(h.n, o.oc);
+            unsafe { qlinear_forward_resadd(o.handle, self.attn_out.ptr, self.ob.ptr, h.ptr) };
+            return;
+        }
+        self.o.forward_into(&self.attn_out, &mut self.ob);
+        residual_add(h, &self.ob);
+    }
+
+    /// One decode step at position `pos`: updates the cache and the residual stream `h`.
+    pub fn forward(&mut self, h: &mut DevHalf, pos: usize) {
+        assert!(pos < self.max_seq(), "decode position {pos} is past the KV cache ({})", self.max_seq());
+        rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
+        self.qkv();
+        // RoPE on q and k and the KV-cache append, one launch on CUDA
+        unsafe {
+            op_rope_append(
+                self.qh.ptr, self.kh.ptr, self.vh.ptr, self.cache_k.ptr, self.cache_v.ptr, pos as i32,
+                std::ptr::null(), self.n_heads as i32, self.n_kv as i32, self.head_dim as i32, self.inv_freq.ptr,
+            )
+        };
         attention(
             &self.qh, &self.cache_k, &self.cache_v, &mut self.attn_out,
             self.n_heads, self.n_kv, self.head_dim, pos + 1, 0.0,
         );
-        self.o.forward_into(&self.attn_out, &mut self.ob);
-        residual_add(h, &self.ob);
+        self.o_residual(h);
     }
 
     /// KV-cache capacity in positions (the `max_seq` the block was built with).
@@ -745,30 +808,20 @@ impl AttnBlock {
     /// graph serves every position. Same kernels and arithmetic as [`forward`](Self::forward).
     #[cfg(any(feature = "cuda", feature = "metal"))]
     fn forward_dk(&mut self, h: &mut DevHalf, d_tp: *const c_void) {
-        let kv_dim = self.n_kv * self.head_dim;
         let max_seq = self.max_seq();
         rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
-        self.q.forward_into(&self.norm, &mut self.qb);
-        if let Some(b) = &self.qbias { vadd(&mut self.qb, b); }
-        self.qh.copy_cast_from(&self.qb);
-        self.k.forward_into(&self.norm, &mut self.kb);
-        if let Some(b) = &self.kbias { vadd(&mut self.kb, b); }
-        self.kh.copy_cast_from(&self.kb);
-        self.v.forward_into(&self.norm, &mut self.vb);
-        if let Some(b) = &self.vbias { vadd(&mut self.vb, b); }
-        self.vh.copy_cast_from(&self.vb);
+        self.qkv();
         unsafe {
-            op_rope_dk(self.qh.ptr, d_tp, self.n_heads as i32, self.head_dim as i32, self.inv_freq.ptr);
-            op_rope_dk(self.kh.ptr, d_tp, self.n_kv as i32, self.head_dim as i32, self.inv_freq.ptr);
-            op_cache_append_dk(self.cache_k.ptr, self.kh.ptr, d_tp, kv_dim as i32);
-            op_cache_append_dk(self.cache_v.ptr, self.vh.ptr, d_tp, kv_dim as i32);
+            op_rope_append(
+                self.qh.ptr, self.kh.ptr, self.vh.ptr, self.cache_k.ptr, self.cache_v.ptr, 0, d_tp,
+                self.n_heads as i32, self.n_kv as i32, self.head_dim as i32, self.inv_freq.ptr,
+            );
             op_attn_dk(
                 self.qh.ptr, self.cache_k.ptr, self.cache_v.ptr, self.attn_out.ptr,
                 self.n_heads as i32, self.n_kv as i32, self.head_dim as i32, d_tp, max_seq as i32, 0.0,
             );
         }
-        self.o.forward_into(&self.attn_out, &mut self.ob);
-        residual_add(h, &self.ob);
+        self.o_residual(h);
     }
 }
 
@@ -970,10 +1023,8 @@ impl Model {
         let max_seq = self.layers.first().map(|l| l.attn.max_seq()).unwrap_or(0);
         assert!(pos < max_seq, "graph decode: position {pos} is past the KV cache ({max_seq})");
         if self.graph.is_none() || self.graph_vocab != real_vocab {
-            for l in &self.layers {
-                let need = (l.attn.head_dim + l.attn.max_seq()) * 4;
-                assert!(need <= 48 * 1024, "graph decode: attention needs {need} B of shared memory (max_seq too large)");
-            }
+            // (the shared-memory limit of the sequential attention kernel is checked in op_attn_dk,
+            // where that kernel is actually chosen; the default split-KV kernel has no such limit)
             let t = self.forward_argmax(token, pos, real_vocab); // eager step; allocates the scratch
             // the argmax scratch must exist before capture even if TRAPETUM_LOGIT_DEBUG made the
             // eager step take its host-side argmax (no allocation may happen while capturing)
@@ -1049,6 +1100,12 @@ impl Model {
 
     pub fn vocab(&self) -> usize {
         self.vocab
+    }
+
+    /// KV-cache capacity in positions (the `max_seq` the model was loaded with): decoding a
+    /// position at or past it is refused.
+    pub fn max_seq(&self) -> usize {
+        self.layers.first().map(|l| l.attn.max_seq()).unwrap_or(0)
     }
 
     /// Batched 2-token forward for speculative verification: processes `t0` at `pos` and

@@ -188,6 +188,99 @@ __global__ void gemv_reduce(const float* __restrict__ Ypart, float* __restrict__
     Y[i] = s;
 }
 
+// ---- Fused decode GEMVs (bitwise identical to the separate kernels they replace) ------------
+// Up to three K=16 projections that read the same input (q, k, v; or gate, up) run as ONE
+// gemv4_partial launch over their concatenated output columns: a block finds its projection
+// from its first column (every projection's OC is a multiple of CPB, so no block straddles
+// two), then runs exactly gemv4_partial's code on that projection's indices and codebook. Each
+// column therefore gets the same IC split, the same loop order and the same block reduction
+// as before. The fused reduce kernels then sum the GS partial rows in the same fixed order as
+// gemv_reduce and apply, in the same float operations, what the separate kernels did next:
+// bias add and cast to half (q, k, v), SiLU(gate) * up (MLP), or the residual add (o, down).
+// The projections are scalar __restrict__ arguments on purpose: a first version read them from
+// a by-value segment table indexed at run time and was SLOWER than the separate kernels (same
+// 40 registers, but +1.8 ms per token on an A40 and no gain on an RTX 4090, 2026-11-05); this
+// form took the 4-bit decode from 6.36 to 5.28 ms per token on the 4090 with identical bits.
+// An unused third projection repeats the second one with oc2 = 0 and is never selected.
+__global__ void __launch_bounds__(32*TY)
+gemv4_partial_seg(const __half* __restrict__ X,
+                  const unsigned char* __restrict__ p0, const unsigned char* __restrict__ p1,
+                  const unsigned char* __restrict__ p2,
+                  const __half* __restrict__ c0, const __half* __restrict__ c1, const __half* __restrict__ c2,
+                  int oc0, int oc1, int oc2, float* __restrict__ Ypart, int IC, int OCt) {
+    extern __shared__ char sm[];
+    __half* s_cb = (__half*)sm; float* red = (float*)(s_cb + K*CPB);
+    int tx = threadIdx.x, ty = threadIdx.y, tid = ty*32+tx, nth = 32*TY;
+    int jg = blockIdx.x*CPB;                       // first column, concatenated space
+    int s = jg < oc0 ? 0 : (jg < oc0 + oc1 ? 1 : 2);
+    const unsigned char* packed = s == 0 ? p0 : (s == 1 ? p1 : p2);
+    const __half* cb = s == 0 ? c0 : (s == 1 ? c1 : c2);
+    int OC = s == 0 ? oc0 : (s == 1 ? oc1 : oc2);
+    int j0 = jg - (s == 0 ? 0 : (s == 1 ? oc0 : oc0 + oc1));   // first column inside projection s
+    for (int t = tid; t < K*CPB/2; t += nth) {
+        int idx = t*2, k = idx/CPB, jj = j0 + (idx%CPB);
+        *reinterpret_cast<__half2*>(&s_cb[idx]) = *reinterpret_cast<const __half2*>(&cb[(size_t)k*OC+jj]);
+    }
+    __syncthreads();
+    int per = (IC+gridDim.y-1)/gridDim.y, ic0 = blockIdx.y*per, ic1 = min(IC, ic0+per);
+    int jbase = j0 + tx*8; size_t OCp = OC/2;
+    float acc[8] = {0,0,0,0,0,0,0,0};
+    for (int ic = ic0+ty; ic < ic1; ic += TY) {
+        unsigned f = __ldg((const unsigned*)&packed[(size_t)ic*OCp + jbase/2]);
+        float xx = __half2float(__ldg(&X[ic]));
+        #pragma unroll
+        for (int c = 0; c < 8; c++) { unsigned char id = (f>>(4*c))&0xF; acc[c] += xx*__half2float(s_cb[id*CPB+tx*8+c]); }
+    }
+    #pragma unroll
+    for (int c = 0; c < 8; c++) red[ty*CPB+tx*8+c] = acc[c];
+    __syncthreads();
+    if (ty == 0) {
+        #pragma unroll
+        for (int c = 0; c < 8; c++) { float s2 = 0; for (int y = 0; y < TY; y++) s2 += red[y*CPB+tx*8+c]; Ypart[(size_t)blockIdx.y*OCt + (jg+tx*8+c)] = s2; }
+    }
+}
+// q, k, v: reduce, add the optional bias (null pointer = none), cast to half, into three outputs.
+__global__ void gemv_reduce_half3(const float* __restrict__ Ypart,
+                                  __half* __restrict__ q, __half* __restrict__ k, __half* __restrict__ v,
+                                  const float* __restrict__ bq, const float* __restrict__ bk,
+                                  const float* __restrict__ bv, int oq, int ok, int OCt, int GSy) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= OCt) return;
+    float s = 0;
+    for (int g = 0; g < GSy; g++) s += Ypart[(size_t)g*OCt + i];
+    if (i < oq) {
+        if (bq) s += bq[i];                        // vadd_k: a[i] += b[i]
+        q[i] = __float2half(s);                    // cast_f2h
+    } else if (i < oq + ok) {
+        int li = i - oq;
+        if (bk) s += bk[li];
+        k[li] = __float2half(s);
+    } else {
+        int li = i - oq - ok;
+        if (bv) s += bv[li];
+        v[li] = __float2half(s);
+    }
+}
+// gate, up (two projections of n columns each): reduce both, then silu_mul_k's arithmetic.
+__global__ void gemv_reduce_silu(const float* __restrict__ Ypart, __half* __restrict__ out, int n, int GSy) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    size_t OCt = (size_t)2*n;
+    float g = 0, u = 0;
+    for (int y = 0; y < GSy; y++) g += Ypart[(size_t)y*OCt + i];
+    for (int y = 0; y < GSy; y++) u += Ypart[(size_t)y*OCt + n + i];
+    float s = g / (1.f + expf(-g));
+    out[i] = __float2half(s * u);
+}
+// o and down: reduce, then resadd_k's arithmetic into the fp16 residual stream.
+__global__ void gemv_reduce_resadd(const float* __restrict__ Ypart, __half* __restrict__ h, int OC, int GSy) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= OC) return;
+    float s = 0;
+    for (int g = 0; g < GSy; g++) s += Ypart[(size_t)g*OC + i];
+    h[i] = __float2half(__half2float(h[i]) + s);
+}
+
 __global__ void cast_f2h(const float* __restrict__ src, __half* __restrict__ dst, int n) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __float2half(src[i]);
@@ -223,18 +316,49 @@ __global__ void resadd_k(__half* __restrict__ h, const float* __restrict__ delta
 // (x[d], x[d+head_dim/2]) by angle = pos * base^(-2d/head_dim).
 // Shared by rope_k (position as a kernel argument) and rope_dk (position read from device
 // memory, for the CUDA-graph decode), so both paths compute bit-identical results.
+// One rotated pair (head h, d in [0, head_dim/2)): the arithmetic shared by rope_body and the
+// fused rope_append kernel, so both write the same bits. `dst` (may equal x) receives the result.
+__device__ __forceinline__ void rope_pair(const __half* x, __half* dst, int h, int d, int pos, int head_dim,
+                                          const float* __restrict__ inv_freq) {
+    int half = head_dim/2;
+    float angle = (float)pos * inv_freq[d];   // freqs precomputed (scaling baked in: llama3/linear/default)
+    float c = cosf(angle), s = sinf(angle);
+    int i = h*head_dim + d, j = h*head_dim + d + half;
+    float x0 = __half2float(x[i]), x1 = __half2float(x[j]);
+    dst[i] = __float2half(x0*c - x1*s);
+    dst[j] = __float2half(x1*c + x0*s);
+}
 __device__ __forceinline__ void rope_body(__half* __restrict__ x, int pos, int n_heads, int head_dim,
                                           const float* __restrict__ inv_freq) {
     int t = blockIdx.x*blockDim.x + threadIdx.x;
     int half = head_dim/2;
     if (t >= n_heads*half) return;
-    int h = t / half, d = t % half;
-    float angle = (float)pos * inv_freq[d];   // freqs precomputed (scaling baked in: llama3/linear/default)
-    float c = cosf(angle), s = sinf(angle);
-    int i = h*head_dim + d, j = h*head_dim + d + half;
-    float x0 = __half2float(x[i]), x1 = __half2float(x[j]);
-    x[i] = __float2half(x0*c - x1*s);
-    x[j] = __float2half(x1*c + x0*s);
+    rope_pair(x, x, t / half, t % half, pos, head_dim, inv_freq);
+}
+// Fused attention prologue, one launch instead of four: RoPE on q (in place) and on k (written
+// to k and to the cache row), and the v row copied to its cache row. The position is `pos`, or
+// d_tp[1] when d_tp is not null (CUDA-graph decode). Same arithmetic as rope_k + cache append.
+__global__ void rope_append_k(__half* __restrict__ q, __half* __restrict__ k, const __half* __restrict__ v,
+                              __half* __restrict__ cache_k, __half* __restrict__ cache_v, int pos_arg,
+                              const int* __restrict__ d_tp, int n_heads, int n_kv, int head_dim,
+                              const float* __restrict__ inv_freq) {
+    int t = blockIdx.x*blockDim.x + threadIdx.x;
+    int half = head_dim/2;
+    int pos = d_tp ? d_tp[1] : pos_arg;
+    int nq = n_heads*half, nk = n_kv*half, kvdim = n_kv*head_dim;
+    if (t < nq) {
+        rope_pair(q, q, t / half, t % half, pos, head_dim, inv_freq);
+    } else if (t < nq + nk) {
+        int u = t - nq, h = u / half, d = u % half;
+        rope_pair(k, k, h, d, pos, head_dim, inv_freq);
+        __half* row = cache_k + (size_t)pos*kvdim;
+        int i = h*head_dim + d, j = i + half;
+        row[i] = k[i];                            // the thread's own two writes: no race
+        row[j] = k[j];
+    } else if (t < nq + nk + kvdim) {
+        int i = t - nq - nk;
+        cache_v[(size_t)pos*kvdim + i] = v[i];
+    }
 }
 __global__ void rope_k(__half* __restrict__ x, int pos, int n_heads, int head_dim, const float* __restrict__ inv_freq) {
     rope_body(x, pos, n_heads, head_dim, inv_freq);
@@ -304,6 +428,121 @@ __device__ __forceinline__ void attn_body(const __half* __restrict__ q, const __
     for (int t = 0; t < seqlen; t++)
         acc += scores[t] * __half2float(cv[(size_t)t*n_kv*head_dim + kvh*head_dim + d]);
     out[h*head_dim + d] = __float2half(acc);
+}
+
+// ---- Split-KV batch-1 decode attention (the Flash-Decoding scheme) --------------------------
+// attn_body walks the cache one position at a time in a single block per head (one dependent
+// global load and two barriers per position), so its cost grows by about 0.65 us per cached
+// position and layer. Here the cache is cut into chunks of ATTN_CHUNK positions: one block per
+// (head, chunk) runs an online softmax with one warp per position stride and writes a partial
+// (running max m, sum l, unnormalized output o), then attn_merge_k combines the chunks of a head.
+// No atomics and fixed reduction orders, so runs are bitwise reproducible; the summation order
+// differs from attn_body, so outputs move by fp32 rounding. TRAPETUM_ATTN=seq selects attn_body.
+#define ATTN_CHUNK 64
+#define ATTN_WARPS 4
+static __host__ __device__ __forceinline__ int attn_chunks(int seqlen) { return (seqlen + ATTN_CHUNK - 1) / ATTN_CHUNK; }
+
+// part layout: [n_heads][stride_chunks][2 + HD] floats = (m, l, o[HD]) per (head, chunk).
+// The seqlen is seqlen_arg on the eager path, d_tp[1] + 1 on the CUDA-graph path (whose grid
+// covers max_seq, so chunks past the current length exit at once).
+template <int PER>   // PER = head_dim / 32 values per lane
+__global__ void attn_split_k(const __half* __restrict__ q, const __half* __restrict__ ck,
+                             const __half* __restrict__ cv, float* __restrict__ part,
+                             int n_heads, int n_kv, int seqlen_arg, const int* __restrict__ d_tp,
+                             float softcap, int stride_chunks) {
+    const int HD = PER * 32;
+    int seqlen = d_tp ? d_tp[1] + 1 : seqlen_arg;
+    int h = blockIdx.x, c = blockIdx.y;
+    int t0 = c * ATTN_CHUNK;
+    if (t0 >= seqlen) return;                    // block-uniform: no barrier is skipped by part of a block
+    int t1 = min(t0 + ATTN_CHUNK, seqlen);
+    int kvh = h / (n_heads / n_kv);
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    float scale = rsqrtf((float)HD);
+    float qv[PER], o[PER];
+    #pragma unroll
+    for (int i = 0; i < PER; i += 2) {
+        float2 f = __half22float2(*(const __half2*)(q + (size_t)h*HD + lane*PER + i));
+        qv[i] = f.x; qv[i + 1] = f.y;
+        o[i] = 0.f; o[i + 1] = 0.f;
+    }
+    // finite start, as attn_body: expf(-1e30 - s) is exactly 0 for any finite score, a -inf score
+    // gets weight 0 and a NaN score propagates, instead of the NaN that -inf - -inf would give
+    float m = -1e30f, l = 0.f;
+    const size_t stride = (size_t)n_kv * HD;
+    const __half* kb = ck + (size_t)kvh*HD + lane*PER;
+    const __half* vb = cv + (size_t)kvh*HD + lane*PER;
+    for (int t = t0 + warp; t < t1; t += ATTN_WARPS) {
+        // issue the V row load with the K row, before the reduction and the softcap branch,
+        // so that both DRAM round trips overlap
+        float vv[PER];
+        #pragma unroll
+        for (int i = 0; i < PER; i += 2) {
+            float2 f = __half22float2(*(const __half2*)(vb + (size_t)t*stride + i));
+            vv[i] = f.x; vv[i + 1] = f.y;
+        }
+        float s = 0.f;
+        #pragma unroll
+        for (int i = 0; i < PER; i += 2) {
+            float2 f = __half22float2(*(const __half2*)(kb + (size_t)t*stride + i));
+            s += qv[i] * f.x + qv[i + 1] * f.y;
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
+        s *= scale;
+        if (softcap > 0.f) s = softcap * tanhf(s / softcap);
+        float mn = fmaxf(m, s);
+        float corr = expf(m - mn);               // 0 at the warp's first position (m = -1e30)
+        float p = expf(s - mn);
+        l = l * corr + p;
+        #pragma unroll
+        for (int i = 0; i < PER; i++) o[i] = o[i] * corr + p * vv[i];
+        m = mn;
+    }
+    // combine the warps of the block in a fixed order (a warp with no position keeps m = -1e30,
+    // so its weight expf(-1e30 - M) is 0)
+    __shared__ float sm_m[ATTN_WARPS], sm_l[ATTN_WARPS];
+    __shared__ float sm_o[ATTN_WARPS][PER * 32];
+    if (lane == 0) { sm_m[warp] = m; sm_l[warp] = l; }
+    #pragma unroll
+    for (int i = 0; i < PER; i++) sm_o[warp][lane*PER + i] = o[i];
+    __syncthreads();
+    float M = -INFINITY;
+    #pragma unroll
+    for (int w = 0; w < ATTN_WARPS; w++) M = fmaxf(M, sm_m[w]);
+    float* dst = part + ((size_t)h * stride_chunks + c) * (HD + 2);
+    for (int d = threadIdx.x; d < HD; d += blockDim.x) {
+        float od = 0.f;
+        #pragma unroll
+        for (int w = 0; w < ATTN_WARPS; w++) if (sm_m[w] > -INFINITY) od += sm_o[w][d] * expf(sm_m[w] - M);
+        dst[2 + d] = od;
+    }
+    if (threadIdx.x == 0) {
+        float L = 0.f;
+        #pragma unroll
+        for (int w = 0; w < ATTN_WARPS; w++) if (sm_m[w] > -INFINITY) L += sm_l[w] * expf(sm_m[w] - M);
+        dst[0] = M;
+        dst[1] = L;
+    }
+}
+
+// One block per head, one thread per output dimension: chunks in a fixed order (0, 1, 2, ...).
+__global__ void attn_merge_k(const float* __restrict__ part, __half* __restrict__ out, int head_dim,
+                             int seqlen_arg, const int* __restrict__ d_tp, int stride_chunks) {
+    int seqlen = d_tp ? d_tp[1] + 1 : seqlen_arg;
+    int nch = attn_chunks(seqlen);
+    int h = blockIdx.x;
+    const size_t rec = (size_t)head_dim + 2;
+    const float* base = part + (size_t)h * stride_chunks * rec;
+    float M = -INFINITY;
+    for (int c = 0; c < nch; c++) M = fmaxf(M, base[c * rec]);
+    float L = 0.f;
+    for (int c = 0; c < nch; c++) L += base[c * rec + 1] * expf(base[c * rec] - M);
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float od = 0.f;
+        for (int c = 0; c < nch; c++) od += base[c * rec + 2 + d] * expf(base[c * rec] - M);
+        out[(size_t)h * head_dim + d] = __float2half(od / L);
+    }
 }
 
 // ============================================================================
@@ -937,10 +1176,80 @@ void op_cache_append(void* cache_half, const void* src_half, int pos, int dim) {
     cudaMemcpyAsync((char*)cache_half + (size_t)pos*dim*sizeof(__half), src_half,
                     (size_t)dim*sizeof(__half), cudaMemcpyDeviceToDevice, g_stream);
 }
+// --- split-KV attention host side: one partial buffer shared by every attention call (calls
+// are ordered on g_stream, so a layer's merge finishes before the next layer's split starts).
+static float* g_attn_part = nullptr;
+static size_t g_attn_part_cap = 0;   // floats
+static int attn_mode() {             // 1: split-KV (default), 0: sequential attn_body (TRAPETUM_ATTN=seq)
+    static int mode = -1;
+    if (mode < 0) {
+        const char* e = getenv("TRAPETUM_ATTN");
+        mode = (e && e[0] == 's' && e[1] == 'e' && e[2] == 'q' && e[3] == 0) ? 0 : 1;
+    }
+    return mode;
+}
+static bool attn_split_ok(int head_dim) {
+    return attn_mode() == 1 && (head_dim == 64 || head_dim == 128 || head_dim == 256);
+}
+// Make the buffer hold `need` floats, allocating `want` (>= need) when it grows. Never allocates
+// during a stream capture (not allowed there) and never frees a buffer a captured graph may use.
+static bool attn_part_fit(size_t need, size_t want) {
+    if (need <= g_attn_part_cap) return true;
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(g_stream, &st);
+    if (st != cudaStreamCaptureStatusNone) return false;
+    if (g_attn_part && !g_graphs_captured) cudaFree(g_attn_part);
+    g_attn_part = nullptr;
+    g_attn_part_cap = 0;
+    if (cudaMalloc(&g_attn_part, want * sizeof(float)) != cudaSuccess) {
+        g_attn_part = nullptr;
+        cudaGetLastError();             // clear the (non-sticky) allocation error; callers fall back
+        return false;
+    }
+    g_attn_part_cap = want;
+    return true;
+}
+static void attn_split_launch(const void* q, const void* ck, const void* cv, void* out, int n_heads, int n_kv,
+                              int head_dim, int seqlen_arg, const int* d_tp, float softcap, int grid_chunks) {
+    dim3 grid(n_heads, grid_chunks), block(32 * ATTN_WARPS);
+    const __half* qh = (const __half*)q;
+    const __half* kh = (const __half*)ck;
+    const __half* vh = (const __half*)cv;
+    if (head_dim == 64)
+        attn_split_k<2><<<grid, block, 0, g_stream>>>(qh, kh, vh, g_attn_part, n_heads, n_kv, seqlen_arg, d_tp, softcap, grid_chunks);
+    else if (head_dim == 128)
+        attn_split_k<4><<<grid, block, 0, g_stream>>>(qh, kh, vh, g_attn_part, n_heads, n_kv, seqlen_arg, d_tp, softcap, grid_chunks);
+    else
+        attn_split_k<8><<<grid, block, 0, g_stream>>>(qh, kh, vh, g_attn_part, n_heads, n_kv, seqlen_arg, d_tp, softcap, grid_chunks);
+    attn_merge_k<<<n_heads, head_dim, 0, g_stream>>>(g_attn_part, (__half*)out, head_dim, seqlen_arg, d_tp, grid_chunks);
+}
+// Reserve the partial buffer for a block of max_seq positions, at model construction, so that
+// neither the eager path nor a captured graph ever has to allocate while decoding.
+void attn_reserve(int n_heads, int head_dim, int max_seq) {
+    ensure_stream();
+    if (!attn_split_ok(head_dim)) return;
+    size_t need = (size_t)n_heads * attn_chunks(max_seq) * ((size_t)head_dim + 2);
+    attn_part_fit(need, need);
+}
+
 void op_attn(const void* q_half, const void* ck_half, const void* cv_half, void* out_half,
              int n_heads, int n_kv, int head_dim, int seqlen, float softcap) {
     ensure_stream();
+    if (attn_split_ok(head_dim)) {
+        int nch = attn_chunks(seqlen);
+        size_t need = (size_t)n_heads * nch * ((size_t)head_dim + 2);
+        size_t want = (size_t)n_heads * attn_chunks(((seqlen + 1023) / 1024) * 1024) * ((size_t)head_dim + 2);
+        if (attn_part_fit(need, want)) {
+            attn_split_launch(q_half, ck_half, cv_half, out_half, n_heads, n_kv, head_dim, seqlen, nullptr, softcap, nch);
+            return;
+        }
+    }
     size_t smem = ((size_t)head_dim + seqlen) * sizeof(float);
+    if (smem > 48 * 1024) {              // the sequential kernel keeps every score in shared memory
+        fprintf(stderr, "trapetum: sequential attention needs %zu B of shared memory for %d positions (limit 49152 B); "
+                        "use the default split-KV kernel or a shorter context\n", smem, seqlen);
+        abort();
+    }
     attn_k<<<n_heads, head_dim, smem, g_stream>>>((const __half*)q_half, (const __half*)ck_half,
         (const __half*)cv_half, (__half*)out_half, n_heads, n_kv, head_dim, seqlen, softcap);
 }
@@ -963,7 +1272,25 @@ void op_cache_append_dk(void* cache_half, const void* src_half, const void* d_tp
 void op_attn_dk(const void* q_half, const void* ck_half, const void* cv_half, void* out_half,
                 int n_heads, int n_kv, int head_dim, const void* d_tp, int max_seq, float softcap) {
     ensure_stream();
+    if (attn_split_ok(head_dim)) {
+        int nch = attn_chunks(max_seq);  // the captured grid covers max_seq; idle chunks exit at once
+        size_t need = (size_t)n_heads * nch * ((size_t)head_dim + 2);
+        if (attn_part_fit(need, need)) {
+            attn_split_launch(q_half, ck_half, cv_half, out_half, n_heads, n_kv, head_dim, 0, (const int*)d_tp, softcap, nch);
+            return;
+        }
+        static bool warned = false;      // only reachable if attn_reserve was skipped before a capture
+        if (!warned) {
+            fprintf(stderr, "trapetum: split-KV attention buffer not reserved before capture; using the sequential kernel\n");
+            warned = true;
+        }
+    }
     size_t smem = ((size_t)head_dim + max_seq) * sizeof(float);
+    if (smem > 48 * 1024) {              // the sequential kernel keeps every score in shared memory
+        fprintf(stderr, "trapetum: sequential attention needs %zu B of shared memory for max_seq %d (limit 49152 B); "
+                        "use the default split-KV kernel or a shorter context\n", smem, max_seq);
+        abort();
+    }
     attn_dk<<<n_heads, head_dim, smem, g_stream>>>((const __half*)q_half, (const __half*)ck_half,
         (const __half*)cv_half, (__half*)out_half, n_heads, n_kv, head_dim, (const int*)d_tp, softcap);
 }
@@ -1210,6 +1537,130 @@ void graph_launch(void* exec) {
 
 void graph_free(void* exec) {
     cudaGraphExecDestroy((cudaGraphExec_t)exec);
+}
+
+// ---- Fused decode entry points (Llama blocks with scalar 4-bit projections) -----------------
+// Each one runs the fused kernels above when fusion applies (default two-stage deterministic
+// mode, K=16 projections sharing the input width, its bit set in TRAPETUM_FUSE) and otherwise the
+// exact sequence of separate kernels the Rust blocks used to call, so the outputs are the same
+// bits either way. The f32 buffers are only scratch for that fallback.
+// TRAPETUM_FUSE is a bit mask: 1 RoPE + KV-cache append, 2 residual add in the o and down
+// reduces, 4 q/k/v in one GEMV, 8 gate/up in one GEMV; 0 = none (the separate kernels), unset =
+// 15 = all. Measured on an RTX 4090, 2026-11-05, Llama-2-7B 4-bit, CUDA graph, mean ms per token
+// over the first 128 positions, two rounds: none 6.36, 1 6.26, 1+2 6.21, all 5.28 (bitwise
+// identical prompt logits for every setting; 16/16 greedy).
+static int fuse_mask() {
+    static int f = -1;
+    if (f < 0) {
+        const char* e = getenv("TRAPETUM_FUSE");
+        f = 15;
+        if (e && e[0] >= '0' && e[0] <= '9') { f = atoi(e) & 15; }
+    }
+    return f;
+}
+static bool fuse_ok(QLinear* const* ps, int n, int bit) {
+    if (!(fuse_mask() & bit) || det_mode() != 2 || det_gs() <= 1) return false;
+    for (int i = 0; i < n; i++)
+        if (ps[i]->K_ != 16 || ps[i]->IC != ps[0]->IC || ps[i]->OC % CPB != 0) return false;
+    return true;
+}
+static void launch_partial_seg(QLinear* const* ps, int n, const void* d_x, float* yp, int OCt, int gy) {
+    size_t smem = (size_t)K*CPB*sizeof(__half) + (size_t)TY*CPB*sizeof(float);
+    dim3 grid(OCt/CPB, gy), block(32, TY);
+    QLinear* a = ps[0];
+    QLinear* b = n > 1 ? ps[1] : ps[0];
+    QLinear* c = n > 2 ? ps[2] : b;              // unused third projection: oc 0, never selected
+    int o0 = a->OC, o1 = n > 1 ? b->OC : 0, o2 = n > 2 ? c->OC : 0;
+    gemv4_partial_seg<<<grid, block, smem, g_stream>>>((const __half*)d_x, a->d_packed, b->d_packed, c->d_packed,
+                                                       a->d_cb, b->d_cb, c->d_cb, o0, o1, o2, yp, a->IC, OCt);
+}
+
+// q, k, v of an attention block: one GEMV launch and one reduce (bias add, cast to half).
+void qlinear3_forward_half(void* hq, void* hk, void* hv, const void* d_x,
+                           void* qf, void* kf, void* vf, void* qh, void* kh, void* vh,
+                           const void* bq, const void* bk, const void* bv) {
+    ensure_stream();
+    QLinear* ps[3] = {(QLinear*)hq, (QLinear*)hk, (QLinear*)hv};
+    if (fuse_ok(ps, 3, 4)) {
+        int gy = det_gs();
+        int OCt = ps[0]->OC + ps[1]->OC + ps[2]->OC;
+        float* yp = ypart((size_t)gy * OCt);
+        launch_partial_seg(ps, 3, d_x, yp, OCt, gy);
+        int tpb = 256;
+        gemv_reduce_half3<<<(OCt + tpb - 1)/tpb, tpb, 0, g_stream>>>(yp, (__half*)qh, (__half*)kh, (__half*)vh,
+            (const float*)bq, (const float*)bk, (const float*)bv, ps[0]->OC, ps[1]->OC, OCt, gy);
+        return;
+    }
+    void* fs[3] = {qf, kf, vf};
+    void* hs[3] = {qh, kh, vh};
+    const void* bs[3] = {bq, bk, bv};
+    for (int i = 0; i < 3; i++) {                   // the previous per-projection sequence
+        qlinear_forward_dev(ps[i], d_x, fs[i]);
+        if (bs[i]) op_vadd(fs[i], bs[i], ps[i]->OC);
+        dev_cast_f32_to_half(hs[i], fs[i], ps[i]->OC);
+    }
+}
+
+// gate, up of an MLP block: one GEMV launch, then one kernel for both reductions and SiLU * up.
+void qlinear2_forward_silu(void* hg, void* hu, const void* d_x, void* gf, void* uf, void* act_h) {
+    ensure_stream();
+    QLinear* ps[2] = {(QLinear*)hg, (QLinear*)hu};
+    if (fuse_ok(ps, 2, 8) && ps[0]->OC == ps[1]->OC) {
+        int gy = det_gs();
+        int n = ps[0]->OC, OCt = 2*n;
+        float* yp = ypart((size_t)gy * OCt);
+        launch_partial_seg(ps, 2, d_x, yp, OCt, gy);
+        int tpb = 256;
+        gemv_reduce_silu<<<(n + tpb - 1)/tpb, tpb, 0, g_stream>>>(yp, (__half*)act_h, n, gy);
+        return;
+    }
+    qlinear_forward_dev(ps[0], d_x, gf);
+    qlinear_forward_dev(ps[1], d_x, uf);
+    op_silu_mul(gf, uf, act_h, ps[0]->OC);
+}
+
+// o and down projections: GEMV, then the residual add folded into the reduce.
+void qlinear_forward_resadd(void* handle, const void* d_x, void* yf, void* h_half) {
+    ensure_stream();
+    QLinear* ps[1] = {(QLinear*)handle};
+    if (fuse_ok(ps, 1, 2)) {
+        QLinear* q = ps[0];
+        int gy = det_gs();
+        float* yp = ypart((size_t)gy * q->OC);
+        size_t smem = (size_t)K*CPB*sizeof(__half) + (size_t)TY*CPB*sizeof(float);
+        dim3 grid(q->OC/CPB, gy), block(32, TY);
+        gemv4_partial<<<grid, block, smem, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, yp, q->IC, q->OC);
+        int tpb = 256;
+        gemv_reduce_resadd<<<(q->OC + tpb - 1)/tpb, tpb, 0, g_stream>>>(yp, (__half*)h_half, q->OC, gy);
+        return;
+    }
+    qlinear_forward_dev(ps[0], d_x, yf);
+    op_residual_add(h_half, yf, ps[0]->OC);
+}
+
+// RoPE on q and k, k and v appended to the KV cache: one launch instead of four. The position is
+// `pos`, or d_tp[1] when d_tp is not null (CUDA-graph decode).
+void op_rope_append(void* q_half, void* k_half, const void* v_half, void* cache_k, void* cache_v,
+                    int pos, const void* d_tp, int n_heads, int n_kv, int head_dim, const void* inv_freq) {
+    ensure_stream();
+    int kvdim = n_kv*head_dim;
+    if (!(fuse_mask() & 1)) {
+        if (d_tp) {
+            op_rope_dk(q_half, d_tp, n_heads, head_dim, inv_freq);
+            op_rope_dk(k_half, d_tp, n_kv, head_dim, inv_freq);
+            op_cache_append_dk(cache_k, k_half, d_tp, kvdim);
+            op_cache_append_dk(cache_v, v_half, d_tp, kvdim);
+        } else {
+            op_rope(q_half, pos, n_heads, head_dim, inv_freq);
+            op_rope(k_half, pos, n_kv, head_dim, inv_freq);
+            op_cache_append(cache_k, k_half, pos, kvdim);
+            op_cache_append(cache_v, v_half, pos, kvdim);
+        }
+        return;
+    }
+    int total = n_heads*(head_dim/2) + n_kv*(head_dim/2) + kvdim;
+    rope_append_k<<<(total + 255)/256, 256, 0, g_stream>>>((__half*)q_half, (__half*)k_half, (const __half*)v_half,
+        (__half*)cache_k, (__half*)cache_v, pos, (const int*)d_tp, n_heads, n_kv, head_dim, (const float*)inv_freq);
 }
 
 } // extern "C"

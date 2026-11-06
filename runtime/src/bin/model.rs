@@ -148,7 +148,7 @@ fn argmax(x: &[f32]) -> usize {
 
 fn main() {
     let c = Cfg { hidden: 512, n_heads: 8, n_kv: 4, hd: 64, inter: 768, vocab: 512 };
-    let (n_layers, max_seq, tokens) = (2usize, 16usize, 5usize);
+    let (n_layers, max_seq, tokens) = (2usize, 128usize, 5usize); // the timing loop decodes up to position 104
     println!(
         "trapetum: full model, {n_layers} layers, hidden={} heads={}/{} kv head_dim={} inter={} vocab={}, GQA",
         c.hidden, c.n_heads, c.n_kv, c.hd, c.inter, c.vocab
