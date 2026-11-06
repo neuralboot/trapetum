@@ -1269,6 +1269,23 @@ impl Model {
         self.v_graphs.push((m, real_vocab, g));
         out
     }
+
+    /// Prefill `tokens` at positions base.. through the verify graphs: chunks of 16 rows, then
+    /// 8, 4, 2 and 1 for the tail. Every row is the decode step's bits and the KV rows are the
+    /// ones token-by-token decoding would write, so a prompt prefilled this way continues exactly
+    /// like a decoded one (a plain greedy run and a speculative run can share it). Returns the
+    /// argmax over the first `real_vocab` logits of the last token: the first generated token.
+    pub fn prefill_verify(&mut self, tokens: &[usize], base: usize, real_vocab: usize) -> u32 {
+        assert!(!tokens.is_empty(), "prefill_verify needs at least one token");
+        let (mut i, mut last) = (0usize, 0u32);
+        while i < tokens.len() {
+            let rem = tokens.len() - i;
+            let m = *VERIFY_M.iter().rev().find(|&&m| m <= rem).expect("VERIFY_M contains 1");
+            last = self.verify_argmax_graph(&tokens[i..i + m], base + i, real_vocab)[m - 1];
+            i += m;
+        }
+        last
+    }
 }
 
 impl Model {
