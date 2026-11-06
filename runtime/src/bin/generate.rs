@@ -5,8 +5,10 @@
 //!
 //! Usage: generate <model.cbk> <prompt.bin> <ref.bin> <cont.bin>
 //!   prompt.bin: P  i32 token ids
-//!   ref.bin   : P*vocab f32 reference logits (HF on the dequantized weights)
-//!   cont.bin  : N  i32 HF greedy continuation token ids
+//!   ref.bin   : P*vocab f32 reference logits (HF on the dequantized weights), or - for none
+//!   cont.bin  : N  i32 HF greedy continuation token ids, or - for none
+//! TRAPETUM_NLL=1 also prints the mean negative log-likelihood of the prompt (each token given
+//! the ones before it), so the runtime's own perplexity on a text can be compared with Python's.
 use trapetum::Model;
 use std::env;
 use std::fs::File;
@@ -47,8 +49,9 @@ fn main() {
     let (mp, pp, rp, cp) = (&a[1], &a[2], &a[3], &a[4]);
 
     let prompt: Vec<usize> = read_i32s(pp).iter().map(|&t| t as usize).collect();
-    let cont: Vec<usize> = read_i32s(cp).iter().map(|&t| t as usize).collect();
-    let refs = read_f32s(rp);
+    let cont: Vec<usize> = if cp == "-" { Vec::new() } else { read_i32s(cp).iter().map(|&t| t as usize).collect() };
+    let refs: Option<Vec<f32>> = if rp == "-" { None } else { Some(read_f32s(rp)) };
+    let nll_on = env::var("TRAPETUM_NLL").map(|v| v == "1").unwrap_or(false);
 
     // TRAPETUM_SWEEP=<N>: after the checks, keep decoding greedily up to position N and print
     // the mean decode time per bin of 128 positions (how the per-token cost grows with context).
@@ -63,6 +66,12 @@ fn main() {
     let mut model = Model::load_cbk(mp, max_seq).unwrap();
     let vocab = model.vocab();
     println!("loaded {mp} in {:.1}s, vocab={vocab}, prompt={} tokens", t0.elapsed().as_secs_f64(), prompt.len());
+    // TRAPETUM_SPARSITY=<file>: opt-in activation sparsity (lossy; the logits then differ from the
+    // dense HF reference by design: compare against teal_sparsity.py's sparse reference instead)
+    if let Ok(p) = env::var("TRAPETUM_SPARSITY") {
+        let s = model.load_sparsity(&p).unwrap_or_else(|e| panic!("TRAPETUM_SPARSITY: {e}"));
+        println!("activation sparsity: target {:.0}% from {p}", s * 100.0);
+    }
 
     // verify per-position logits against the HF-on-dequantized reference
     // (TRAPETUM_DUMP=<file> also writes these prompt logits, f32 little-endian, for bitwise A/B)
@@ -70,17 +79,27 @@ fn main() {
     let mut dumped: Vec<u8> = Vec::new();
     let mut worst = 0f64;
     let mut top1 = 0usize;
+    let (mut nll_sum, mut nll_n) = (0f64, 0usize);
     let mut last_logits = Vec::new();
     for (t, &tok) in prompt.iter().enumerate() {
         let lg = model.forward(tok, t);
         if dump.is_some() {
             dumped.extend(lg.iter().flat_map(|v| v.to_le_bytes()));
         }
-        let r = &refs[t * vocab..(t + 1) * vocab];
-        let e = rel_err(&lg, r);
-        worst = worst.max(e);
-        if argmax(&lg) == argmax(r) {
-            top1 += 1;
+        if let Some(refs) = &refs {
+            let r = &refs[t * vocab..(t + 1) * vocab];
+            let e = rel_err(&lg, r);
+            worst = worst.max(e);
+            if argmax(&lg) == argmax(r) {
+                top1 += 1;
+            }
+        }
+        if nll_on && t + 1 < prompt.len() {
+            // -log softmax(lg)[next], in f64 with the max subtracted
+            let m = lg.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v)) as f64;
+            let lse = lg.iter().map(|&v| (v as f64 - m).exp()).sum::<f64>().ln() + m;
+            nll_sum += lse - lg[prompt[t + 1]] as f64;
+            nll_n += 1;
         }
         last_logits = lg;
     }
@@ -88,8 +107,14 @@ fn main() {
         std::fs::write(p, &dumped).expect("TRAPETUM_DUMP: cannot write the logits file");
         println!("prompt logits written to {p} ({} bytes)", dumped.len());
     }
-    println!("logits rel err vs HF (worst over prompt): {worst:.2e}");
-    println!("top-1 agreement with HF                 : {top1}/{}", prompt.len());
+    if refs.is_some() {
+        println!("logits rel err vs HF (worst over prompt): {worst:.2e}");
+        println!("top-1 agreement with HF                 : {top1}/{}", prompt.len());
+    }
+    if nll_on && nll_n > 0 {
+        let m = nll_sum / nll_n as f64;
+        println!("PROMPT_NLL {m:.6} over {nll_n} predictions (ppl {:.4})", m.exp());
+    }
 
     // reproduce HF greedy continuation + time it. Device argmax: the next token is
     // reduced on the GPU, so the full vocab is never copied to the host per step.

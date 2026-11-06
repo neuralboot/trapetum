@@ -570,10 +570,23 @@ pub unsafe fn qlinear3_forward_half(
     }
 }
 pub unsafe fn qlinear2_forward_silu(hg: *mut c_void, hu: *mut c_void, d_x: *const c_void,
-                                    gf: *mut c_void, uf: *mut c_void, act_h: *mut c_void) {
+                                    gf: *mut c_void, uf: *mut c_void, act_h: *mut c_void, thr: f32) {
+    assert!(thr <= 0.0, "activation sparsity is CUDA-only for now");
     qlinear_forward_dev(hg, d_x, gf);
     qlinear_forward_dev(hu, d_x, uf);
     op_silu_mul(gf, uf, act_h, qlin_oc(hg));
+}
+// Activation sparsity is CUDA-only for now (Model::load_sparsity refuses on Metal, so these only
+// ever see a zero threshold): the dense ops run unchanged.
+pub unsafe fn op_rmsnorm_thr(x_half: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32, thr: f32) {
+    assert!(thr <= 0.0, "activation sparsity is CUDA-only for now");
+    op_rmsnorm(x_half, w_f32, out_half, n, eps);
+}
+pub unsafe fn op_sparsify_half(_x_half: *mut c_void, _n: i32, thr: f32) {
+    assert!(thr <= 0.0, "activation sparsity is CUDA-only for now");
+}
+pub unsafe fn set_sparse_rows(on: i32) {
+    assert!(on == 0, "activation sparsity is CUDA-only for now");
 }
 pub unsafe fn qlinear_forward_resadd(h: *mut c_void, d_x: *const c_void, yf: *mut c_void, h_half: *mut c_void) {
     qlinear_forward_dev(h, d_x, yf);

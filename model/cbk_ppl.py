@@ -106,6 +106,56 @@ def ppl_full(nlls):
     return math.exp(sum(nlls) / (len(nlls) * SEQLEN))
 
 
+def load_file_weights(model, path, dev):
+    """Load the scalar projections of a .cbk FILE into a Hugging Face Llama-style model, in place,
+    and return (header, the file's LM head as fp16 [real vocab, hidden] on dev, integrity checks).
+    The model's embedding and norms are compared with the file's, not replaced."""
+    cfg = model.config
+    real_vocab = cfg.vocab_size
+    checks = {}
+    with open(path, "rb") as f:
+        H = read_header(f)
+        log("%s %s: %d layers, hidden %d, inter %d, vocab %d, avq_m %d, lm_k %d" % (
+            os.path.basename(path), H["format"], H["n_layers"], H["hidden"], H["inter"], H["vocab"], H["avq_m"], H["lm_k"]))
+        if H["avq_m"]:
+            raise SystemExit("additive (CBKA) projections: measure them with model/export_aqlm.py --ppl")
+        hidden, vocab = H["hidden"], H["vocab"]
+        want = dict(n_layers=cfg.num_hidden_layers, hidden=cfg.hidden_size, n_heads=cfg.num_attention_heads,
+                    n_kv=getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
+                    head_dim=cfg.hidden_size // cfg.num_attention_heads, inter=cfg.intermediate_size,
+                    vocab=((real_vocab + 255) // 256) * 256)
+        bad = {k: (H[k], v) for k, v in want.items() if H[k] != v}
+        if bad:
+            raise SystemExit("file config does not match the model (file, model): %r" % (bad,))
+
+        emb = rd(f, "<f2", vocab * hidden).reshape(vocab, hidden)
+        checks["embedding_max_abs_diff"] = maxdiff(emb[:real_vocab], model.model.embed_tokens.weight)
+        checks["embedding_pad_rows_zero"] = bool(not np.any(emb[real_vocab:]))
+        del emb
+        norm_d, bias_d = 0.0, 0.0
+        for li in range(H["n_layers"]):
+            L = model.model.layers[li]
+            norm_d = max(norm_d, maxdiff(rd(f, "<f4", hidden), L.input_layernorm.weight))
+            for blk, pn in PROJS:
+                if pn == "gate_proj":
+                    norm_d = max(norm_d, maxdiff(rd(f, "<f4", hidden), L.post_attention_layernorm.weight))
+                mod = getattr(getattr(L, blk), pn)
+                mod.weight.data = read_scalar(f, mod.in_features, mod.out_features, 16, dev)
+                if H["has_bias"] and pn in ("q_proj", "k_proj", "v_proj"):
+                    b = rd(f, "<f4", mod.out_features)
+                    ref_b = mod.bias if getattr(mod, "bias", None) is not None else torch.zeros(mod.out_features)
+                    bias_d = max(bias_d, maxdiff(b, ref_b))
+        norm_d = max(norm_d, maxdiff(rd(f, "<f4", hidden), model.model.norm.weight))
+        head_file = read_scalar(f, hidden, vocab, H["lm_k"], dev)        # [vocab_padded, hidden]
+        checks["head_pad_rows_zero"] = bool(not head_file[real_vocab:].any())
+        head_file = head_file[:real_vocab].contiguous()
+        checks["trailing_bytes_none"] = (f.read(1) == b"")
+    checks["norms_max_abs_diff"] = norm_d
+    if H["has_bias"]:
+        checks["bias_max_abs_diff"] = bias_d
+    return H, head_file, checks
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cbk", required=True)
@@ -140,47 +190,9 @@ def main():
             log("CBKPPL fp16 model: custom %.4f  full %.4f" % (R["ppl"]["fp16_model"]["ppl_custom"], R["ppl"]["fp16_model"]["ppl_full"]))
 
     head_fp16 = model.lm_head.weight.detach().clone()
-    with open(args.cbk, "rb") as f:
-        H = read_header(f)
-        R["header"] = {k: v for k, v in H.items() if k != "inv_freq"}
-        log("%s %s: %d layers, hidden %d, inter %d, vocab %d, avq_m %d, lm_k %d" % (
-            os.path.basename(args.cbk), H["format"], H["n_layers"], H["hidden"], H["inter"], H["vocab"], H["avq_m"], H["lm_k"]))
-        if H["avq_m"]:
-            raise SystemExit("additive (CBKA) projections: measure them with model/export_aqlm.py --ppl")
-        hidden, vocab = H["hidden"], H["vocab"]
-        want = dict(n_layers=cfg.num_hidden_layers, hidden=cfg.hidden_size, n_heads=cfg.num_attention_heads,
-                    n_kv=getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
-                    head_dim=cfg.hidden_size // cfg.num_attention_heads, inter=cfg.intermediate_size,
-                    vocab=((real_vocab + 255) // 256) * 256)
-        bad = {k: (H[k], v) for k, v in want.items() if H[k] != v}
-        if bad:
-            raise SystemExit("file config does not match the model (file, model): %r" % (bad,))
-
-        emb = rd(f, "<f2", vocab * hidden).reshape(vocab, hidden)
-        R["checks"]["embedding_max_abs_diff"] = maxdiff(emb[:real_vocab], model.model.embed_tokens.weight)
-        R["checks"]["embedding_pad_rows_zero"] = bool(not np.any(emb[real_vocab:]))
-        del emb
-        norm_d, bias_d = 0.0, 0.0
-        for li in range(H["n_layers"]):
-            L = model.model.layers[li]
-            norm_d = max(norm_d, maxdiff(rd(f, "<f4", hidden), L.input_layernorm.weight))
-            for blk, pn in PROJS:
-                if pn == "gate_proj":
-                    norm_d = max(norm_d, maxdiff(rd(f, "<f4", hidden), L.post_attention_layernorm.weight))
-                mod = getattr(getattr(L, blk), pn)
-                mod.weight.data = read_scalar(f, mod.in_features, mod.out_features, 16, dev)
-                if H["has_bias"] and pn in ("q_proj", "k_proj", "v_proj"):
-                    b = rd(f, "<f4", mod.out_features)
-                    ref_b = mod.bias if getattr(mod, "bias", None) is not None else torch.zeros(mod.out_features)
-                    bias_d = max(bias_d, maxdiff(b, ref_b))
-        norm_d = max(norm_d, maxdiff(rd(f, "<f4", hidden), model.model.norm.weight))
-        head_file = read_scalar(f, hidden, vocab, H["lm_k"], dev)        # [vocab_padded, hidden]
-        R["checks"]["head_pad_rows_zero"] = bool(not head_file[real_vocab:].any())
-        head_file = head_file[:real_vocab].contiguous()
-        R["checks"]["trailing_bytes_none"] = (f.read(1) == b"")
-    R["checks"]["norms_max_abs_diff"] = norm_d
-    if H["has_bias"]:
-        R["checks"]["bias_max_abs_diff"] = bias_d
+    H, head_file, checks = load_file_weights(model, args.cbk, dev)
+    R["header"] = {k: v for k, v in H.items() if k != "inv_freq"}
+    R["checks"].update(checks)
     log("file read: projections and head dequantized (%.0fs)" % (time.time() - T0))
 
     def use_head(which):

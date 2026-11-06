@@ -68,7 +68,12 @@ mod backend {
             bq: *const c_void, bk: *const c_void, bv: *const c_void,
         );
         pub fn qlinear2_forward_silu(hg: *mut c_void, hu: *mut c_void, d_x: *const c_void,
-                                     gf: *mut c_void, uf: *mut c_void, act_h: *mut c_void);
+                                     gf: *mut c_void, uf: *mut c_void, act_h: *mut c_void, thr: f32);
+        // activation sparsity (TEAL-style, opt-in): thresholded RMSNorm, in-place threshold, and
+        // the switch to the row-skipping 4-bit GEMVs
+        pub fn op_rmsnorm_thr(x_half: *const c_void, w_f32: *const c_void, out_half: *mut c_void, n: i32, eps: f32, thr: f32);
+        pub fn op_sparsify_half(x_half: *mut c_void, n: i32, thr: f32);
+        pub fn set_sparse_rows(on: i32);
         pub fn qlinear_forward_resadd(h: *mut c_void, d_x: *const c_void, yf: *mut c_void, h_half: *mut c_void);
         pub fn op_rope_append(
             q_half: *mut c_void, k_half: *mut c_void, v_half: *const c_void,
@@ -411,6 +416,13 @@ pub fn rmsnorm(x: &DevHalf, w: &DevF32, out: &mut DevHalf, eps: f32) {
     unsafe { op_rmsnorm(x.ptr, w.ptr, out.ptr, x.n as i32, eps) };
 }
 
+/// RMSNorm whose outputs below `thr` in magnitude become 0 (activation sparsity; 0 = [`rmsnorm`]).
+pub fn rmsnorm_thr(x: &DevHalf, w: &DevF32, out: &mut DevHalf, eps: f32, thr: f32) {
+    assert_eq!(x.n, out.n);
+    assert_eq!(x.n, w.n);
+    unsafe { op_rmsnorm_thr(x.ptr, w.ptr, out.ptr, x.n as i32, eps, thr) };
+}
+
 /// SwiGLU activation: `out = silu(gate) * up`, on-device.
 pub fn silu_mul(gate: &DevF32, up: &DevF32, out: &mut DevHalf) {
     assert_eq!(gate.n, up.n);
@@ -523,6 +535,9 @@ pub struct MlpBlock {
     mlp: DevF32,
     eps: f32,
     m_scratch: Option<MScratchMlp>,
+    // activation-sparsity thresholds (0 = dense): the gate/up input (RMSNorm output) and the down input
+    sp_gu: f32,
+    sp_down: f32,
 }
 
 impl MlpBlock {
@@ -564,6 +579,8 @@ impl MlpBlock {
             mlp: DevF32::zeros(hidden),
             eps,
             m_scratch: None,
+            sp_gu: 0.0,
+            sp_down: 0.0,
         }
     }
 
@@ -571,13 +588,14 @@ impl MlpBlock {
     /// With scalar 4-bit projections, gate and up run as one fused GEMV whose reduce applies
     /// SiLU(gate) * up, and down's reduce adds into `h` (same bits as the separate kernels).
     pub fn forward(&mut self, h: &mut DevHalf) {
-        rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
+        rmsnorm_thr(h, &self.norm_w, &mut self.norm, self.eps, self.sp_gu);
         if let (Proj::Scalar(g), Proj::Scalar(u)) = (&self.gate, &self.up) {
-            unsafe { qlinear2_forward_silu(g.handle, u.handle, self.norm.ptr, self.g.ptr, self.u.ptr, self.act.ptr) };
+            unsafe { qlinear2_forward_silu(g.handle, u.handle, self.norm.ptr, self.g.ptr, self.u.ptr, self.act.ptr, self.sp_down) };
         } else {
             self.gate.forward_into(&self.norm, &mut self.g);
             self.up.forward_into(&self.norm, &mut self.u);
             silu_mul(&self.g, &self.u, &mut self.act);
+            unsafe { op_sparsify_half(self.act.ptr, self.act.n as i32, self.sp_down) };
         }
         if let Proj::Scalar(d) = &self.down {
             assert_eq!(h.n, d.oc);
@@ -657,6 +675,9 @@ pub struct AttnBlock {
     kbias_h: Option<Vec<f32>>,
     vbias_h: Option<Vec<f32>>,
     m_scratch: Option<MScratchAttn>,
+    // activation-sparsity thresholds (0 = dense): the q/k/v input (RMSNorm output) and the o input
+    sp_qkv: f32,
+    sp_o: f32,
 }
 
 impl AttnBlock {
@@ -739,6 +760,8 @@ impl AttnBlock {
             kbias_h: biases.map(|b| b.1.to_vec()),
             vbias_h: biases.map(|b| b.2.to_vec()),
             m_scratch: None,
+            sp_qkv: 0.0,
+            sp_o: 0.0,
         }
     }
 
@@ -782,7 +805,7 @@ impl AttnBlock {
     /// One decode step at position `pos`: updates the cache and the residual stream `h`.
     pub fn forward(&mut self, h: &mut DevHalf, pos: usize) {
         assert!(pos < self.max_seq(), "decode position {pos} is past the KV cache ({})", self.max_seq());
-        rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
+        rmsnorm_thr(h, &self.norm_w, &mut self.norm, self.eps, self.sp_qkv);
         self.qkv();
         // RoPE on q and k and the KV-cache append, one launch on CUDA
         unsafe {
@@ -795,6 +818,7 @@ impl AttnBlock {
             &self.qh, &self.cache_k, &self.cache_v, &mut self.attn_out,
             self.n_heads, self.n_kv, self.head_dim, pos + 1, 0.0,
         );
+        unsafe { op_sparsify_half(self.attn_out.ptr, self.attn_out.n as i32, self.sp_o) };
         self.o_residual(h);
     }
 
@@ -809,7 +833,7 @@ impl AttnBlock {
     #[cfg(any(feature = "cuda", feature = "metal"))]
     fn forward_dk(&mut self, h: &mut DevHalf, d_tp: *const c_void) {
         let max_seq = self.max_seq();
-        rmsnorm(h, &self.norm_w, &mut self.norm, self.eps);
+        rmsnorm_thr(h, &self.norm_w, &mut self.norm, self.eps, self.sp_qkv);
         self.qkv();
         unsafe {
             op_rope_append(
@@ -820,6 +844,7 @@ impl AttnBlock {
                 self.qh.ptr, self.cache_k.ptr, self.cache_v.ptr, self.attn_out.ptr,
                 self.n_heads as i32, self.n_kv as i32, self.head_dim as i32, d_tp, max_seq as i32, 0.0,
             );
+            op_sparsify_half(self.attn_out.ptr, self.attn_out.n as i32, self.sp_o);
         }
         self.o_residual(h);
     }
@@ -859,6 +884,9 @@ impl Layer {
 impl MlpBlock {
     /// `h` is `m*hidden`, updated in place: `h = h + MLP(RMSNorm(h))` for all M rows.
     pub fn forward_m(&mut self, h: &mut DevHalf, m: usize) {
+        // the batched (speculative verify) path has no activation sparsity: refuse rather than
+        // mix sparse prefill rows with dense verified rows (the output would match neither)
+        assert!(self.sp_gu == 0.0 && self.sp_down == 0.0, "activation sparsity is not supported on the batched path");
         let hidden = self.norm_w.len();
         let inter = self.g.n;
         if self.m_scratch.as_ref().map(|s| s.m) != Some(m) {
@@ -886,6 +914,7 @@ impl AttnBlock {
     /// Batched decode step: `h` is `m*hidden`, the M new tokens sit at positions
     /// `base..base+m`. Each query attends causally over `base+row+1` keys.
     pub fn forward_m(&mut self, h: &mut DevHalf, base: usize, m: usize) {
+        assert!(self.sp_qkv == 0.0 && self.sp_o == 0.0, "activation sparsity is not supported on the batched path");
         let hidden = self.norm_w.len();
         let qdim = self.n_heads * self.head_dim;
         let kvdim = self.n_kv * self.head_dim;
@@ -962,7 +991,16 @@ pub struct Model {
     graph: Option<Graph>,
     graph_vocab: usize,
     tp_dev: Option<DevF32>,
+    // opt-in activation sparsity (load_sparsity): the per-layer [q/k/v, o, gate/up, down]
+    // thresholds; positions below SPARSE_DENSE_FIRST run dense (the attention sink)
+    sparsity: Option<Vec<[f32; 4]>>,
 }
+
+/// Positions kept dense under activation sparsity: position 0 is the attention sink, whose
+/// normalized state is a few massive values and thousands of tiny ones that any threshold
+/// would zero (measured on Llama-2-7B 4-bit: keeping it dense cuts the perplexity cost of 25%
+/// sparsity from +0.66 to +0.12). Must match teal_sparsity.py --dense-first.
+pub const SPARSE_DENSE_FIRST: usize = 1;
 
 impl Model {
     pub fn new(
@@ -1006,6 +1044,20 @@ impl Model {
             graph: None,
             graph_vocab: 0,
             tp_dev: None,
+            sparsity: None,
+        }
+    }
+
+    /// Put the loaded activation-sparsity thresholds (`on`) or zeros (dense) into the blocks.
+    fn set_sparse_thresholds(&mut self, on: bool) {
+        if let Some(ts) = &self.sparsity {
+            for (l, t) in self.layers.iter_mut().zip(ts) {
+                let t = if on { *t } else { [0.0; 4] };
+                l.attn.sp_qkv = t[0];
+                l.attn.sp_o = t[1];
+                l.mlp.sp_gu = t[2];
+                l.mlp.sp_down = t[3];
+            }
         }
     }
 
@@ -1022,6 +1074,10 @@ impl Model {
     pub fn forward_argmax_graph(&mut self, token: usize, pos: usize, real_vocab: usize) -> u32 {
         let max_seq = self.layers.first().map(|l| l.attn.max_seq()).unwrap_or(0);
         assert!(pos < max_seq, "graph decode: position {pos} is past the KV cache ({max_seq})");
+        if self.sparsity.is_some() && pos < SPARSE_DENSE_FIRST {
+            // the captured graph carries the sparse thresholds: run the dense positions eagerly
+            return self.forward_argmax(token, pos, real_vocab);
+        }
         if self.graph.is_none() || self.graph_vocab != real_vocab {
             // (the shared-memory limit of the sequential attention kernel is checked in op_attn_dk,
             // where that kernel is actually chosen; the default split-KV kernel has no such limit)
@@ -1063,6 +1119,10 @@ impl Model {
     /// (on device). Shared body of [`forward`](Self::forward) and
     /// [`forward_argmax`](Self::forward_argmax).
     fn run_forward(&mut self, token: usize, pos: usize) {
+        let dense = self.sparsity.is_some() && pos < SPARSE_DENSE_FIRST;
+        if dense {
+            self.set_sparse_thresholds(false);
+        }
         let row = &self.embedding[token * self.hidden..(token + 1) * self.hidden];
         self.h.upload(row);
         for l in &mut self.layers {
@@ -1070,6 +1130,9 @@ impl Model {
         }
         rmsnorm(&self.h, &self.final_norm, &mut self.normed, self.eps);
         self.lm_head.forward_into(&self.normed, &mut self.logits);
+        if dense {
+            self.set_sparse_thresholds(true);
+        }
     }
 
     /// Process one token at position `pos`, returning the `vocab` next-token logits.
@@ -1106,6 +1169,49 @@ impl Model {
     /// position at or past it is refused.
     pub fn max_seq(&self) -> usize {
         self.layers.first().map(|l| l.attn.max_seq()).unwrap_or(0)
+    }
+
+    /// Opt-in activation sparsity (TEAL-style, lossy): load per-layer thresholds written by
+    /// `model/teal_sparsity.py` (magic SPT1, i32 layers, i32 sites = 4, f32 target sparsity, then
+    /// per layer the q/k/v, o, gate/up and down input thresholds). Inputs below a threshold
+    /// become 0 and the 4-bit GEMVs skip their rows. CUDA only; call it before the first decode
+    /// step (the CUDA graph captures the kernel choice). Positions below SPARSE_DENSE_FIRST
+    /// (the attention sink) run dense. The batched path (forward_m2, forward_mk, speculative
+    /// decoding) refuses to run with thresholds loaded. Returns the target sparsity.
+    pub fn load_sparsity(&mut self, path: &str) -> std::io::Result<f32> {
+        use std::io::{Error, ErrorKind};
+        if cfg!(not(feature = "cuda")) {
+            return Err(Error::new(ErrorKind::Unsupported, "activation sparsity is CUDA-only for now"));
+        }
+        if self.graph.is_some() {
+            return Err(Error::new(ErrorKind::Other, "load the sparsity thresholds before the first graph decode step"));
+        }
+        let mut b = Vec::new();
+        File::open(path)?.read_to_end(&mut b)?;
+        let bad = |m: &str| Error::new(ErrorKind::InvalidData, format!("{path}: {m}"));
+        if b.len() < 16 || &b[0..4] != b"SPT1" {
+            return Err(bad("not a sparsity file (magic SPT1)"));
+        }
+        let i32_at = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let f32_at = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let (nl, ns, target) = (i32_at(4) as usize, i32_at(8) as usize, f32_at(12));
+        if nl != self.layers.len() || ns != 4 || b.len() != 16 + nl * ns * 4 {
+            return Err(bad(&format!("{nl} layers x {ns} sites does not match this model ({} layers x 4)", self.layers.len())));
+        }
+        // validate every threshold before touching any layer: a rejected file leaves the model dense
+        let ts: Vec<[f32; 4]> = (0..nl)
+            .map(|li| {
+                let o = 16 + li * 16;
+                [f32_at(o), f32_at(o + 4), f32_at(o + 8), f32_at(o + 12)]
+            })
+            .collect();
+        if let Some(li) = ts.iter().position(|t| t.iter().any(|x| !x.is_finite() || *x < 0.0)) {
+            return Err(bad(&format!("layer {li}: thresholds must be finite and non-negative")));
+        }
+        self.sparsity = Some(ts);
+        self.set_sparse_thresholds(true);
+        unsafe { set_sparse_rows(1) };
+        Ok(target)
     }
 
     /// Batched 2-token forward for speculative verification: processes `t0` at `pos` and

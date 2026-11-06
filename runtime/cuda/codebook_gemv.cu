@@ -13,6 +13,10 @@
 // Set once a CUDA graph has been captured: from then on, scratch buffers that a captured
 // graph may reference are never freed (see ypart), only superseded.
 static int g_graphs_captured = 0;
+// Activation sparsity (TEAL-style, opt-in): set by set_sparse_rows() when a model loads activation
+// thresholds; the 4-bit GEMVs then skip the index rows of zero inputs. Chosen at launch, so it
+// must be set before any CUDA-graph capture.
+static int g_sparse_rows = 0;
 
 #define K 16
 #define CPB 256
@@ -88,6 +92,10 @@ gemv4(const __half* __restrict__ X, const unsigned char* __restrict__ packed,
 // grid.y block writes its IC-slice partial to its OWN row of Ypart (Ypart[blockIdx.y*OC + j]) --
 // disjoint, no atomics. Stage 2 (gemv_reduce) sums the GS partial rows per column in FIXED
 // blockIdx.y order -> bitwise-reproducible while keeping gemv4's GS-way IC split.
+// SKIP (activation sparsity): read the input first and skip the row's indices when it is zero. A
+// zero input adds exactly nothing, so the result is the same bits as the dense loop, which keeps
+// its original load order when SKIP is false.
+template <bool SKIP>
 __global__ void __launch_bounds__(32*TY)
 gemv4_partial(const __half* __restrict__ X, const unsigned char* __restrict__ packed,
               const __half* __restrict__ cb, float* __restrict__ Ypart, int IC, int OC) {
@@ -104,8 +112,16 @@ gemv4_partial(const __half* __restrict__ X, const unsigned char* __restrict__ pa
     int jbase = j0 + tx*8; size_t OCp = OC/2;
     float acc[8] = {0,0,0,0,0,0,0,0};
     for (int ic = ic0+ty; ic < ic1; ic += TY) {
-        unsigned f = __ldg((const unsigned*)&packed[(size_t)ic*OCp + jbase/2]);
-        float xx = __half2float(__ldg(&X[ic]));
+        unsigned f;
+        float xx;
+        if (SKIP) {
+            xx = __half2float(__ldg(&X[ic]));
+            if (xx == 0.f) continue;              // warp-uniform: the 32 lanes share the row
+            f = __ldg((const unsigned*)&packed[(size_t)ic*OCp + jbase/2]);
+        } else {
+            f = __ldg((const unsigned*)&packed[(size_t)ic*OCp + jbase/2]);
+            xx = __half2float(__ldg(&X[ic]));
+        }
         #pragma unroll
         for (int c = 0; c < 8; c++) { unsigned char id = (f>>(4*c))&0xF; acc[c] += xx*__half2float(s_cb[id*CPB+tx*8+c]); }
     }
@@ -202,6 +218,7 @@ __global__ void gemv_reduce(const float* __restrict__ Ypart, float* __restrict__
 // 40 registers, but +1.8 ms per token on an A40 and no gain on an RTX 4090, 2026-11-05); this
 // form took the 4-bit decode from 6.36 to 5.28 ms per token on the 4090 with identical bits.
 // An unused third projection repeats the second one with oc2 = 0 and is never selected.
+template <bool SKIP>
 __global__ void __launch_bounds__(32*TY)
 gemv4_partial_seg(const __half* __restrict__ X,
                   const unsigned char* __restrict__ p0, const unsigned char* __restrict__ p1,
@@ -226,8 +243,16 @@ gemv4_partial_seg(const __half* __restrict__ X,
     int jbase = j0 + tx*8; size_t OCp = OC/2;
     float acc[8] = {0,0,0,0,0,0,0,0};
     for (int ic = ic0+ty; ic < ic1; ic += TY) {
-        unsigned f = __ldg((const unsigned*)&packed[(size_t)ic*OCp + jbase/2]);
-        float xx = __half2float(__ldg(&X[ic]));
+        unsigned f;
+        float xx;
+        if (SKIP) {
+            xx = __half2float(__ldg(&X[ic]));
+            if (xx == 0.f) continue;              // warp-uniform: the 32 lanes share the row
+            f = __ldg((const unsigned*)&packed[(size_t)ic*OCp + jbase/2]);
+        } else {
+            f = __ldg((const unsigned*)&packed[(size_t)ic*OCp + jbase/2]);
+            xx = __half2float(__ldg(&X[ic]));
+        }
         #pragma unroll
         for (int c = 0; c < 8; c++) { unsigned char id = (f>>(4*c))&0xF; acc[c] += xx*__half2float(s_cb[id*CPB+tx*8+c]); }
     }
@@ -262,7 +287,7 @@ __global__ void gemv_reduce_half3(const float* __restrict__ Ypart,
     }
 }
 // gate, up (two projections of n columns each): reduce both, then silu_mul_k's arithmetic.
-__global__ void gemv_reduce_silu(const float* __restrict__ Ypart, __half* __restrict__ out, int n, int GSy) {
+__global__ void gemv_reduce_silu(const float* __restrict__ Ypart, __half* __restrict__ out, int n, int GSy, float thr) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= n) return;
     size_t OCt = (size_t)2*n;
@@ -270,7 +295,9 @@ __global__ void gemv_reduce_silu(const float* __restrict__ Ypart, __half* __rest
     for (int y = 0; y < GSy; y++) g += Ypart[(size_t)y*OCt + i];
     for (int y = 0; y < GSy; y++) u += Ypart[(size_t)y*OCt + n + i];
     float s = g / (1.f + expf(-g));
-    out[i] = __float2half(s * u);
+    __half o = __float2half(s * u);
+    if (thr > 0.f && fabsf(__half2float(o)) < thr) o = __float2half(0.f);   // activation sparsity
+    out[i] = o;
 }
 // o and down: reduce, then resadd_k's arithmetic into the fp16 residual stream.
 __global__ void gemv_reduce_resadd(const float* __restrict__ Ypart, __half* __restrict__ h, int OC, int GSy) {
@@ -287,8 +314,9 @@ __global__ void cast_f2h(const float* __restrict__ src, __half* __restrict__ dst
 }
 
 // RMSNorm: out = x / sqrt(mean(x^2)+eps) * w. One block, 256 threads (n up to a few k).
+// thr > 0 (activation sparsity): outputs whose fp16 value is below thr in magnitude become 0.
 __global__ void rmsnorm_k(const __half* __restrict__ x, const float* __restrict__ w,
-                          __half* __restrict__ out, int n, float eps) {
+                          __half* __restrict__ out, int n, float eps, float thr) {
     __shared__ float red[256];
     int tid = threadIdx.x;
     float ss = 0;
@@ -296,7 +324,11 @@ __global__ void rmsnorm_k(const __half* __restrict__ x, const float* __restrict_
     red[tid] = ss; __syncthreads();
     for (int s = 128; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid+s]; __syncthreads(); }
     float scale = rsqrtf(red[0]/n + eps);
-    for (int i = tid; i < n; i += 256) out[i] = __float2half(__half2float(x[i]) * scale * w[i]);
+    for (int i = tid; i < n; i += 256) {
+        __half o = __float2half(__half2float(x[i]) * scale * w[i]);
+        if (thr > 0.f && fabsf(__half2float(o)) < thr) o = __float2half(0.f);
+        out[i] = o;
+    }
 }
 
 // SwiGLU activation: out = silu(gate) * up, gate/up are f32 (kernel outputs), out fp16.
@@ -1039,7 +1071,8 @@ void qlinear_forward_dev(void* handle, const void* d_x, void* d_y) {
         // Two-stage deterministic: partials to Ypart (no atomics), then fixed-order reduce.
         float* yp = ypart((size_t)gy * q->OC);
         dim3 grid(q->OC/CPB, gy), block(32, TY);
-        gemv4_partial<<<grid, block, smem, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, yp, q->IC, q->OC);
+        if (g_sparse_rows) gemv4_partial<true><<<grid, block, smem, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, yp, q->IC, q->OC);
+        else gemv4_partial<false><<<grid, block, smem, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, yp, q->IC, q->OC);
         int tpb = 256;
         gemv_reduce<<<(q->OC + tpb - 1)/tpb, tpb, 0, g_stream>>>(yp, (float*)d_y, q->OC, gy);
         return;
@@ -1149,8 +1182,25 @@ void dev_upload_f32(void* d_f32, const float* x, int n) {
 // transformer-block ops (all on g_stream, so the whole block is CUDA-graph capturable)
 void op_rmsnorm(const void* x_half, const void* w_f32, void* out_half, int n, float eps) {
     ensure_stream();
-    rmsnorm_k<<<1, 256, 0, g_stream>>>((const __half*)x_half, (const float*)w_f32, (__half*)out_half, n, eps);
+    rmsnorm_k<<<1, 256, 0, g_stream>>>((const __half*)x_half, (const float*)w_f32, (__half*)out_half, n, eps, 0.f);
 }
+// RMSNorm whose small outputs (|fp16 value| < thr) become 0 (activation sparsity); thr 0 = op_rmsnorm.
+void op_rmsnorm_thr(const void* x_half, const void* w_f32, void* out_half, int n, float eps, float thr) {
+    ensure_stream();
+    rmsnorm_k<<<1, 256, 0, g_stream>>>((const __half*)x_half, (const float*)w_f32, (__half*)out_half, n, eps, thr);
+}
+// In place: fp16 values below thr in magnitude become 0 (the o_proj input under activation sparsity).
+__global__ void sparsify_half_k(__half* __restrict__ x, int n, float thr) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n && fabsf(__half2float(x[i])) < thr) x[i] = __float2half(0.f);
+}
+void op_sparsify_half(void* x_half, int n, float thr) {
+    if (thr <= 0.f) return;
+    ensure_stream();
+    sparsify_half_k<<<(n+255)/256, 256, 0, g_stream>>>((__half*)x_half, n, thr);
+}
+// Turn the row-skipping 4-bit GEMVs on (activation thresholds loaded) or off.
+void set_sparse_rows(int on) { g_sparse_rows = on ? 1 : 0; }
 void op_silu_mul(const void* gate_f32, const void* up_f32, void* out_half, int n) {
     ensure_stream();
     silu_mul_k<<<(n+255)/256, 256, 0, g_stream>>>((const float*)gate_f32, (const float*)up_f32, (__half*)out_half, n);
@@ -1571,8 +1621,12 @@ static void launch_partial_seg(QLinear* const* ps, int n, const void* d_x, float
     QLinear* b = n > 1 ? ps[1] : ps[0];
     QLinear* c = n > 2 ? ps[2] : b;              // unused third projection: oc 0, never selected
     int o0 = a->OC, o1 = n > 1 ? b->OC : 0, o2 = n > 2 ? c->OC : 0;
-    gemv4_partial_seg<<<grid, block, smem, g_stream>>>((const __half*)d_x, a->d_packed, b->d_packed, c->d_packed,
-                                                       a->d_cb, b->d_cb, c->d_cb, o0, o1, o2, yp, a->IC, OCt);
+    if (g_sparse_rows)
+        gemv4_partial_seg<true><<<grid, block, smem, g_stream>>>((const __half*)d_x, a->d_packed, b->d_packed, c->d_packed,
+                                                                 a->d_cb, b->d_cb, c->d_cb, o0, o1, o2, yp, a->IC, OCt);
+    else
+        gemv4_partial_seg<false><<<grid, block, smem, g_stream>>>((const __half*)d_x, a->d_packed, b->d_packed, c->d_packed,
+                                                                  a->d_cb, b->d_cb, c->d_cb, o0, o1, o2, yp, a->IC, OCt);
 }
 
 // q, k, v of an attention block: one GEMV launch and one reduce (bias add, cast to half).
@@ -1602,7 +1656,8 @@ void qlinear3_forward_half(void* hq, void* hk, void* hv, const void* d_x,
 }
 
 // gate, up of an MLP block: one GEMV launch, then one kernel for both reductions and SiLU * up.
-void qlinear2_forward_silu(void* hg, void* hu, const void* d_x, void* gf, void* uf, void* act_h) {
+// thr > 0: the SiLU output (the down_proj input) is thresholded too (activation sparsity).
+void qlinear2_forward_silu(void* hg, void* hu, const void* d_x, void* gf, void* uf, void* act_h, float thr) {
     ensure_stream();
     QLinear* ps[2] = {(QLinear*)hg, (QLinear*)hu};
     if (fuse_ok(ps, 2, 8) && ps[0]->OC == ps[1]->OC) {
@@ -1611,12 +1666,13 @@ void qlinear2_forward_silu(void* hg, void* hu, const void* d_x, void* gf, void* 
         float* yp = ypart((size_t)gy * OCt);
         launch_partial_seg(ps, 2, d_x, yp, OCt, gy);
         int tpb = 256;
-        gemv_reduce_silu<<<(n + tpb - 1)/tpb, tpb, 0, g_stream>>>(yp, (__half*)act_h, n, gy);
+        gemv_reduce_silu<<<(n + tpb - 1)/tpb, tpb, 0, g_stream>>>(yp, (__half*)act_h, n, gy, thr);
         return;
     }
     qlinear_forward_dev(ps[0], d_x, gf);
     qlinear_forward_dev(ps[1], d_x, uf);
     op_silu_mul(gf, uf, act_h, ps[0]->OC);
+    op_sparsify_half(act_h, ps[0]->OC, thr);
 }
 
 // o and down projections: GEMV, then the residual add folded into the reduce.
@@ -1629,7 +1685,8 @@ void qlinear_forward_resadd(void* handle, const void* d_x, void* yf, void* h_hal
         float* yp = ypart((size_t)gy * q->OC);
         size_t smem = (size_t)K*CPB*sizeof(__half) + (size_t)TY*CPB*sizeof(float);
         dim3 grid(q->OC/CPB, gy), block(32, TY);
-        gemv4_partial<<<grid, block, smem, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, yp, q->IC, q->OC);
+        if (g_sparse_rows) gemv4_partial<true><<<grid, block, smem, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, yp, q->IC, q->OC);
+        else gemv4_partial<false><<<grid, block, smem, g_stream>>>((const __half*)d_x, q->d_packed, q->d_cb, yp, q->IC, q->OC);
         int tpb = 256;
         gemv_reduce_resadd<<<(q->OC + tpb - 1)/tpb, tpb, 0, g_stream>>>(yp, (__half*)h_half, q->OC, gy);
         return;
