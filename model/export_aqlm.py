@@ -144,11 +144,17 @@ def walk_cbk4(path):
 
 
 @torch.no_grad()
-def ppl_windows(model, tok, n_windows, seqlen=2048):
+def ppl_windows(model, tok, n_windows, seqlen=2048, window0_out=None):
+    """wikitext-2 test PPL over the first n_windows windows of seqlen tokens. Also prints the
+    running PPL after windows 1 and 30 (window 1 alone is what the runtime's TRAPETUM_NLL check
+    compares against) and, with window0_out, writes window 0's token ids (i32) for that check."""
     from datasets import load_dataset
     data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     enc = tok("\n\n".join(data["text"]), return_tensors="pt").input_ids
     n = min(n_windows, enc.size(1) // seqlen)
+    if window0_out:
+        enc[0, :seqlen].numpy().astype("<i4").tofile(window0_out)
+        print(f"wrote {window0_out} ({seqlen} tokens of wikitext-2 test window 0)", flush=True)
     lf = torch.nn.CrossEntropyLoss(reduction="sum")
     tot, nt = 0.0, 0
     for i in range(n):
@@ -156,6 +162,8 @@ def ppl_windows(model, tok, n_windows, seqlen=2048):
         o = model(ids).logits
         tot += lf(o[:, :-1, :].reshape(-1, o.size(-1)).float(), ids[:, 1:].reshape(-1)).item()
         nt += ids[:, 1:].numel()
+        if i + 1 in (1, 30) or (i + 1) % 10 == 0:
+            print(f"  PPL_RUNNING windows={i + 1} mean_nll={tot / nt:.6f} ppl={math.exp(tot / nt):.4f}", flush=True)
     return math.exp(tot / nt), n
 
 
@@ -168,6 +176,9 @@ def main():
     ap.add_argument("--lm-k", type=int, default=256, choices=(16, 256))
     ap.add_argument("--ppl", type=int, default=0, help="also report wikitext-2 PPL over N windows of 2048")
     ap.add_argument("--ppl-tokenizer", default=None, help="tokenizer for --ppl (default: the model's)")
+    ap.add_argument("--ppl-window0-out", default=None, help="with --ppl: write window 0's token ids (i32) here")
+    ap.add_argument("--lm-chunk", type=int, default=16384,
+                    help="LM-head quantization: output columns per GPU chunk (smaller = less GPU memory, same result)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -222,7 +233,8 @@ def main():
             if (li + 1) % 8 == 0 or li + 1 == n_layers:
                 print(f"  layer {li + 1}/{n_layers} written", flush=True)
         w_f32(f, model.model.norm.weight)
-        packed, cb, w_dq = quantize(pad_rows(model.lm_head.weight, pad_vocab), k=args.lm_k)
+        assert args.lm_chunk > 0 and args.lm_chunk % 2 == 0, "--lm-chunk must be even (nibble pairs)"
+        packed, cb, w_dq = quantize(pad_rows(model.lm_head.weight, pad_vocab), chunk=args.lm_chunk, k=args.lm_k)
         f.write(packed.tobytes())
         f.write(cb.tobytes())
     L_, m_, k_ = walk_cbk4(path)
@@ -249,7 +261,7 @@ def main():
 
     if args.ppl > 0:
         ptok = AutoTokenizer.from_pretrained(args.ppl_tokenizer) if args.ppl_tokenizer else tok
-        p, n = ppl_windows(model, ptok, args.ppl)
+        p, n = ppl_windows(model, ptok, args.ppl, window0_out=args.ppl_window0_out)
         print(f"PPL of the exported model (AQLM codes + {args.lm_k}-entry LM head), wikitext-2 {n}x2048 = {p:.4f}", flush=True)
 
 
