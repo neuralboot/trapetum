@@ -13,7 +13,9 @@ fp16 over a 512-token generation (see [`bench/PARETO.md`](bench/PARETO.md); ener
 re-measured since). With the November 2026 kernels and the new exporter's file it decodes at
 194.5 tok/s (RTX 4090, CUDA graph, mean over a 512-token generation), still 16/16. The 4-bit
 file is 3.66 GB instead of 13.48 GB in fp16, 3.7x smaller (the new exporter's file is
-3.75 GB, 3.6x).
+3.75 GB, 3.6x). The same runtime serves Llama-2-70B in 2 bits on one RTX 4090: 38.4 tok/s at
+positions 6 to 22, wikitext-2 perplexity 4.49 on the full test set, against 5.72 for the new
+7B 4-bit file and 5.47 for fp16 Llama-2-7B ([details](#llama-2-70b-in-2-bits-on-one-rtx-4090)).
 
 > **Correction, November 2026.** The 4-bit Llama-2-7B perplexity published here until now
 > (wikitext-2 PPL 6.34) came from a research script, not from the runtime's 4-bit file,
@@ -44,10 +46,11 @@ Y[m, j]     = sum_i  X[m, i] * W_deq[i, j]
 | opt-in activation sparsity at 25% (lossy) | 1.16x faster decode for +0.12 PPL |
 | tensor-core 4-bit GEMV, batch-invariant verify | 194.5 tok/s (512-token benchmark); verifying 16 tokens costs 1.21x a decode step at short context |
 | PARD speculative decoding, Llama-3.1-8B-Instruct | 2.51x end to end (165.5 to 415.6 tok/s); 520 of 520 outputs identical to plain greedy decoding of the same 4-bit target |
+| Llama-2-70B in 2 bits (AQLM 2x8, 17.96 GB file) on one RTX 4090 | wikitext-2 PPL 4.49 on the full test set (4.68 on 30 windows), against 5.72 (6.10) for the new 7B 4-bit file; 38.4 tok/s at positions 6 to 22; greedy 16/16 against the Hugging Face reference |
 
 Setup, caveats, per-step details and how to reproduce:
 [November 2026 update](#november-2026-update), under *Benchmarks*. The kernel changes are CUDA
-only (Apple Metal is unchanged). The code is on `main` (commits 2e8c170 to 2ca5d97); the
+only (Apple Metal is unchanged). The code is on `main` (commits 2e8c170 to fb8795f); the
 desktop app's downloadable models are not updated.
 
 ## Repository layout
@@ -370,9 +373,10 @@ experiment (`prof11.cu`) shows the wmma API is *not* the bottleneck (raw
 
 ### November 2026 update
 
-Measured on 5 and 6 November 2026. Code: commits 2e8c170 (exporter), 04a8b60 (split-KV
+Measured on 5, 6 and 7 November 2026. Code: commits 2e8c170 (exporter), 04a8b60 (split-KV
 attention, fused kernels), e9b97d6 (activation sparsity), d0c4e23 (tensor-core GEMV,
-batch-invariant verify) and 2ca5d97 (PARD), on `main`. The raw logs of these runs are not
+batch-invariant verify), 2ca5d97 (PARD) and fb8795f (2-bit exporter options for
+Llama-2-70B), on `main`. The raw logs of these runs are not
 in the repository; the results are summarized here.
 
 **Setup.** Rented RunPod GPUs, one GPU per run, each run on a fresh pod, so hosts differ
@@ -383,7 +387,8 @@ Image `pytorch/pytorch:2.4.0-cuda12.1-cudnn9-devel` (Python 3.11.9, PyTorch 2.4.
 4090 hosts that log it. Batch 1, greedy, CUDA-graph decode (`TRAPETUM_GRAPH=1`) unless marked
 eager. Three timing windows: the mean per 128-position bin of one long greedy decode
 (`TRAPETUM_SWEEP`), the 16-token continuation after a 6-token prompt (positions 6 to 22, the
-window of the CBK4 table above), and a 512-token decode benchmark. Each per-step gain below
+window of the CBK4 table above), and a 512-token decode benchmark (the Llama-2-70B run also
+reports a 256-token decode). Each per-step gain below
 is a same-host A/B; figures from different steps come from different hosts (for scale, one
 decode path measured 184.6, 185.5 and 187.8 tok/s at positions 6 to 22 on three RTX 4090
 hosts). From step 1 on, every Llama-2-7B 4-bit speed is measured on the new exporter's file.
@@ -599,6 +604,60 @@ pin) on the target's original tokenizer. `pard_bench` runs both arms on every pr
 a `PARD MISMATCH` line for any output difference, then one line per prompt set and a pooled
 line; `--limit N` and `--sets a,b` select prompts, and `--eos` and `--mask` default to Llama
 3.1's end tokens and the PARD drafter's mask token.
+
+#### Llama-2-70B in 2 bits on one RTX 4090
+
+The 2-bit path (CBK4 additive codebooks, see *Toward vector codebooks* above) also serves
+[`ISTA-DASLab/Llama-2-70b-AQLM-2Bit-2x8-hf`](https://huggingface.co/ISTA-DASLab/Llama-2-70b-AQLM-2Bit-2x8-hf),
+an AQLM 2x8 checkpoint (not PV-tuned), on a single RTX 4090 (24 GB). `model/export_aqlm.py`
+copies the AQLM codes, codebooks and scales bit for bit and quantizes the fp16 LM head to
+8 bits, a 17.96 GB file; the runtime keeps the embedding off the GPU (524 MB in fp16 in the file, about 1.05 GB as f32 in host RAM, one row uploaded per token). Llama-2-70B uses the Llama-2-7B tokenizer, so the
+perplexities below compare directly. Measured on 7 November 2026, one run on one host, against
+a rule fixed before the run; all five criteria passed (the model fits on the card; prompt logits within 5e-3 relative error of the reference, top-1 on every prompt position and greedy 16/16 in eager and CUDA-graph mode; the runtime's own NLL within 0.005 nats of the reference; full-test perplexity at most 4.70; at least 10 tok/s).
+
+| Llama-2 | file | wikitext-2 PPL, 30 windows | full test set | decode tok/s, positions 6 to 22 |
+|---|---:|---:|---:|---:|
+| 7B, fp16 | 13.48 GB | 5.83 | 5.47 | - |
+| 7B, 4-bit, new exporter | 3.75 GB | 6.10 | 5.72 | 205.0 |
+| **70B, 2-bit AQLM 2x8** | **17.96 GB** | **4.68** | **4.49** | **38.4** |
+
+Decode is batch 1 with CUDA graphs on an RTX 4090; the two models ran on different hosts.
+
+- **Agreement with the reference.** Against the Hugging Face AQLM model carrying the same
+  8-bit head, prompt logits are within 1.77e-3 to 2.57e-3 relative error (top-1 6/6) and the
+  16-token greedy continuation matches, in eager mode and in three CUDA-graph runs; the
+  smallest top-two logit margin along it is 0.17. On the first 2,048 wikitext-2 test tokens the
+  runtime's own mean NLL (`TRAPETUM_NLL=1`) is 1.228539 nats per token against 1.228504 for
+  the reference.
+- **Memory.** With a 1,024-position KV cache, decoding peaks at 17,378 MiB of the card's 24,564 MiB (17,698 MiB with the 1,216-position cache of the decode to 1,152 positions, 18,004 MiB with the 2,112-position cache of the 2,048-token NLL check).
+- **Speed.** 38.3 and 38.6 tok/s at positions 6 to 22 (two rounds), 38.1 over a 256-token
+  decode, 37.5 near 1,024 to 1,152 positions. About 17.4 GB of weights are read per token, so
+  about 670 GB/s, two thirds of the card's 1,008 GB/s. On the same host the 7B 2-bit PV file
+  decodes at 213.4 and 213.9 tok/s.
+- **Limits.** One run on one host. The checkpoint is 2x8 and not PV-tuned (no PV-tuned 2x8 Llama-2-70B is published): at context 4,096 the model cards give 4.21 for it, 3.83 for the 1x16 checkpoint and 3.78 for the PV-tuned 1x16 one, a layout the runtime does not decode yet. The 4.06 of the 2-bit 70B in
+  [`bench/README.md`](bench/README.md) is that 1x16 checkpoint (not PV-tuned), run in Python,
+  not this file. The perplexities are computed in Python on the served weights (AQLM codes and
+  the 8-bit head); the runtime's NLL was compared on the first window only. 2-bit decode sums
+  partials with atomics, so its logits vary slightly from run to run, and it has no speculative
+  path. The weights are not redistributed (Llama 2 Community License).
+
+Reproduce (CUDA; the export loads the AQLM model on the GPU, about 18.2 GB, with `aqlm[gpu]`;
+the run used transformers 4.44.2 and aqlm 1.1.7, and peaked at 20,315 MiB with the perplexity):
+
+```sh
+python model/export_aqlm.py --model ISTA-DASLab/Llama-2-70b-AQLM-2Bit-2x8-hf --out /root/c70 \
+    --lm-k 256 --lm-chunk 4096 --ppl 166 --ppl-tokenizer NousResearch/Llama-2-7b-hf \
+    --ppl-window0-out /root/c70/wt2_w0.bin
+cd runtime && cargo build --release --bin generate
+TRAPETUM_GRAPH=1 ./target/release/generate /root/c70/model.cbk /root/c70/prompt.bin \
+    /root/c70/ref.bin /root/c70/cont.bin 256
+TRAPETUM_NLL=1 ./target/release/generate /root/c70/model.cbk /root/c70/wt2_w0.bin - -
+```
+
+`--lm-chunk 4096` quantizes the LM head in chunks of 4,096 columns (same result, less GPU
+memory) so that it fits next to the 70B; `--ppl 166` prints the running perplexity after
+window 1 and every 10 windows (the 30-window value included) and the full-test value, and
+`--ppl-window0-out` writes the first window's tokens for the `TRAPETUM_NLL` check.
 
 #### Switches and checks
 
