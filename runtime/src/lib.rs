@@ -25,6 +25,8 @@ mod backend {
         // AVQ (additive-codebook) linear for MoE routed experts (M in {2,3}); see AvqLinear.
         pub fn avq_create(codes: *const u8, cb: *const f32, scale: *const f32, m: i32, rows: i32, cols: i32) -> *mut c_void;
         pub fn avq_forward_dev(h: *mut c_void, d_x: *const c_void, d_y: *mut c_void);
+        // batch-invariant verify GEMV of a 1x16 AVQ projection: m rows, each the decode GEMV's bits
+        pub fn avq_forward_v(h: *mut c_void, d_x: *const c_void, d_y: *mut c_void, m: i32);
         pub fn avq_free(h: *mut c_void);
         pub fn dev_alloc_half(n: i32) -> *mut c_void;
         pub fn dev_alloc_f32(n: i32) -> *mut c_void;
@@ -320,36 +322,49 @@ impl Drop for QuantLinear {
 pub const AVQ_K: usize = 256;
 /// Group size for additive VQ (weights per code).
 pub const AVQ_D: usize = 8;
+/// Entries of the single codebook of an AQLM "1x16" projection (`M = 1`, 16-bit codes).
+pub const AVQ16_K: usize = 65536;
 
 /// An additive-codebook (AQLM-style) quantized linear whose weights live on the GPU,
-/// used for MoE routed experts. A group of [`AVQ_D`] input weights for output channel `o`
-/// is reconstructed as `scale[o] * sum_m C_m[code_m[o,g]]`, with `M` additive codebooks of
-/// [`AVQ_K`] vectors (`M=2` -> 2 bit/weight, `M=3` -> 3 bit). Same decode as the CBKA
-/// container and `kernels/avq_gemv3.cu`; see the CBKA reader in `load_deepseek_qlora`.
+/// used for MoE routed experts and the CBK4 dense body. A group of [`AVQ_D`] input weights
+/// for output channel `o` is reconstructed as `scale[o] * sum_m C_m[code_m[o,g]]`, with `M`
+/// additive codebooks of [`AVQ_K`] vectors (`M=2` -> 2 bit/weight, `M=3` -> 3 bit), or, with
+/// `M=1`, AQLM "1x16": one codebook of [`AVQ16_K`] vectors and 16-bit codes (2 bit/weight).
+/// Same decode as the CBKA/CBKH records (see `read_cbka`) and `kernels/avq_gemv3.cu`.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct AvqLinear {
     handle: *mut c_void,
     ic: usize,
     oc: usize,
+    m: usize, // 1 = 1x16 (the only AVQ format with a batch-invariant verify GEMV), 2 or 3 = Mx8
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl AvqLinear {
-    /// - `codes`: `M*(cols/AVQ_D)*rows` bytes, layout `[M][ng][rows]` (`ng = cols/AVQ_D`).
-    /// - `cb`: `M*AVQ_K*AVQ_D` f32, layout `[M][AVQ_K][AVQ_D]`.
+    /// - `codes`: `M = 2, 3`: `M*(cols/AVQ_D)*rows` bytes, layout `[M][ng][rows]` (`ng = cols/AVQ_D`);
+    ///   `M = 1` (1x16): `rows*ng` little-endian u16 (`2*rows*ng` bytes), layout `[rows][ng]`.
+    /// - `cb`: `M = 2, 3`: `M*AVQ_K*AVQ_D` f32, layout `[M][AVQ_K][AVQ_D]`;
+    ///   `M = 1`: `AVQ16_K*AVQ_D` f32, layout `[AVQ16_K][AVQ_D]`.
     /// - `scale`: `rows` f32, one per output channel. `rows = oc`, `cols = ic`.
     pub fn new(codes: &[u8], cb: &[f32], scale: &[f32], m: usize, rows: usize, cols: usize) -> Self {
-        assert!(m == 2 || m == 3, "AVQ M must be 2 or 3 (only those kernels are instantiated)");
+        assert!(m == 1 || m == 2 || m == 3, "AVQ M must be 1 (1x16), 2 or 3 (only those kernels are instantiated)");
         assert_eq!(cols % AVQ_D, 0, "cols (ic) must be a multiple of AVQ_D={AVQ_D}");
-        assert_eq!(rows % 4, 0, "rows (oc) must be a multiple of 4 (uint32 code read)");
-        assert_eq!(codes.len(), m * (cols / AVQ_D) * rows, "codes must be M*(cols/AVQ_D)*rows bytes");
-        assert_eq!(cb.len(), m * AVQ_K * AVQ_D, "cb must be M*AVQ_K*AVQ_D floats");
+        let ng = cols / AVQ_D;
+        if m == 1 {
+            assert_eq!(cols % 64, 0, "1x16: cols (ic) must be a multiple of 64 (16-byte rows of u16 codes)");
+            assert_eq!(codes.len(), 2 * rows * ng, "1x16: codes must be rows*(cols/AVQ_D) u16");
+            assert_eq!(cb.len(), AVQ16_K * AVQ_D, "1x16: cb must be AVQ16_K*AVQ_D floats");
+        } else {
+            assert_eq!(rows % 4, 0, "rows (oc) must be a multiple of 4 (uint32 code read)");
+            assert_eq!(codes.len(), m * ng * rows, "codes must be M*(cols/AVQ_D)*rows bytes");
+            assert_eq!(cb.len(), m * AVQ_K * AVQ_D, "cb must be M*AVQ_K*AVQ_D floats");
+        }
         assert_eq!(scale.len(), rows, "scale must be rows floats");
         let handle = unsafe {
             avq_create(codes.as_ptr(), cb.as_ptr(), scale.as_ptr(), m as i32, rows as i32, cols as i32)
         };
         assert!(!handle.is_null(), "avq_create returned null (CUDA error?)");
-        Self { handle, ic: cols, oc: rows }
+        Self { handle, ic: cols, oc: rows, m }
     }
 
     /// `y` (device f32) = `x` (device fp16) W^T, decoding the additive codebook. On-device.
@@ -357,6 +372,17 @@ impl AvqLinear {
         assert_eq!(x.n, self.ic, "x must have length ic");
         assert_eq!(y.n, self.oc, "y must have length oc");
         unsafe { avq_forward_dev(self.handle, x.ptr, y.ptr) };
+    }
+
+    /// Batch-invariant verify GEMV, 1x16 only: row r of `y` (the first `m*oc` f32) is the same
+    /// bits as [`forward_into`](Self::forward_into) on row r of `x` (the first `m*ic` fp16).
+    /// `m` in [`VERIFY_M`]. The speculative verify path calls the same kernel.
+    #[cfg(feature = "cuda")]
+    pub fn forward_v(&self, x: &DevHalf, y: &mut DevF32, m: usize) {
+        assert_eq!(self.m, 1, "the AVQ verify GEMV exists for 1x16 projections only");
+        assert!(VERIFY_M.contains(&m), "m must be one of {VERIFY_M:?}");
+        assert!(x.n >= m * self.ic && y.n >= m * self.oc, "x must hold m*ic values and y m*oc");
+        unsafe { avq_forward_v(self.handle, x.ptr, y.ptr, m as i32) };
     }
 
     pub fn shape(&self) -> (usize, usize) {
@@ -588,6 +614,8 @@ const VERIFY_MAX: usize = 16;
 struct VScratchMlp {
     norm: DevHalf,
     act: DevHalf,
+    // 1x16 projections only: the f32 outputs of gate, up and down (VERIFY_MAX rows each)
+    f32s: Option<(DevF32, DevF32, DevF32)>,
 }
 struct VScratchAttn {
     norm: DevHalf,
@@ -595,6 +623,8 @@ struct VScratchAttn {
     kh: DevHalf,
     vh: DevHalf,
     out: DevHalf,
+    // 1x16 projections only: the f32 outputs of q, k, v and o (VERIFY_MAX rows each)
+    f32s: Option<(DevF32, DevF32, DevF32, DevF32)>,
 }
 
 impl MlpBlock {
@@ -1041,20 +1071,35 @@ impl MlpBlock {
     /// Rows 0..m of `h` (VERIFY_MAX x hidden) updated in place: `h = h + MLP(RMSNorm(h))`.
     fn forward_v(&mut self, h: &mut DevHalf, m: usize) {
         assert!(self.sp_gu == 0.0 && self.sp_down == 0.0, "activation sparsity is not supported on the verify path");
-        let (g, u, d) = match (&self.gate, &self.up, &self.down) {
-            (Proj::Scalar(g), Proj::Scalar(u), Proj::Scalar(d)) => (g.handle, u.handle, d.handle),
-            _ => panic!("the verify path needs scalar 4-bit projections"),
+        // scalar 4-bit: fused verify kernels; 1x16: the decode step's separate kernels on m rows
+        let (g, u, d, avq16) = match (&self.gate, &self.up, &self.down) {
+            (Proj::Scalar(g), Proj::Scalar(u), Proj::Scalar(d)) => (g.handle, u.handle, d.handle, false),
+            (Proj::Avq(g), Proj::Avq(u), Proj::Avq(d)) if g.m == 1 && u.m == 1 && d.m == 1 => (g.handle, u.handle, d.handle, true),
+            _ => panic!("the verify path needs scalar 4-bit or 1x16 projections"),
         };
         let hidden = self.norm_w.len();
         let inter = self.g.n;
         let s = self.v_scratch.get_or_insert_with(|| VScratchMlp {
             norm: DevHalf::zeros(VERIFY_MAX * hidden),
             act: DevHalf::zeros(VERIFY_MAX * inter),
+            f32s: avq16.then(|| (DevF32::zeros(VERIFY_MAX * inter), DevF32::zeros(VERIFY_MAX * inter),
+                                 DevF32::zeros(VERIFY_MAX * hidden))),
         });
         unsafe {
             op_rmsnorm_v(h.ptr, self.norm_w.ptr, s.norm.ptr, hidden as i32, self.eps, m as i32);
-            qlinear2_forward_silu_v(g, u, s.norm.ptr, s.act.ptr, m as i32);
-            qlinear_forward_resadd_v(d, s.act.ptr, h.ptr, m as i32);
+            if let Some((gf, uf, df)) = &s.f32s {
+                // as MlpBlock::forward on a 1x16 block: gate, up, SiLU(gate) * up, down, residual
+                // add (the elementwise kernels give the same bits on m rows as on one; the
+                // decode step's op_sparsify_half is a no-op at threshold 0)
+                avq_forward_v(g, s.norm.ptr, gf.ptr, m as i32);
+                avq_forward_v(u, s.norm.ptr, uf.ptr, m as i32);
+                op_silu_mul(gf.ptr, uf.ptr, s.act.ptr, (m * inter) as i32);
+                avq_forward_v(d, s.act.ptr, df.ptr, m as i32);
+                op_residual_add(h.ptr, df.ptr, (m * hidden) as i32);
+            } else {
+                qlinear2_forward_silu_v(g, u, s.norm.ptr, s.act.ptr, m as i32);
+                qlinear_forward_resadd_v(d, s.act.ptr, h.ptr, m as i32);
+            }
         }
     }
 }
@@ -1065,9 +1110,13 @@ impl AttnBlock {
     /// d_tp is not null, for the CUDA graph): appends their KV rows and updates `h` in place.
     fn forward_v(&mut self, h: &mut DevHalf, base: usize, d_tp: *const c_void, m: usize) {
         assert!(self.sp_qkv == 0.0 && self.sp_o == 0.0, "activation sparsity is not supported on the verify path");
-        let (q, k, v, o) = match (&self.q, &self.k, &self.v, &self.o) {
-            (Proj::Scalar(q), Proj::Scalar(k), Proj::Scalar(v), Proj::Scalar(o)) => (q.handle, k.handle, v.handle, o.handle),
-            _ => panic!("the verify path needs scalar 4-bit projections"),
+        let (q, k, v, o, avq16) = match (&self.q, &self.k, &self.v, &self.o) {
+            (Proj::Scalar(q), Proj::Scalar(k), Proj::Scalar(v), Proj::Scalar(o)) => (q.handle, k.handle, v.handle, o.handle, false),
+            (Proj::Avq(q), Proj::Avq(k), Proj::Avq(v), Proj::Avq(o)) if q.m == 1 && k.m == 1 && v.m == 1 && o.m == 1 => {
+                assert!(self.qbias.is_none(), "the 1x16 verify path takes no q/k/v bias");
+                (q.handle, k.handle, v.handle, o.handle, true)
+            }
+            _ => panic!("the verify path needs scalar 4-bit or 1x16 projections"),
         };
         let max_seq = self.max_seq();
         if d_tp.is_null() {
@@ -1087,10 +1136,22 @@ impl AttnBlock {
             kh: DevHalf::zeros(VERIFY_MAX * nkv * hd),
             vh: DevHalf::zeros(VERIFY_MAX * nkv * hd),
             out: DevHalf::zeros(VERIFY_MAX * nh * hd),
+            f32s: avq16.then(|| (DevF32::zeros(VERIFY_MAX * nh * hd), DevF32::zeros(VERIFY_MAX * nkv * hd),
+                                 DevF32::zeros(VERIFY_MAX * nkv * hd), DevF32::zeros(VERIFY_MAX * hidden))),
         });
         unsafe {
             op_rmsnorm_v(h.ptr, self.norm_w.ptr, s.norm.ptr, hidden as i32, self.eps, m as i32);
-            qlinear3_forward_half_v(q, k, v, s.norm.ptr, s.qh.ptr, s.kh.ptr, s.vh.ptr, bq, bk, bv, m as i32);
+            if let Some((qf, kf, vf, _)) = &s.f32s {
+                // as AttnBlock::qkv on a 1x16 block: each projection in f32, then cast to fp16
+                avq_forward_v(q, s.norm.ptr, qf.ptr, m as i32);
+                dev_cast_f32_to_half(s.qh.ptr, qf.ptr, (m * nh * hd) as i32);
+                avq_forward_v(k, s.norm.ptr, kf.ptr, m as i32);
+                dev_cast_f32_to_half(s.kh.ptr, kf.ptr, (m * nkv * hd) as i32);
+                avq_forward_v(v, s.norm.ptr, vf.ptr, m as i32);
+                dev_cast_f32_to_half(s.vh.ptr, vf.ptr, (m * nkv * hd) as i32);
+            } else {
+                qlinear3_forward_half_v(q, k, v, s.norm.ptr, s.qh.ptr, s.kh.ptr, s.vh.ptr, bq, bk, bv, m as i32);
+            }
             op_rope_append_v(
                 s.qh.ptr, s.kh.ptr, s.vh.ptr, self.cache_k.ptr, self.cache_v.ptr, base as i32, d_tp,
                 nh as i32, nkv as i32, hd as i32, self.inv_freq.ptr, m as i32,
@@ -1099,7 +1160,13 @@ impl AttnBlock {
                 s.qh.ptr, self.cache_k.ptr, self.cache_v.ptr, s.out.ptr, nh as i32, nkv as i32, hd as i32,
                 base as i32, d_tp, max_seq as i32, 0.0, m as i32,
             );
-            qlinear_forward_resadd_v(o, s.out.ptr, h.ptr, m as i32);
+            if let Some((_, _, _, of)) = &s.f32s {
+                // as AttnBlock::o_residual on a 1x16 block (op_sparsify_half is a no-op at threshold 0)
+                avq_forward_v(o, s.out.ptr, of.ptr, m as i32);
+                op_residual_add(h.ptr, of.ptr, (m * hidden) as i32);
+            } else {
+                qlinear_forward_resadd_v(o, s.out.ptr, h.ptr, m as i32);
+            }
         }
     }
 }
@@ -1168,14 +1235,21 @@ impl Model {
             return Err("activation sparsity is not supported on the verify path".into());
         }
         let scalar16 = |p: &Proj| matches!(p, Proj::Scalar(q) if q.k == 16);
+        let avq16 = |p: &Proj| matches!(p, Proj::Avq(a) if a.m == 1);
         for (i, l) in self.layers.iter().enumerate() {
             let hd = l.attn.head_dim;
             if hd != 64 && hd != 128 && hd != 256 {
                 return Err(format!("layer {i}: head_dim {hd} (the split-KV attention takes 64, 128 or 256)"));
             }
             let (a, f) = (&l.attn, &l.mlp);
-            if ![&a.q, &a.k, &a.v, &a.o, &f.gate, &f.up, &f.down].iter().all(|p| scalar16(p)) {
-                return Err(format!("layer {i}: the verify path needs scalar 4-bit (K=16) projections"));
+            let ps = [&a.q, &a.k, &a.v, &a.o, &f.gate, &f.up, &f.down];
+            let all16 = ps.iter().all(|p| avq16(p));
+            if !ps.iter().all(|p| scalar16(p)) && !all16 {
+                return Err(format!("layer {i}: the verify path needs scalar 4-bit (K=16) or AQLM 1x16 projections \
+                                    (the 2x8 kernel uses atomics, so its rows are not batch-invariant)"));
+            }
+            if all16 && a.qbias.is_some() {
+                return Err(format!("layer {i}: the 1x16 verify path takes no q/k/v bias"));
             }
         }
         Ok(())
@@ -1744,9 +1818,10 @@ impl Model {
     /// `CBK4` is the CBK3 header plus `avq_m` and `lm_k` (two i32 after the RoPE
     /// frequencies), and its LM head is a scalar codebook with `lm_k` entries (16 or 256).
     /// With `avq_m` 2 or 3 (see `model/export_aqlm.py`) the seven per-layer projections are
-    /// CBKA additive-codebook records (AQLM-style, `avq_m` codebooks of 256 x 8), decoded by
-    /// [`AvqLinear`]. With `avq_m` 0 (see `model/export_runtime.py`, 8-bit head) the body is
-    /// exactly CBK3's, 4-bit scalar projections, only the LM head differs.
+    /// CBKA additive-codebook records (AQLM-style, `avq_m` codebooks of 256 x 8); with `avq_m`
+    /// 1 they are CBKH records (AQLM "1x16": one codebook of 65,536 x 8, 16-bit codes). Both
+    /// are decoded by [`AvqLinear`]. With `avq_m` 0 (see `model/export_runtime.py`, 8-bit head)
+    /// the body is exactly CBK3's, 4-bit scalar projections, only the LM head differs.
     pub fn load_cbk(path: &str, max_seq: usize) -> std::io::Result<Model> {
         let mut r = BufReader::new(File::open(path)?);
         let mut magic = [0u8; 4];
@@ -1828,9 +1903,10 @@ impl Model {
     }
 
     /// Rest of a CBK4 file after the embedding: per layer the two RMSNorm weights and seven
-    /// CBKA records (q, k, v, o, gate, up, down; optional f32 q/k/v biases right after their
-    /// records, as in CBK3), then the final norm and the `lm_k` scalar-codebook LM head.
-    /// The CBKA index bytes are mmap-backed until uploaded, never copied through host RAM.
+    /// CBKA records, or CBKH records when `avq_m` is 1 (q, k, v, o, gate, up, down; optional
+    /// f32 q/k/v biases right after their records, as in CBK3), then the final norm and the
+    /// `lm_k` scalar-codebook LM head. The index bytes are mmap-backed until uploaded, never
+    /// copied through host RAM.
     #[allow(clippy::too_many_arguments)]
     fn load_cbk4_body(
         path: &str,
@@ -1845,7 +1921,7 @@ impl Model {
         embedding: Vec<f32>,
     ) -> std::io::Result<Model> {
         let [n_layers, hidden, n_heads, n_kv, head_dim, inter, vocab] = c;
-        assert!(avq_m == 2 || avq_m == 3, "CBK4: avq_m must be 2 or 3 (got {avq_m})");
+        assert!(avq_m == 1 || avq_m == 2 || avq_m == 3, "CBK4: avq_m must be 1 (1x16), 2 or 3 (got {avq_m})");
         assert!(lm_k == 16 || lm_k == 256, "CBK4: lm_k must be 16 or 256 (got {lm_k})");
         // SAFETY: read-only mapping of the file being loaded, only used for the CBKA index
         // ranges recorded by read_cbka; nothing writes the file while the model loads.
@@ -3386,11 +3462,12 @@ impl ExpertHost {
     }
 }
 
-/// One additive-codebook (CBKA) projection of a MoE expert, host-resident until streamed to
-/// the GPU. The packed `M*(cols/AVQ_D)*rows` u8 indices (`idx`, the bulk) may be
-/// `PackedBytes::Mmap` (paged from disk on demand); the tiny codebooks (`cb`, `M*AVQ_K*AVQ_D`
-/// f32) and per-output-channel scales (`scale`, `rows` f32) always stay owned -- a mmap byte
-/// offset is not guaranteed f32/f16 aligned, and both are only a few KB.
+/// One additive-codebook (CBKA, or CBKH for 1x16) projection, host-resident until uploaded to
+/// the GPU. The packed indices (`idx`, the bulk: `M*(cols/AVQ_D)*rows` u8, or `rows*(cols/AVQ_D)`
+/// u16 for 1x16) may be `PackedBytes::Mmap` (paged from disk on demand); the codebooks (`cb`,
+/// `M*AVQ_K*AVQ_D` f32, or `AVQ16_K*AVQ_D` for 1x16) and per-output-channel scales (`scale`,
+/// `rows` f32) always stay owned -- a mmap byte offset is not guaranteed f32/f16 aligned, and
+/// both are small (a few KB; 2 MiB for a 1x16 codebook).
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct AvqProjHost { idx: PackedBytes, cb: Vec<f32>, scale: Vec<f32>, m: usize, rows: usize, cols: usize }
 
@@ -3403,9 +3480,8 @@ impl AvqProjHost {
 
 // ============================================================================
 // CBKA -- additive-codebook expert record (2/3-bit AQLM-style), the on-disk format
-// emitted by model/export_deepseek_stream.py --experts-avq {2,3} and decoded by
-// `kernels/avq_gemv3.cu` / `AvqLinear`. Only MoE ROUTED experts use it; attention,
-// dense FFN, shared expert, router and lm_head stay on the 4-bit scalar CBKR path.
+// emitted by model/export_deepseek_stream.py --experts-avq {2,3} (MoE routed experts) and
+// model/export_aqlm.py (the CBK4 dense body), decoded by `kernels/avq_gemv3.cu` / `AvqLinear`.
 // One record per weight matrix (a routed expert = 3 records: gate, up, down):
 //   magic  "CBKA"                 (4 bytes)
 //   M      i32                    (2 or 3 additive codebooks)
@@ -3416,6 +3492,11 @@ impl AvqProjHost {
 //   codebooks   M*K*D    f16      layout [M][K][D], flat (m*K + k)*D + e
 //   scales      rows     f16      per output channel
 //   indices     M*ng*rows u8      ng = cols/D, layout [M][ng][rows], flat (m*ng + g)*rows + o
+// CBKH -- the AQLM "1x16" record (model/export_aqlm.py, CBK4 with avq_m = 1): same header
+// with magic "CBKH", M = 1, K = AVQ16_K = 65536 and cols % 64 == 0, then
+//   codebook    K*D      f16      layout [K][D], flat k*D + e
+//   scales      rows     f16      per output channel
+//   indices     rows*ng  u16 LE   layout [rows][ng], flat o*ng + g (row-major, unlike CBKA)
 // The indices (the bulk) are recorded as an mmap byte range (never copied to RAM); the
 // codebooks/scales are read owned. Reconstruction: W[o, g*D+e] = scale[o]*sum_m CB[m][code][e].
 // ============================================================================
@@ -3424,21 +3505,28 @@ fn read_cbka(r: &mut BufReader<File>, mmap: &Arc<memmap2::Mmap>,
              exp_m: usize, exp_rows: usize, exp_cols: usize) -> std::io::Result<AvqProjHost> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
-    assert_eq!(&magic, b"CBKA", "expected a CBKA additive-codebook expert record");
+    let h16 = &magic == b"CBKH";
+    assert!(h16 || &magic == b"CBKA", "expected a CBKA (Mx8) or CBKH (1x16) additive-codebook record");
     let m = rd_i32(r) as usize;
     let d = rd_i32(r) as usize;
     let k = rd_i32(r) as usize;
     let rows = rd_i32(r) as usize;
     let cols = rd_i32(r) as usize;
-    assert_eq!(m, exp_m, "CBKA M mismatch (header experts_avq={exp_m})");
+    assert_eq!(m, exp_m, "CBKA/CBKH M mismatch (header expects M={exp_m})");
     assert_eq!(d, AVQ_D, "CBKA D must be {AVQ_D}");
-    assert_eq!(k, AVQ_K, "CBKA K must be {AVQ_K}");
+    if h16 {
+        assert_eq!(m, 1, "CBKH (1x16) records have M = 1");
+        assert_eq!(k, AVQ16_K, "CBKH K must be {AVQ16_K}");
+    } else {
+        assert_eq!(k, AVQ_K, "CBKA K must be {AVQ_K}");
+    }
     assert_eq!(rows, exp_rows, "CBKA rows mismatch");
     assert_eq!(cols, exp_cols, "CBKA cols mismatch");
     let cb = rd_f16_vec(r, m * k * d);   // codebooks f16 -> f32
     let scale = rd_f16_vec(r, rows);     // per-output scales f16 -> f32
     let ng = cols / d;
-    let idx = mmap_skip(r, mmap, m * ng * rows)?; // u8 indices, mmap-backed (the bulk)
+    let nbytes = if h16 { 2 * rows * ng } else { m * ng * rows };
+    let idx = mmap_skip(r, mmap, nbytes)?; // indices, mmap-backed (the bulk)
     Ok(AvqProjHost { idx, cb, scale, m, rows, cols })
 }
 

@@ -980,6 +980,146 @@ __global__ void avq_gemv_t(const __half* __restrict__ X, const unsigned char* __
 }
 
 // ============================================================================
+// AQLM "1x16" decode GEMV: ONE codebook of 65,536 entries of AVQ_D = 8 f16 values,
+//   W[o, g*AVQ_D + e] = scale[o] * CB[ code[o,g] ][e]       (u16 codes, 2 bits per weight).
+// The 1 MiB codebook does not fit in shared memory (the Mx8 kernel above keeps its 8 KB codebook
+// and a LUT there), so every (o, g) gathers its 16-byte entry with __ldcg (cache-global: L2 only;
+// the codebook stays L2-resident during the GEMV and the random gathers do not thrash L1). The
+// codes are read once with __ldcs (evict-first), so streaming them does not push the codebook
+// out of L2. One warp per output row: each lane owns 8 consecutive groups per step (one 16-byte
+// load of 8 u16 codes), so a warp covers A16_STEP = 256 groups (2,048 inputs) per step, and the
+// block's warps share that step's activations, staged once in shared memory as f32 (lane-major,
+// one float4 of padding per lane row so the 16-byte reads are bank-conflict free). f32 products
+// and accumulation; the lane sums are combined by a fixed shuffle tree and lane 0 writes
+// scale[o] * sum: no atomics, no memset, deterministic (same bits eager and in a CUDA graph).
+// Device layout (CBKH record, model/cbka_format.py; read_cbka in lib.rs):
+//   codebook CB : [A16_K][AVQ_D] f16, flat k*AVQ_D + e
+//   scales      : [rows] f16
+//   codes       : [rows][ng] u16 row-major, flat o*ng + g; needs cols % 64 == 0 (16-byte rows)
+#define A16_K     65536
+#define A16_WARPS 8      // output rows per block
+#define A16_STEP  256    // groups per warp step (32 lanes x 8)
+
+__global__ void __launch_bounds__(32 * A16_WARPS)
+avq16_gemv(const __half* __restrict__ X, const unsigned short* __restrict__ codes,
+           const __half* __restrict__ CB, const __half* __restrict__ scale,
+           float* __restrict__ Y, int IC, int OC) {
+    const int ng = IC / AVQ_D;
+    const int lane = threadIdx.x & 31;
+    const int o = blockIdx.x * A16_WARPS + (threadIdx.x >> 5);
+    __shared__ float4 s_x[32 * 17];   // the step's 2,048 inputs: 32 lane rows of 16 float4 + 1 pad
+    const uint4* crow = reinterpret_cast<const uint4*>(codes + (size_t)(o < OC ? o : 0) * ng);
+    const uint4* cb = reinterpret_cast<const uint4*>(CB);   // one uint4 = one entry (8 x f16)
+    float acc = 0.f;
+    for (int g0 = 0; g0 < ng; g0 += A16_STEP) {
+        __syncthreads();              // every warp is done reading the previous step's s_x
+        for (int i = threadIdx.x; i < 32 * 16; i += blockDim.x) {   // float4 i = inputs 4i..4i+3
+            const int xi = g0 * AVQ_D + 4 * i;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (xi < IC) {            // IC % 64 == 0 and xi % 4 == 0: the 4 inputs are in range
+                const __half2* xp = reinterpret_cast<const __half2*>(X + xi);
+                const float2 a = __half22float2(xp[0]), b = __half22float2(xp[1]);
+                v = make_float4(a.x, a.y, b.x, b.y);
+            }
+            s_x[(i >> 4) * 17 + (i & 15)] = v;   // lane row i/16 holds inputs 64*(i/16) ..
+        }
+        __syncthreads();
+        const int g = g0 + lane * 8;
+        if (o < OC && g < ng) {       // ng % 8 == 0, so groups g .. g+7 are all in range
+            const uint4 c8 = __ldcs(crow + (g >> 3));   // the 8 codes of groups g .. g+7
+            const unsigned cw[4] = {c8.x, c8.y, c8.z, c8.w};
+            uint4 w[8];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) w[j] = __ldcg(cb + ((cw[j >> 1] >> (16 * (j & 1))) & 0xFFFFu));
+            const float4* xr = &s_x[lane * 17];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const __half2* h = reinterpret_cast<const __half2*>(&w[j]);
+                const float4 xa = xr[2 * j], xb = xr[2 * j + 1];
+                const float2 w0 = __half22float2(h[0]), w1 = __half22float2(h[1]);
+                const float2 w2 = __half22float2(h[2]), w3 = __half22float2(h[3]);
+                acc = fmaf(w0.x, xa.x, acc); acc = fmaf(w0.y, xa.y, acc);
+                acc = fmaf(w1.x, xa.z, acc); acc = fmaf(w1.y, xa.w, acc);
+                acc = fmaf(w2.x, xb.x, acc); acc = fmaf(w2.y, xb.y, acc);
+                acc = fmaf(w3.x, xb.z, acc); acc = fmaf(w3.y, xb.w, acc);
+            }
+        }
+    }
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, s);
+    if (lane == 0 && o < OC) Y[o] = __half2float(scale[o]) * acc;
+}
+
+// Batch-invariant M-row twin of avq16_gemv, for the speculative verify: row r of Y is the same
+// bits as avq16_gemv on row r of X. Each lane covers the same groups in the same steps, and for
+// every row runs the same fmaf chain (group by group, the 8 products in order) from the same f32
+// values (the f16 activations converted exactly, here when read instead of when staged), then the
+// same shuffle tree and the same final product with the scale. What the M rows share is the
+// expensive part: one pass over the codes and ONE codebook gather per (o, g) serve all M rows.
+// X [M][IC] f16 (16-byte aligned rows: IC % 64 == 0), Y [M][OC] f32. Dynamic shared memory:
+// the step's 2,048 inputs of each row as f16, [M][32 lane rows][8 uint4 + 1 pad] (M * 4,608 B).
+template <int M>
+__global__ void __launch_bounds__(32 * A16_WARPS)
+avq16_gemv_v(const __half* __restrict__ X, const unsigned short* __restrict__ codes,
+             const __half* __restrict__ CB, const __half* __restrict__ scale,
+             float* __restrict__ Y, int IC, int OC) {
+    const int ng = IC / AVQ_D;
+    const int lane = threadIdx.x & 31;
+    const int o = blockIdx.x * A16_WARPS + (threadIdx.x >> 5);
+    extern __shared__ uint4 s_xv[];   // uint4 (r*32 + L)*9 + j = group g0 + 8L + j of row r
+    const uint4* crow = reinterpret_cast<const uint4*>(codes + (size_t)(o < OC ? o : 0) * ng);
+    const uint4* cb = reinterpret_cast<const uint4*>(CB);
+    float acc[M];
+    #pragma unroll
+    for (int r = 0; r < M; r++) acc[r] = 0.f;
+    for (int g0 = 0; g0 < ng; g0 += A16_STEP) {
+        __syncthreads();              // every warp is done reading the previous step's s_xv
+        for (int t = threadIdx.x; t < M * A16_STEP; t += blockDim.x) {   // uint4 = one group's 8 inputs
+            const int r = t / A16_STEP, i = t % A16_STEP;
+            const int xi = (g0 + i) * AVQ_D;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (xi < IC) v = *reinterpret_cast<const uint4*>(X + (size_t)r * IC + xi);
+            s_xv[(r * 32 + (i >> 3)) * 9 + (i & 7)] = v;
+        }
+        __syncthreads();
+        const int g = g0 + lane * 8;
+        if (o < OC && g < ng) {
+            const uint4 c8 = __ldcs(crow + (g >> 3));
+            const unsigned cw[4] = {c8.x, c8.y, c8.z, c8.w};
+            uint4 w[8];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) w[j] = __ldcg(cb + ((cw[j >> 1] >> (16 * (j & 1))) & 0xFFFFu));
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const __half2* h = reinterpret_cast<const __half2*>(&w[j]);
+                const float2 w0 = __half22float2(h[0]), w1 = __half22float2(h[1]);
+                const float2 w2 = __half22float2(h[2]), w3 = __half22float2(h[3]);
+                #pragma unroll
+                for (int r = 0; r < M; r++) {
+                    const uint4 xv = s_xv[(r * 32 + lane) * 9 + j];
+                    const __half2* xh = reinterpret_cast<const __half2*>(&xv);
+                    const float2 x0 = __half22float2(xh[0]), x1 = __half22float2(xh[1]);
+                    const float2 x2 = __half22float2(xh[2]), x3 = __half22float2(xh[3]);
+                    float a = acc[r];
+                    a = fmaf(w0.x, x0.x, a); a = fmaf(w0.y, x0.y, a);
+                    a = fmaf(w1.x, x1.x, a); a = fmaf(w1.y, x1.y, a);
+                    a = fmaf(w2.x, x2.x, a); a = fmaf(w2.y, x2.y, a);
+                    a = fmaf(w3.x, x3.x, a); a = fmaf(w3.y, x3.y, a);
+                    acc[r] = a;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < M; r++) {
+        float a = acc[r];
+        #pragma unroll
+        for (int s = 16; s > 0; s >>= 1) a += __shfl_down_sync(0xffffffffu, a, s);
+        if (lane == 0 && o < OC) Y[(size_t)r * OC + o] = __half2float(scale[o]) * a;
+    }
+}
+
+// ============================================================================
 // Batch-invariant verify (speculative decoding): M tokens at positions base .. base+M-1 in one
 // forward whose logits are, row by row, the SAME BITS as M sequential decode steps on the default
 // deterministic path (two-stage GEMVs, split-KV attention). Each reduction keeps its decode order:
@@ -1491,6 +1631,22 @@ struct QLinear { unsigned char* d_packed; __half* d_cb; int IC, OC, K_; };
 static void verify_need_t(bool ok, const char* what) {
     if (!ok) { fprintf(stderr, "trapetum: batch-invariant verify: %s\n", what); abort(); }
 }
+// The 1x16 verify GEMV for M rows (avq16_gemv_v). Its shared memory passes the 48 KB default at
+// M = 16 (73,728 B), so the attribute is raised once per instantiation, on the eager first call
+// (never during a CUDA-graph capture).
+template <int M>
+static void launch_avq16_v_m(const AvqLin* q, const __half* X, float* Y) {
+    size_t smem = (size_t)M * 32 * 9 * sizeof(uint4);
+    static bool once = false;
+    if (!once) {
+        cudaError_t e = cudaFuncSetAttribute(avq16_gemv_v<M>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        verify_need_t(e == cudaSuccess, "cannot give the 1x16 verify GEMV its shared memory");
+        once = true;
+    }
+    dim3 grid((q->OC + A16_WARPS - 1) / A16_WARPS), block(32 * A16_WARPS);
+    avq16_gemv_v<M><<<grid, block, smem, g_stream>>>(X, (const unsigned short*)q->d_codes, q->d_cb, q->d_scale,
+                                                     Y, q->IC, q->OC);
+}
 template <int M>
 static void launch_partial_v_m(const __half* X, QLinear* a, QLinear* b, QLinear* c, int o0, int o1, int o2,
                                float* yp, int OCt, int gy) {
@@ -1722,19 +1878,21 @@ void qlinear_free(void* handle) {
     cudaFree(q->d_packed); cudaFree(q->d_cb); free(q);
 }
 
-// --- AVQ (additive-codebook) linear, MoE routed experts --------------------------
-// codes: [M][cols/AVQ_D][rows] u8; cb_f32: [M][AVQ_K][AVQ_D]; scale_f32: [rows]. Host
-// speaks f32 for the codebook/scale (converted to half on the way in, like qlinear_create);
-// the packed u8 indices are uploaded as-is. rows = OC, cols = IC.
+// --- AVQ (additive-codebook) linear: MoE routed experts and the CBK4 dense body -----------
+// M = 2, 3 (Mx8): codes [M][cols/AVQ_D][rows] u8, cb_f32 [M][AVQ_K][AVQ_D].
+// M = 1 (AQLM 1x16): codes [rows][cols/AVQ_D] u16 little-endian (passed as bytes),
+//                    cb_f32 [A16_K][AVQ_D]; cols % 64 == 0.
+// scale_f32: [rows]. Host speaks f32 for the codebook/scale (converted to half on the way in,
+// like qlinear_create); the packed indices are uploaded as-is. rows = OC, cols = IC.
 void* avq_create(const unsigned char* codes, const float* cb_f32, const float* scale_f32,
                  int M, int rows, int cols) {
     AvqLin* q = (AvqLin*)malloc(sizeof(AvqLin));
     q->M = M; q->IC = cols; q->OC = rows;
     int ng = cols / AVQ_D;
-    size_t nidx = (size_t)M * ng * rows;
+    size_t nidx = M == 1 ? (size_t)rows * ng * 2 : (size_t)M * ng * rows;
     cudaMalloc(&q->d_codes, nidx);
     cudaMemcpy(q->d_codes, codes, nidx, cudaMemcpyHostToDevice);
-    size_t ncb = (size_t)M * AVQ_K * AVQ_D;
+    size_t ncb = M == 1 ? (size_t)A16_K * AVQ_D : (size_t)M * AVQ_K * AVQ_D;
     __half* cbh = (__half*)malloc(ncb * sizeof(__half));
     for (size_t i = 0; i < ncb; i++) cbh[i] = __float2half(cb_f32[i]);
     cudaMalloc(&q->d_cb, ncb * sizeof(__half));
@@ -1752,15 +1910,38 @@ void* avq_create(const unsigned char* codes, const float* cb_f32, const float* s
 void avq_forward_dev(void* handle, const void* d_x, void* d_y) {
     AvqLin* q = (AvqLin*)handle;
     ensure_stream();
+    const __half* X = (const __half*)d_x; float* Y = (float*)d_y;
+    if (q->M == 1) {   // 1x16: one warp per row writes y[o] outright (no memset, no atomics)
+        dim3 grid16((q->OC + A16_WARPS - 1) / A16_WARPS), block16(32 * A16_WARPS);
+        avq16_gemv<<<grid16, block16, 0, g_stream>>>(X, (const unsigned short*)q->d_codes, q->d_cb,
+                                                       q->d_scale, Y, q->IC, q->OC);
+        return;
+    }
     cudaMemsetAsync(d_y, 0, (size_t)q->OC * sizeof(float), g_stream);
     int ng = q->IC / AVQ_D;
     dim3 grid((q->OC + AVQ_CPB*4 - 1) / (AVQ_CPB*4), (ng + AVQ_GT - 1) / AVQ_GT);
     dim3 block(AVQ_CPB);
-    const __half* X = (const __half*)d_x; float* Y = (float*)d_y;
     switch (q->M) {
         case 2: avq_gemv_t<2><<<grid, block, 0, g_stream>>>(X, q->d_codes, q->d_cb, q->d_scale, Y, q->IC, q->OC); break;
         case 3: avq_gemv_t<3><<<grid, block, 0, g_stream>>>(X, q->d_codes, q->d_cb, q->d_scale, Y, q->IC, q->OC); break;
         default: break; // only M in {2,3} instantiated; loader asserts this
+    }
+}
+
+// Batch-invariant verify GEMV of a 1x16 projection: d_x [m][IC] half, d_y [m][OC] f32, row r the
+// same bits as avq_forward_dev on row r. m in {1, 2, 4, 8, 16}; the Mx8 kernel (atomics) has none.
+void avq_forward_v(void* handle, const void* d_x, void* d_y, int m) {
+    AvqLin* q = (AvqLin*)handle;
+    ensure_stream();
+    verify_need_t(q->M == 1, "the AVQ verify GEMV exists for 1x16 projections only (the Mx8 kernel uses atomics)");
+    const __half* X = (const __half*)d_x; float* Y = (float*)d_y;
+    switch (m) {
+        case 1: launch_avq16_v_m<1>(q, X, Y); break;
+        case 2: launch_avq16_v_m<2>(q, X, Y); break;
+        case 4: launch_avq16_v_m<4>(q, X, Y); break;
+        case 8: launch_avq16_v_m<8>(q, X, Y); break;
+        case 16: launch_avq16_v_m<16>(q, X, Y); break;
+        default: verify_need_t(false, "M must be 1, 2, 4, 8 or 16");
     }
 }
 

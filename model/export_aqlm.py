@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
 Export a HuggingFace AQLM checkpoint in the 2x8 (or 3x8) additive-codebook format, for example
-ISTA-DASLab/Llama-2-7b-AQLM-PV-2Bit-2x8-hf, to the Rust runtime's CBK4 container.
+ISTA-DASLab/Llama-2-7b-AQLM-PV-2Bit-2x8-hf, or in the 1x16 format (one codebook of 65,536
+entries), for example ISTA-DASLab/Llama-2-70b-AQLM-PV-2Bit-1x16-hf, to the Rust runtime's CBK4
+container.
 
-The seven per-layer projections are written as CBKA records (model/cbka_format.py): the AQLM
-codes, codebooks and per-output scales are copied bit for bit, nothing is requantized, and the
-runtime decodes them with AvqLinear (avq_gemv_t). Embedding and norms stay dense. AQLM keeps the
+The seven per-layer projections are written as CBKA records, or CBKH records for 1x16
+(model/cbka_format.py): the AQLM codes, codebooks and per-output scales are copied bit for bit,
+nothing is requantized, and the runtime decodes them with AvqLinear (avq_gemv_t for Mx8,
+avq16_gemv for 1x16). Embedding and norms stay dense. AQLM keeps the
 LM head in fp16; the runtime's LM head is a scalar codebook, so it is quantized here with
 --lm-k 256 (8-bit, default, near lossless) or 16 (4-bit).
 
@@ -23,11 +26,12 @@ CBK4 layout (little-endian):
   3 x f32   eps, rope_theta, rope_scale (informational; the reader uses inv_freq)
   i32       has_bias
   f32 x head_dim/2   inv_freq (RoPE frequencies, any scaling baked in, as in CBK3)
-  i32       avq_m  (additive codebooks per projection: 2 for "2x8")
+  i32       avq_m  (additive codebooks per projection: 2 for "2x8", 1 for "1x16")
   i32       lm_k   (LM head scalar codebook size: 16 or 256)
   f16 x pad_vocab*hidden   embedding
   per layer: input_layernorm f32[hidden]; CBKA q [+ f32 q bias]; CBKA k [+ bias]; CBKA v [+ bias];
              CBKA o; post_attention_layernorm f32[hidden]; CBKA gate; CBKA up; CBKA down
+             (CBKH records instead of CBKA when avq_m = 1)
   final norm f32[hidden]
   LM head: lm_k=16  -> u8[hidden*pad_vocab/2] nibble-packed [in][out/2], f32[16*pad_vocab]
            lm_k=256 -> u8[hidden*pad_vocab] [in][out], f32[256*pad_vocab]
@@ -44,7 +48,7 @@ import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from cbka_format import AVQ_D, AVQ_K, write_cbka_record  # noqa: E402  single source of truth for CBKA
+from cbka_format import AVQ_D, AVQ_K, AVQ16_K, write_cbka_record, write_cbkh_record  # noqa: E402  single source of truth for CBKA/CBKH
 from export_runtime import quantize  # noqa: E402  scalar codebook (LM head), same packing as CBK3
 
 
@@ -90,22 +94,30 @@ def rope(cfg, head_dim):
 
 
 def aqlm_parts(mod):
-    """(codes [OC, ng, M] uint8, C [M, K, D] f32, scale [OC] f32, M) of an aqlm QuantizedLinear."""
+    """(codes, C, scale [OC] f32, M) of an aqlm QuantizedLinear. Mx8 (M in 2, 3): codes [OC, ng, M]
+    uint8 and C [M, 256, D] f32. 1x16 (M = 1): codes [OC, ng] uint16 and C [65536, D] f32."""
     if type(mod).__name__ != "QuantizedLinear":
         raise SystemExit(f"expected an aqlm QuantizedLinear, got {type(mod).__name__} (not an AQLM checkpoint?)")
     cb = mod.codebooks.detach()
     M, K, og, ig = cb.shape
-    if not (K == AVQ_K and og == 1 and ig == AVQ_D and M in (2, 3)):
+    x8 = K == AVQ_K and M in (2, 3)
+    x16 = K == AVQ16_K and M == 1
+    if not ((x8 or x16) and og == 1 and ig == AVQ_D):
         raise SystemExit(f"unsupported AQLM layout {tuple(cb.shape)}: the runtime decodes Mx8 codebooks of "
-                         f"{AVQ_K} entries with in_group {AVQ_D}, out_group 1, M in (2, 3) (e.g. a 2x8 checkpoint)")
+                         f"{AVQ_K} entries (M in (2, 3), e.g. a 2x8 checkpoint) or one codebook of {AVQ16_K} "
+                         f"entries (1x16), with in_group {AVQ_D} and out_group 1")
     if getattr(mod, "bias", None) is not None:
         raise SystemExit("AQLM linear with a bias is not supported by this exporter")
-    codes = (mod.codes.detach().to(torch.int64) % 256).to(torch.uint8)  # aqlm stores 8-bit codes as int8
+    # aqlm stores b-bit codes as signed ints (int8 for 8 bits, int16 for 16): reduce mod 2^b
+    codes = mod.codes.detach().to(torch.int64) % K
     OC, ng, Mc = codes.shape
     assert Mc == M, f"codes M {Mc} != codebooks M {M}"
     scale = mod.scales.detach().reshape(-1)
     assert scale.numel() == OC, f"scales {scale.numel()} != OC {OC}"
-    return codes.cpu().numpy(), cb[:, :, 0, :].float().cpu().numpy(), scale.float().cpu().numpy(), M
+    if x16:
+        return (codes[:, :, 0].to(torch.int32).cpu().numpy().astype(np.uint16), cb[0, :, 0, :].float().cpu().numpy(),
+                scale.float().cpu().numpy(), M)
+    return codes.to(torch.uint8).cpu().numpy(), cb[:, :, 0, :].float().cpu().numpy(), scale.float().cpu().numpy(), M
 
 
 def walk_cbk4(path):
@@ -122,10 +134,12 @@ def walk_cbk4(path):
         qd, kvd = nh * hd, nkv * hd
 
         def rec(rows, cols):
-            assert f.read(4) == b"CBKA", "missing CBKA magic"
+            magic = f.read(4)
+            assert magic == (b"CBKH" if m == 1 else b"CBKA"), f"missing {'CBKH' if m == 1 else 'CBKA'} magic"
             mm, d, k, r, c = struct.unpack("<5i", f.read(20))
-            assert (mm, d, k, r, c) == (m, AVQ_D, AVQ_K, rows, cols), ((mm, d, k, r, c), (m, rows, cols))
-            f.seek(2 * mm * k * d + 2 * r + mm * (c // d) * r, 1)
+            assert (mm, d, k, r, c) == (m, AVQ_D, AVQ16_K if m == 1 else AVQ_K, rows, cols), ((mm, d, k, r, c), (m, rows, cols))
+            idx_bytes = 2 * r * (c // d) if m == 1 else mm * (c // d) * r   # u16 [rows][ng] or u8 [M][ng][rows]
+            f.seek(2 * mm * k * d + 2 * r + idx_bytes, 1)
 
         for _ in range(L):
             f.seek(4 * hid, 1)
@@ -179,6 +193,11 @@ def main():
     ap.add_argument("--ppl-window0-out", default=None, help="with --ppl: write window 0's token ids (i32) here")
     ap.add_argument("--lm-chunk", type=int, default=16384,
                     help="LM-head quantization: output columns per GPU chunk (smaller = less GPU memory, same result)")
+    ap.add_argument("--ref-gemm", action="store_true",
+                    help="also write ref_gemm.bin: the prompt logits with every AQLM layer forced onto its "
+                         "dequantize-then-matmul path (aqlm 1.1.7 runs prompts of 6 tokens or fewer through its "
+                         "GEMV kernel, which adds the 8 products of each group in fp16), and print how far apart "
+                         "the two references are")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -218,18 +237,26 @@ def main():
         f.write(struct.pack("<2i", M, args.lm_k))
         w_f16(f, pad_rows(model.model.embed_tokens.weight, pad_vocab))
 
-        def rec(lin_mod):
+        def rec(lin_mod, name=None):
             codes, C, scale, m = aqlm_parts(lin_mod)
             assert m == M, f"mixed codebook counts ({m} vs {M}) are not supported"
-            write_cbka_record(f, codes, C, scale, M)
+            if M == 1:
+                write_cbkh_record(f, codes, C, scale)
+                if name:  # information only: how concentrated the 1x16 code usage is
+                    cnt = np.sort(np.bincount(codes.ravel(), minlength=AVQ16_K))[::-1]
+                    print(f"  code usage {name}: {(cnt > 0).sum()} of {AVQ16_K} entries used, the 6144 most used "
+                          f"cover {cnt[:6144].sum() / cnt.sum():.1%}", flush=True)
+            else:
+                write_cbka_record(f, codes, C, scale, M)
 
         for li, L in enumerate(model.model.layers):
+            nm = (lambda s: f"layer {li} {s}") if li == 0 else (lambda s: None)
             w_f32(f, L.input_layernorm.weight)
-            for p in (L.self_attn.q_proj, L.self_attn.k_proj, L.self_attn.v_proj, L.self_attn.o_proj):
-                rec(p)
+            for s, p in (("q", L.self_attn.q_proj), ("k", L.self_attn.k_proj), ("v", L.self_attn.v_proj), ("o", L.self_attn.o_proj)):
+                rec(p, nm(s))
             w_f32(f, L.post_attention_layernorm.weight)
-            for p in (L.mlp.gate_proj, L.mlp.up_proj, L.mlp.down_proj):
-                rec(p)
+            for s, p in (("gate", L.mlp.gate_proj), ("up", L.mlp.up_proj), ("down", L.mlp.down_proj)):
+                rec(p, nm(s))
             if (li + 1) % 8 == 0 or li + 1 == n_layers:
                 print(f"  layer {li + 1}/{n_layers} written", flush=True)
         w_f32(f, model.model.norm.weight)
@@ -249,9 +276,29 @@ def main():
     print("prompt:", repr(args.prompt), "->", ids.tolist(), flush=True)
     with torch.no_grad():
         logits = model(ids).logits[0].float().cpu()  # [P, vocab]
+        logits_gemm = None
+        if args.ref_gemm:
+            qls = [m for m in model.modules() if type(m).__name__ == "QuantizedLinear"]
+            if qls and all(hasattr(m, "use_gemv_rule") for m in qls):
+                saved = [m.use_gemv_rule for m in qls]
+                for m in qls:
+                    m.use_gemv_rule = lambda inp: False  # dequantize-then-matmul, whatever the token count
+                logits_gemm = model(ids).logits[0].float().cpu()
+                for m, s in zip(qls, saved):
+                    m.use_gemv_rule = s
+                d = ((logits.double() - logits_gemm.double()).norm(dim=1) / logits_gemm.double().norm(dim=1)).max().item()
+                print(f"HF prompt logits, aqlm GEMV path vs dequantized path: worst rel err {d:.2e} "
+                      f"(top-1 agreement {(logits.argmax(1) == logits_gemm.argmax(1)).sum().item()}/{logits.shape[0]})", flush=True)
+            else:
+                print("--ref-gemm: this aqlm version has no use_gemv_rule, ref_gemm.bin not written", flush=True)
         gen = model.generate(ids, max_new_tokens=args.gen, do_sample=False, pad_token_id=tok.eos_token_id)
     ref = torch.zeros(logits.shape[0], pad_vocab)
     ref[:, :vocab] = logits  # padded vocab rows are zero weights in the .cbk, so zero logits
+    if logits_gemm is not None:
+        ref_g = torch.zeros(logits_gemm.shape[0], pad_vocab)
+        ref_g[:, :vocab] = logits_gemm
+        ref_g.numpy().astype("<f4").tofile(os.path.join(args.out, "ref_gemm.bin"))
+        print("wrote ref_gemm.bin", flush=True)
     cont = gen[0, ids.shape[1]:].cpu().numpy().astype("<i4")
     print("continuation:", repr(tok.decode(cont)), flush=True)
     ids.cpu().numpy().astype("<i4").tofile(os.path.join(args.out, "prompt.bin"))

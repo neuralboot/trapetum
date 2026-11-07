@@ -18,6 +18,19 @@ Record (one weight matrix; a routed expert = 3 records: gate, up, down):
     indices     M*ng*rows u8      ng = cols/D, layout [M][ng][rows], flat (m*ng + g)*rows + o
 
 Reconstruction:  W[o, g*D + e] = scale[o] * sum_m codebooks[m][code_m[o,g]][e].
+
+CBKH record, the AQLM "1x16" variant (one codebook of 65,536 entries, 16-bit codes), written by
+export_aqlm.py into a CBK4 file whose header says avq_m = 1:
+    magic  "CBKH"                 (4 bytes)
+    M      i32                    (1)
+    D      i32                    (group size, 8)
+    K      i32                    (entries, 65536)
+    rows   i32                    (OC, output channels)
+    cols   i32                    (IC, input channels; cols % 64 == 0, so a row of codes is 16-byte aligned)
+    codebook    K*D      f16      layout [K][D], flat k*D + e
+    scales      rows     f16      per output channel
+    indices     rows*ng  u16 LE   layout [rows][ng], flat o*ng + g (row-major, unlike CBKA)
+Reconstruction:  W[o, g*D + e] = scale[o] * codebook[code[o,g]][e].
 No em dashes or en dashes anywhere.
 """
 import struct
@@ -25,6 +38,7 @@ import numpy as np
 
 AVQ_K = 256
 AVQ_D = 8
+AVQ16_K = 65536
 
 
 def write_cbka_record(f, codes_ogm, C, scale, M):
@@ -48,6 +62,26 @@ def write_cbka_record(f, codes_ogm, C, scale, M):
     # indices to [M][ng][OC] with o fastest (C order), matching flat (m*ng + g)*OC + o
     idx = np.ascontiguousarray(np.transpose(codes_ogm, (2, 1, 0)).astype(np.uint8))
     f.write(idx.tobytes())
+
+
+def write_cbkh_record(f, codes_og, C, scale):
+    """Append one CBKH (1x16) record to an open binary file.
+
+    codes_og : integer array [OC, ng], the code index per (output row, group), in [0, 65536)
+    C        : float array [65536, D] codebook (f16 values, written back as f16 bit for bit)
+    scale    : float array [OC] per-output-channel scale
+    """
+    codes_og = np.asarray(codes_og)
+    OC, ng = codes_og.shape
+    assert C.shape == (AVQ16_K, AVQ_D), f"bad 1x16 codebook shape {C.shape}"
+    assert scale.shape[0] == OC, f"scale len {scale.shape[0]} != OC {OC}"
+    assert (ng * AVQ_D) % 64 == 0, f"cols ({ng * AVQ_D}) must be a multiple of 64 (16-byte rows of u16 codes)"
+    assert codes_og.min() >= 0 and codes_og.max() < AVQ16_K, "1x16 codes must be in [0, 65536)"
+    f.write(b"CBKH")
+    f.write(struct.pack("<5i", 1, AVQ_D, AVQ16_K, OC, ng * AVQ_D))   # M, D, K, rows, cols
+    f.write(np.ascontiguousarray(C, np.float32).astype(np.float16).tobytes())
+    f.write(np.ascontiguousarray(scale, np.float32).astype(np.float16).tobytes())
+    f.write(np.ascontiguousarray(codes_og).astype("<u2").tobytes())   # [OC][ng], o slowest
 
 
 def avq_reconstruct(codes_ogm, C, scale):
