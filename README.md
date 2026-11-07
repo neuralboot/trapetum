@@ -7,9 +7,23 @@ matmul, so the dequantized weight matrix `W` is never materialized in global mem
 
 It is fused CUDA kernels for **codebook (non-uniform / k-means) weight quantization** plus
 a pure-Rust runtime. A real Llama-2-7B, quantized to 4-bit, runs end-to-end in Rust with
-**no Python at runtime**, reproducing HuggingFace token for token (16/16) at 135 tok/s on
-an RTX 4090, in 3.5 GB instead of 13, at 2.1x less energy per token than fp16
-(see [`bench/PARETO.md`](bench/PARETO.md)).
+**no Python at runtime**, reproducing HuggingFace token for token (16/16). In June 2026 it
+decoded at 135 tok/s at short context on an RTX 4090, with 2.1x less energy per token than
+fp16 over a 512-token generation (see [`bench/PARETO.md`](bench/PARETO.md); energy not
+re-measured since). With the November 2026 kernels and the new exporter's file it decodes at
+194.5 tok/s (RTX 4090, CUDA graph, mean over a 512-token generation), still 16/16. The 4-bit
+file is 3.66 GB instead of 13.48 GB in fp16, 3.7x smaller (the new exporter's file is
+3.75 GB, 3.6x).
+
+> **Correction, November 2026.** The 4-bit Llama-2-7B perplexity published here until now
+> (wikitext-2 PPL 6.34) came from a research script, not from the runtime's 4-bit file,
+> which measures 6.79 in the same harness; the new exporter's file measures 6.10. The claim
+> that 2-bit "trades +0.33 PPL" is withdrawn. Earlier versions also gave this file as 3.5 GB and
+> 3.9x smaller than fp16, a MiB figure written as GB: it is 3.66 GB (3.75 GB for the new
+> exporter's file), 3.7x (3.6x) smaller than the 13.48 GB of fp16 weights. Details, and the decode work of November 2026
+> (split-KV attention, fused kernels, opt-in sparsity, a tensor-core GEMV with a
+> batch-invariant verify, PARD speculative decoding), are in the
+> [November 2026 update](#november-2026-update).
 
 ```
 W_deq[i, j] = codebook[ indices[i, j], j ]            # per-output-channel codebooks
@@ -20,6 +34,22 @@ Y[m, j]     = sum_i  X[m, i] * W_deq[i, j]
 - `codebook`: `[K, OC]`, `fp16` (small per-column table, `K` in 16..256)
 - `X`       : activations `fp16`; `Y`: output `fp16`
 
+## November 2026 update, in brief
+
+| change | result (RTX 4090, CUDA graph; Llama-2-7B 4-bit unless noted) |
+|---|---|
+| new exporter (E[x^2]-weighted k-means, 8-bit LM head), now the default | wikitext-2 PPL 6.10, against 6.79 for the legacy file (published as 6.34) and 5.83 for fp16 (30 windows of 2,048 tokens) |
+| split-KV decode attention | 4.3x faster decode at 1,024 positions (146.2 against 34.3 tok/s, same host) |
+| fused decode kernels | 6.36 to 5.28 ms per token over the first 128 positions |
+| opt-in activation sparsity at 25% (lossy) | 1.16x faster decode for +0.12 PPL |
+| tensor-core 4-bit GEMV, batch-invariant verify | 194.5 tok/s (512-token benchmark); verifying 16 tokens costs 1.21x a decode step at short context |
+| PARD speculative decoding, Llama-3.1-8B-Instruct | 2.51x end to end (165.5 to 415.6 tok/s); 520 of 520 outputs identical to plain greedy decoding of the same 4-bit target |
+
+Setup, caveats, per-step details and how to reproduce:
+[November 2026 update](#november-2026-update), under *Benchmarks*. The kernel changes are CUDA
+only (Apple Metal is unchanged). The code is on `main` (commits 2e8c170 to 2ca5d97); the
+desktop app's downloadable models are not updated.
+
 ## Repository layout
 
 - [`kernels/`](kernels/): the CUDA kernels (scalar decode, prefill, and the additive
@@ -27,7 +57,7 @@ Y[m, j]     = sum_i  X[m, i] * W_deq[i, j]
   and the build/run harness (`benchmark.py`, `shapes_test.py`).
 - [`model/`](model/): model-level scripts on Llama-2: the cast-free CUDA-graph serving
   integration that realizes the 2.0x/2.45x end-to-end decode speedup, the AQLM-style
-  additive-VQ training that beats the scalar codebook, the accuracy probes, and the
+  additive-VQ training that beats the unweighted scalar codebook, the accuracy probes, and the
   **torch-free exporter** (`export_safetensors.py`): it reads `safetensors` directly
   (no PyTorch, no transformers) and compresses any Llama- or Phi-3-architecture model
   to the runtime's format: this is how Phi-4 (14B) was exported and run at 79.9 tok/s.
@@ -86,17 +116,17 @@ single binary. The 4-bit memory saving is universal; only the speedup depends on
 
 | Your GPU | Arch | Memory win | Decode speed |
 |---|---|---|---|
-| RTX 30 / 40 (3060, 3090, 4070, 4090, ...) | `sm_86` / `sm_89` | 3.9x disk / 2.9x VRAM | largest, up to 2.2x |
-| A100 / A40 / L40 | `sm_80` / `sm_86` / `sm_89` | 3.9x disk / 2.9x VRAM | strong, 2.34x on A40 |
-| H100 / H200 | `sm_90` | 3.9x disk / 2.9x VRAM | parity (fp16 already near roofline) |
-| Turing and older (GTX 16, RTX 20, V100) | `sm_70` / `sm_75` | 3.9x disk / 2.9x VRAM | untested, rebuild needed |
+| RTX 30 / 40 (3060, 3090, 4070, 4090, ...) | `sm_86` / `sm_89` | 3.6-3.7x disk / 2.9x VRAM | largest, up to 2.2x |
+| A100 / A40 / L40 | `sm_80` / `sm_86` / `sm_89` | 3.6-3.7x disk / 2.9x VRAM | strong, 2.34x on A40 |
+| H100 / H200 | `sm_90` | 3.6-3.7x disk / 2.9x VRAM | parity (fp16 already near roofline) |
+| Turing and older (GTX 16, RTX 20, V100) | `sm_70` / `sm_75` | 3.6-3.7x disk / 2.9x VRAM | untested, rebuild needed |
 | AMD, Apple Silicon, CPU | - | - | not supported (CUDA only) |
 
-Memory, labeled (both hold, they measure different things): **3.9x smaller on disk**
-(3.5 GB `.cbk` codebook file vs 13.5 GB fp16) and **2.9x less VRAM at runtime**
-(13.6 GB -> 4.7 GB peak).
+Memory, labeled (both hold, they measure different things): **3.6x to 3.7x smaller on disk**
+(a 3.75 GB `.cbk` codebook file from the new exporter, 3.66 GB from the legacy one, vs
+13.48 GB fp16) and **2.9x less VRAM at runtime** (13.6 GB -> 4.7 GB peak).
 
-The memory win (a 7B in ~3.5 GB, so it fits an 8 GB card) holds on every NVIDIA GPU.
+The memory win (a 7B in 3.66 to 3.75 GB, so it fits an 8 GB card) holds on every NVIDIA GPU.
 Validated on Ampere, Ada and Hopper (`sm_80` to `sm_90`); pre-Ampere is untested, and the
 `mma.sync` / `cp.async` prefill paths require `sm_80+`.
 
@@ -189,16 +219,22 @@ grows with size and bandwidth-boundedness: Llama-2 13B on an A40 decodes 49.0 vs
 tok/s (**x2.45**) at 8.50 vs 26.17 GB (3.08x less).
 
 **Accuracy, and its ceiling.** wikitext-2 PPL goes 5.83 (fp16, custom codebook
-evaluation harness used for the ablations) -> 6.34 (4-bit
-codebook). Three attempts to close the gap to AWQ all fail: a simple activation-aware
-calibration reaches 6.17, the full AWQ pipeline (output-error scale search + weight
-clipping) does not improve on it (6.21), a naive vector quantizer is catastrophic
-(diverges, with or without per-channel normalization), and incoherence processing (a
-random orthogonal rotation before quantizing, the QuIP# lever) moves it only marginally
-(6.34 -> 6.29). AWQ's scaling assumes a uniform grid while a codebook is already
-adaptive; real vector/trellis accuracy needs AQLM/QuIP#-level machinery (residual
-codebooks, incoherence paired with vector quantization, fine-tuning). **The value
-of this scheme is memory and kernel speed, not accuracy.**
+evaluation harness used for the ablations) -> 6.34 (4-bit codebook from the research
+script: unweighted k-means from a mid-grid start, LM head kept in fp16; not the runtime's
+file, which measures 6.79, while the November 2026 exporter's file measures 6.10, see the
+[correction](#correction-4-bit-perplexity)). Three attempts to close the gap to AWQ fail: a
+simple activation-aware calibration reaches 6.17, the full AWQ pipeline (output-error scale
+search + weight clipping) does not improve on it (6.21), a naive vector quantizer is
+catastrophic (diverges, with or without per-channel normalization), and incoherence
+processing (a random orthogonal rotation before quantizing, the QuIP# lever) moves it only
+marginally (6.34 -> 6.29). One later recipe does help: weighting every k-means centroid
+update by E[x^2] of its input channel (128 wikitext-2 train windows) reaches 6.10, and the
+exporter now uses it by default, with an 8-bit LM head (6.10; 5.72 on the full test set,
+fp16 5.47). AWQ's scaling assumes a uniform grid while a codebook is already adaptive; real
+vector/trellis accuracy needs AQLM/QuIP#-level machinery (residual codebooks, incoherence
+paired with vector quantization, fine-tuning). **The value of this scheme is memory and
+kernel speed; the new exporter narrows the gap to fp16 (72% smaller than the legacy file's
+in this harness) but does not close it.**
 
 ### Toward vector codebooks: a fused additive-VQ decode kernel (preliminary)
 
@@ -248,17 +284,32 @@ the Rust runtime now serves it end to end: `model/export_aqlm.py` copies the AQL
 codebooks and scales byte for byte into a `CBK4` file (CBK3 header plus one CBKA record
 per projection, LM head as an 8-bit scalar codebook), and the dense Llama blocks dispatch
 each projection to the scalar or the additive kernel. `generate` reproduces the Hugging Face
-greedy continuation 16/16. Llama-2 7B on one RTX 4090, batch 1:
+greedy continuation 16/16. Llama-2 7B on one RTX 4090, batch 1, with the kernels of
+5 November 2026 (before the [November 2026 update](#november-2026-update)):
 
 | Llama-2 7B in the runtime | file | peak VRAM | PPL (custom harness) | tok/s eager | tok/s CUDA graph | tok/s graph, 256-token window |
 |---|---|---|---|---|---|---|
-| scalar 4-bit (CBK3) | 3.66 GB | 4.2 GB | 6.34 | 143 | 157 | 111 |
-| **AQLM PV 2x8 (CBK4)** | **2.05 GB** | **2.7 GB** | **6.67** | **182** | **205** | **132** |
+| scalar 4-bit (CBK3), legacy exporter, still used by the app's downloadable models | 3.66 GB | 4,166 MiB | 6.79 (published as 6.34) | 143 | 157 | 111 |
+| scalar 4-bit, new exporter (CBK4, 8-bit LM head) | 3.75 GB | 4,246 MiB\* | 6.10 | 138.1\* | 150.6\* | 107.3\* |
+| **AQLM PV 2x8 (CBK4)** | **2.05 GB** | **2,730 MiB** | **6.67** | **182** | **205** | **132** |
 
-So 2-bit trades +0.33 PPL for 44% less disk, 35% less GPU memory and 1.2x to 1.3x the decode
-speed (256-token window to short context). `TRAPETUM_GRAPH=1` replays the whole decode step as one CUDA graph (position read
-from device memory); it saves about 0.6 ms per token in both formats, and the remaining
-fixed cost is small kernels plus the batch-1 attention, which grows with context. Only four
+\* Same kernels, measured on another RTX 4090 host, where the legacy file gave 140.3, 153.0
+and 108.5 tok/s in the same columns: the new file is 1.1 to 1.6% slower, with a peak of
+4,246 MiB against 4,172 MiB.
+
+Against the legacy 4-bit file, the 2-bit file was slightly better in quality (6.665 against
+6.791), 44% smaller on disk, used 34% less GPU memory and decoded 1.2x to 1.3x faster with
+these kernels (256-token window to short context). Against the new exporter's file it is
+0.57 PPL behind (6.665 against 6.098), for 45% less disk and 36% less peak GPU memory (2,736
+against 4,246 MiB with CUDA graphs). The "+0.33 PPL" published here before compared the
+2-bit checkpoint with the research script's 6.34 and is withdrawn. Of the November kernels,
+split-KV attention speeds up both formats, but the projection fusions and the tensor-core
+GEMV cover scalar 4-bit projections only, and the two formats have not been measured on one
+host since, so no 2-bit speed advantage is claimed for them. `TRAPETUM_GRAPH=1` replays the
+whole decode step as one CUDA graph (position read from device memory); with these kernels
+it saved about 0.6 ms per token in both formats, and the remaining fixed cost was small
+kernels plus the batch-1 attention, which grew with context (the November kernels address
+both, though the 2-bit path gets only the RoPE and KV-append fusion). Only four
 PV checkpoints exist in the 2x8 format (Llama-2 7B, Llama-3.1 8B Instruct, Llama-3.2 3B and
 3B Instruct); the 2-bit path is CUDA only (no Metal AVQ kernel yet), and its decode sums
 partials with atomics, so its logits vary in the last digits from run to run.
@@ -270,22 +321,26 @@ cd runtime && TRAPETUM_GRAPH=1 cargo run --release --bin generate \
 ```
 
 Before PV tuning, the 2x8 config (the one a shared-memory LUT can decode) was worse than
-scalar 4-bit (7.63 vs 6.34) though at *half* the bits, and far better than scalar *2-bit*,
+scalar 4-bit (7.63 vs 6.34 for the research script's codebook, 6.79 for the legacy runtime
+file) though at *half* the bits, and far better than scalar *2-bit*,
 which diverges. The accuracy-competitive AQLM is `1x16`
 (K = 65536), whose 256 KB-per-group LUT does not fit shared memory and needs a different,
 slower kernel (which is why AQLM decode is slow). We tested the `4x8` path (M=4, 4 bits). The kernel stays fast (M=4 decodes at **x2.39**
 on the A40, GT=4, verified). On accuracy, a *greedy* additive fit only ties the scalar
-4-bit codebook (PPL 6.32 vs 6.34): the additive *structure* alone does not beat scalar,
+4-bit codebook of the research script (PPL 6.32 vs 6.34): the additive *structure* alone
+does not beat scalar,
 AQLM's edge is its *training*. So we reproduced the core of that training (per-output
 scale + **beam-search** code assignment + **least-squares** codebook updates, alternating;
 no block fine-tuning), in `llama_aqlm_train.py`. That **wins**: at M=4 it reaches PPL
-**6.13, beating the scalar 4-bit codebook (6.34)** at equal bits, while the kernel still
-decodes it at **x2.39** on the A40. And that is one alternating round with no calibration
-or block fine-tuning, the levers the full AQLM pipeline adds to push further toward fp16
-(5.83). So the Pareto point holds: trained additive VQ is **more accurate than the scalar
-codebook at the same bits and the same decode speed**, and this kernel is the fast-decode
-path that makes it usable (it also makes 2-bit *usable* and fast, x4.27, where the scalar
-2-bit codebook diverges).
+**6.13, beating the unweighted scalar 4-bit codebook (6.34)** at equal bits, while the
+kernel still decodes it at **x2.39** on the A40. And that is one alternating round with no
+calibration or block fine-tuning, the levers the full AQLM pipeline adds to push further
+toward fp16 (5.83). So against the unweighted scalar codebook the Pareto point holds: trained
+additive VQ is **more accurate at the same bits and the same decode speed**, and this kernel
+is the fast-decode path that makes it usable (it also makes 2-bit *usable* and fast, x4.27,
+where the scalar 2-bit codebook diverges). The additive training was not given the
+activation weighting, though: the E[x^2]-weighted scalar recipe the exporter now uses
+reaches 6.10 in the same harness, ahead of this first additive fit.
 
 ### Standalone dequantization (bandwidth)
 
@@ -312,6 +367,256 @@ quantization buys memory, not speed.** Closing the remaining gap requires
 `ldmatrix` + shared-memory swizzling (production-Marlin engineering); a separate
 experiment (`prof11.cu`) shows the wmma API is *not* the bottleneck (raw
 `mma.sync` matches it), so the remaining gap is occupancy + bank conflicts.
+
+### November 2026 update
+
+Measured on 5 and 6 November 2026. Code: commits 2e8c170 (exporter), 04a8b60 (split-KV
+attention, fused kernels), e9b97d6 (activation sparsity), d0c4e23 (tensor-core GEMV,
+batch-invariant verify) and 2ca5d97 (PARD), on `main`. The raw logs of these runs are not
+in the repository; the results are summarized here.
+
+**Setup.** Rented RunPod GPUs, one GPU per run, each run on a fresh pod, so hosts differ
+between runs. An NVIDIA GeForce RTX 4090 (24 GB, `sm_89`) ran every step; an A40 (`sm_86`)
+also ran the first and the final fusion validations and one Python-only sparsity diagnostic.
+Image `pytorch/pytorch:2.4.0-cuda12.1-cudnn9-devel` (Python 3.11.9, PyTorch 2.4.0, CUDA
+12.1), Rust 1.99.1 on every pod that built the runtime, NVIDIA driver 595.91.07 on the RTX
+4090 hosts that log it. Batch 1, greedy, CUDA-graph decode (`TRAPETUM_GRAPH=1`) unless marked
+eager. Three timing windows: the mean per 128-position bin of one long greedy decode
+(`TRAPETUM_SWEEP`), the 16-token continuation after a 6-token prompt (positions 6 to 22, the
+window of the CBK4 table above), and a 512-token decode benchmark. Each per-step gain below
+is a same-host A/B; figures from different steps come from different hosts (for scale, one
+decode path measured 184.6, 185.5 and 187.8 tok/s at positions 6 to 22 on three RTX 4090
+hosts). From step 1 on, every Llama-2-7B 4-bit speed is measured on the new exporter's file.
+
+#### Correction: 4-bit perplexity
+
+The tables published until now listed the scalar 4-bit runtime file (CBK3) of Llama-2-7B at
+3.66 GB and PPL 6.34. That 6.34 came from a research script (mid-grid k-means start, LM head
+kept in fp16), not from that file. Measured from the files on 5 November 2026 on the
+341,469-token wikitext-2 test set (the repository's harness averages the first 30 windows of
+2,048 tokens; the full harness, all 166 full windows):
+
+| Llama-2-7B | file | PPL, 30 windows | PPL, full test set |
+|---|---|---:|---:|
+| fp16 | - | 5.83 | 5.47 |
+| scalar 4-bit, legacy exporter (CBK3, 4-bit LM head), the recipe and format of the app's current downloadable models | 3,655,827,760 bytes (3.66 GB) | **6.79** | 6.35 |
+| scalar 4-bit, new exporter (CBK4, 8-bit LM head), the new default | 3,752,083,768 bytes (3.75 GB) | **6.10** | 5.72 |
+| 2-bit AQLM PV 2x8 (CBK4, 8-bit LM head) | 2,050,610,744 bytes (2.05 GB) | 6.67 (checkpoint; the file reads back 6.665) | 6.26 (checkpoint) |
+
+- The earlier claim that 2-bit "trades +0.33 PPL" compared the 2-bit checkpoint with the
+  research script's 6.34 and is withdrawn. Against the legacy file, the 2-bit file was in
+  fact slightly better (6.665 against 6.791, a 0.13 gap) and 44% smaller (2.05 against
+  3.66 GB). Against the new file it is 0.57 behind (6.665 against 6.098), for 45% less disk
+  (2.05 against 3.75 GB) and 36% less peak GPU memory (2,736 against 4,246 MiB with CUDA
+  graphs).
+- The new exporter (`model/export_runtime.py`, now the default; `--recipe legacy --lm-k 16`
+  still writes the previous files byte for byte) runs k-means from a mid-grid start, moves an
+  empty centroid to 0, runs 10 iterations, weights every centroid update by E[x^2] of its
+  input channel over 128 wikitext-2 train windows, and stores an 8-bit LM head as CBK4. The
+  gap to fp16 in the 30-window harness falls from 0.96 to 0.27 PPL (72% smaller). In the
+  legacy file the 4-bit LM head alone cost about 0.30 PPL (6.49 with an fp16 head); the new
+  8-bit head costs 0.0004 (6.0978 with an fp16 head, 6.0982 as written). The worst
+  prompt-logits error against the Hugging Face reference falls from 5.1e-3 to 2.0e-3, and the
+  unused centroid slots across the 224 projections from 1.19% to 0.004%.
+- Cost, with the previous kernels on one RTX 4090 host, two rounds: the file is 2.6% larger,
+  decode is 1.1 to 1.6% slower (150.6 against 153.0 tok/s, CUDA graph, positions 6 to 22),
+  peak GPU memory is 4,246 against 4,172 MiB, and greedy decoding matches the reference 16/16
+  in all 8 runs.
+- Scope: the new recipe's perplexity was measured on Llama-2-7B only; the AQLM, DeepSeek and
+  Gemma exporters are unchanged; runtimes older than this change reject the new files. The
+  8-bit LM head is chosen automatically only on GPUs that can run its kernel (69,632 bytes of
+  shared memory per block), and the runtime refuses such a layer at load time on Turing and
+  Pascal GPUs (verified by reading the code; no Turing GPU was available to test).
+- The desktop app's model registry is not updated: its downloadable models keep the old
+  format and the old recipe, because installed apps (including the Windows beta
+  0.1.0-beta.1) cannot read the new files. A runtime release has to come before any new
+  registry entries.
+- `model/llama_quant.py` no longer reproduces the research script's 6.34: since commit
+  c9d8b72 (2026-06-28) it starts its centroids from a min-to-max grid and gives 6.41.
+
+Reproduce (Llama-2-7B is the default `--model`):
+
+```sh
+python model/export_runtime.py --out /root/cbk_old --recipe legacy --lm-k 16   # previous file
+python model/export_runtime.py --out /root/cbk_new                             # new default
+python model/cbk_ppl.py --cbk /root/cbk_old/model.cbk --ref-dir /root/cbk_old --heads file,fp16 --fp16-control
+python model/cbk_ppl.py --cbk /root/cbk_new/model.cbk --ref-dir /root/cbk_new --heads file,fp16
+```
+
+#### Decode kernels and speculative decoding (steps 1 to 5, CUDA)
+
+| step | change | result (RTX 4090, CUDA graph; Llama-2-7B 4-bit unless noted) |
+|---|---|---|
+| 1 | measure decode time against context | old attention: 131.1 tok/s over the first 128 positions, 35.0 at 1,024 positions, 11.2 at 4,096 |
+| 2 | split-KV decode attention | 146.2 against 34.3 tok/s at 1,024 positions (4.3x, same host); 115.8 at 4,096 against 11.2 in step 1 (10x) |
+| 3 | fused decode kernels | 6.36 to 5.28 ms per token over the first 128 positions (157 to 189 tok/s) |
+| 4 | opt-in activation sparsity at 25% (lossy) | 5.44 to 4.69 ms per token (1.16x) for +0.12 PPL |
+| 5a | tensor-core 4-bit GEMV, batch-invariant verify | 5.42 to 5.14 ms per token (184.3 to 194.5 tok/s, 512-token benchmark); verifying 16 tokens costs 1.21x a decode step |
+| 5b | PARD speculative decoding, Llama-3.1-8B-Instruct | 165.5 to 415.6 tok/s end to end (2.51x); 520 of 520 outputs identical to plain greedy |
+
+- **Step 1.** Decode attention walked the KV cache one position at a time in one block per
+  head, about 20.6 microseconds per cached position per token. At 1,024 positions, 73%
+  (4-bit) and 78% (2-bit) of the decode time depended on the context, against a threshold of
+  30% fixed before the run. The 2-bit file decoded at 167.8, 37.1 and 11.4 tok/s in the same
+  three bins.
+- **Step 2, split-KV attention.** The KV cache is cut into 64-position chunks; one block per
+  (head, chunk) runs an online softmax, and the chunks merge in a fixed order with no atomics,
+  so results are bitwise reproducible. No decode step allocates during CUDA-graph capture.
+  88 of 88 cases match an f64 CPU reference (worst relative error 2.2e-4), each one
+  deterministic, across MHA and GQA, head_dim 64, 128 and 256, and lengths 1 to 4,096 around
+  the chunk boundaries; greedy 16/16 in every run. On the same host, the time per token over
+  the first 128 positions drops 18% (6.35 against 7.71 ms), and the attention kernel alone
+  (32 heads, head_dim 128) takes 10.0 microseconds per call at 1,024 positions, against 569.5
+  for the old one. The 2-bit file decodes at 214.5 tok/s over the first 128 positions, 194.4
+  at 1,024 and 143.9 at 4,096 (5x and 13x the step 1 figures at 1,024 and 4,096 positions,
+  measured on another host).
+- **Step 3, fused kernels** for scalar 4-bit projections: q, k and v in one GEMV; gate and up
+  in one GEMV with SiLU(gate) times up applied in the reduce; the residual add inside the o
+  and down reduces; RoPE and the KV-cache append in one launch. About 28 launches per layer
+  become 13 (no profiler was run to confirm the count). Prompt logits are byte-identical to
+  the separate kernels (checked on an RTX 4090 and on an A40), greedy 16/16 in every run, and
+  a GQA model with head_dim 64 matches a CPU reference (relative error 7.9e-4, top-1 5/5). On
+  an A40: 10.49 to 9.31 ms per token. The 2-bit path gets only the RoPE and KV-append fusion
+  (about 1.5% on an A40, 7.17 to 7.06 ms); its decode sums partials with atomics, so its
+  logits vary slightly from run to run, and the bit-identity results apply to the 4-bit path.
+- **Step 4, activation sparsity** (TEAL-style; off by default, lossy, CUDA only).
+  `TRAPETUM_SPARSITY=<file>` loads per-layer thresholds; inputs of the q/k/v, o, gate/up and
+  down projections below their threshold become zero, and the 4-bit GEMVs skip the index
+  rows of zero inputs. Position 0, the attention sink, always runs dense: sparsifying it too
+  cost +0.66 PPL at 25%, against +0.12. At 25% on every site, decode is 1.16x faster over the
+  first 128 positions (184 to 213 tok/s) and 1.15x at 1,024 positions (5.85 to 5.08 ms), for
+  +0.12 PPL in the 30-window harness (6.10 to 6.22) and +0.11 on the full test set (5.72 to
+  5.83), computed in Python with the file's weights; the runtime's own NLL on the first 2,048
+  wikitext-2 test tokens reproduces the simulated loss (+0.0174 against +0.0164 nats per
+  token). The output changes: the 16-token greedy continuation matches the dense reference
+  for 3 of 16 tokens. Per-site mixes with the o and down inputs at 50 to 60% reach 1.19 to
+  1.26x but cost +0.17 to +0.30 PPL. Without a file the kernels and their bits are
+  unchanged; Metal and the batched speculative path refuse it.
+- **Step 5a, tensor-core GEMV and batch-invariant verify.** The 4-bit codebook GEMV runs on
+  tensor cores (`mma.sync` m16n8k16, f16 inputs, f32 accumulation, weights read straight from
+  the 4-bit index bytes with no repacking or extra memory, partial sums added in a fixed
+  order), and decode and a new batch-invariant verify, used by `pard_bench`, share this
+  kernel: M = 1, 2, 4, 8 or 16 rows are verified in one forward whose logits are, row by row,
+  the same bits as M decode steps. The runtime's earlier batched verify of up to 4 rows, used
+  by its other speculative loops and the only one on Metal, is unchanged. 15 of 15 checks pass
+  (M = 1, 2, 4, 8 and 16 at bases 6, 56 and 1,016, attention over up to 17 chunks, CUDA
+  graphs replayed at other bases, state scrambled before every checked call, next decode step
+  compared), also with `TRAPETUM_FUSE=0` and with `TRAPETUM_TC=0`. Verify cost relative to
+  one decode step at short context: 1.05x at M=2, 1.06x at M=4, 1.12x at M=8 and 1.21x at
+  M=16; it grows with context (1.46x at M=16 near 1,100 positions). An FMA-only verify, kept
+  as the fallback, reached the same bits but cost 3.27x a decode step at M=16 (in an earlier
+  run, on another host). Over positions 6 to 22 the decode goes from 184.6 to 205.0 tok/s
+  with CUDA graphs and from 175.8 to 195.4 eager; greedy 16/16, worst prompt-logits error
+  1.94e-3 (1.98e-3 before), and `TRAPETUM_TC=0` and the sparse path give prompt logits
+  byte-identical to the previous commit. It needs `sm_80` or newer and was measured on an
+  RTX 4090 only; older GPUs, `TRAPETUM_TC=0`, the non-default determinism modes and the
+  sparse path keep the previous FMA kernels and their bits, and the 8-bit LM head stays on
+  FMA kernels.
+- **Cumulative, across hosts.** At short context the 4-bit decode went from 7.63 to 7.71 ms
+  per token (130 to 131 tok/s) before split-KV to 5.28 to 5.44 ms (184 to 189 tok/s) after
+  split-KV and fusion, +40% to +46% depending on the host pair. At 1,024 positions: 34.3 to
+  35.0 tok/s before, 170.9 after split-KV and fusion, about 5x. At 4,096 positions only
+  split-KV was measured (115.8 against 11.2 tok/s, 10x), nothing after fusion or the
+  tensor-core GEMV.
+- **Apple Metal is unchanged**: it keeps the sequential attention, runs the same separate
+  operations as before and refuses sparsity. Split-KV, the fused kernels, sparsity and the
+  tensor-core GEMV are CUDA only for now.
+
+#### PARD speculative decoding
+
+`bin/pard_bench` (`runtime/src/bin/pard_bench.rs`) runs
+[PARD](https://arxiv.org/abs/2504.18583) (AMD-AGI/PARD) in target-independent mode, with the
+drafter of [PARD-2](https://arxiv.org/abs/2605.08632): the drafter proposes K tokens in one
+forward over the new real tokens plus K-1 mask tokens, the target checks the last token and
+the K drafts in one batch-invariant verify, and the longest matching prefix plus the target's
+next token are emitted. Both caches are addressed by position, so a rejection needs no copy.
+Prompts are prefilled through the same verify graphs (chunks of 16, then 8, 4, 2 and 1 rows),
+whose rows and KV-cache rows carry the decode step's bits, so a prefilled prompt continues
+exactly like a decoded one; plain and speculative runs share this prefill.
+
+Decision run: target Llama-3.1-8B-Instruct in 4-bit (new exporter defaults, a 5,041 MiB
+file); drafter `amd/PARD2-Llama-3.1-8B` (1.2 billion parameters, 16 layers) in 4-bit with a
+4-bit head; K=7, so the target verifies 8 rows; at most 256 new tokens with EOS stop; RTX
+4090; CUDA graphs in both arms; 260 prompts in the chat template with a system prompt, up to
+437 tokens long; two repetitions with the arm order alternated; both arms on the same file in
+the same process. Speed is end to end with prefill included (total new tokens over total wall
+time from prefill start to last token); tokens per round count the bonus token.
+
+| prompt set | prompts | plain tok/s | PARD tok/s | speedup | tokens per verify round |
+|---|---:|---:|---:|---:|---:|
+| GSM8K (from PARD's repository) | 80 | 166.4 | 451.0 | 2.71x | 4.55 |
+| HumanEval (from PARD's repository) | 80 | 163.6 | 471.8 | 2.88x | 5.13 |
+| MATH-500 (from PARD's repository) | 20 | 165.4 | 449.1 | 2.72x | 4.62 |
+| MT-Bench first turns (from FastChat) | 80 | 167.0 | 340.0 | 2.04x | 3.21 |
+| **pooled: 520 runs, 108,102 tokens** | 260 | **165.5** | **415.6** | **2.51x** | **4.19** |
+
+- **Exact greedy output.** 520 of 520 speculative outputs are identical, token for token up
+  to EOS or 256 tokens, to plain greedy decoding of the same 4-bit target (not of the bf16
+  model). With an 8-bit drafter head (one repetition): 2.31x pooled (165.4 to 381.9 tok/s,
+  4.22 tokens per round), 260 of 260 identical.
+- **The 8B target** decodes on the tensor-core GEMV with prompt logits within 1.93e-3
+  relative error of the Hugging Face reference (top-1 6/6), at 173.5 tok/s (5.76 ms per
+  token, 512-token benchmark) in a preliminary run (175.2 in an earlier run on another host).
+  Its 16-token greedy continuation follows the reference for 4 tokens, then splits on a
+  near-tie (top-two logit margin 0.004 at the fifth token). On this GQA model the verify
+  passes 15 of 15 bit checks (M = 1 to 16 at bases 6, 56 and 1,016); verifying 8 tokens costs
+  1.19x a decode step and 16 tokens 1.34x to 1.36x at short context, rising to 1.58x near
+  1,050 to 1,170 positions. The drafter's 16-row forward costs 0.27 of a target decode step
+  with a 4-bit head and 0.43 with an 8-bit head. No perplexity was measured for the 8B file.
+- **Limits.** Measured on these four prompt sets only, with a 4-bit target and a 4-bit
+  drafter, in target-independent mode, at contexts under about 700 positions (prompts up to
+  437 tokens plus at most 256 new tokens); verify cost grows with context. MT-Bench uses
+  FastChat's first turns: in a preliminary acceptance check with PARD's own code, its
+  acceptance came out 22.5% below the PARD-2 paper's vLLM figure, while GSM8K, MATH-500 and
+  HumanEval were within 5%. Neither the Llama-3.1 weights (Llama 3.1 Community License) nor
+  the PARD-2 drafter is redistributed.
+
+Reproduce (CUDA only, measured on an RTX 4090; the decision run downloaded the target from
+`unsloth/Llama-3.1-8B-Instruct`, revision not pinned, and the drafter at revision
+`a509e315`). Exports of Llama-3.x models need a `tokenizer.json` that tokenizers 0.19 can
+read (the version that comes with the transformers 4.44.2 pinned by `model/setup.sh`): first
+convert its BPE merges from pairs to `"a b"` strings, as the decision run did for the target
+and the drafter (the converted target tokenizer gave the same ids as the original on test
+strings and on the chat template), or use a newer transformers.
+
+```sh
+python model/export_runtime.py --model /root/hf/target --out /root/t8b
+python model/export_runtime.py --model /root/hf/drafter --out /root/d16 --lm-k 16   # 4-bit head
+python model/prep_prompts.py /root/hf/target /root/pard /root/prompts.jsonl
+cd runtime && cargo run --release --bin pard_bench -- \
+  /root/t8b/model.cbk /root/d16/model.cbk /root/prompts.jsonl --k 7 --n 256 --max-seq 1024 --reps 2
+```
+
+`prompts.jsonl` holds one `{"set": "...", "ids": [...]}` line per prompt: the prompt in the
+target's chat template (system prompt "You are a helpful assistant.", generation prompt
+added), tokenized with BOS and no other added special tokens, as PARD's `pard2_infer.py`
+does. `model/prep_prompts.py` (arguments: target model directory, PARD checkout, output file,
+optional comma-separated sets) writes it from the checkout's `datas/bmk/<set>.jsonl` files,
+one `{"data": "<prompt>"}` line per prompt. The decision run took GSM8K, HumanEval and
+MATH-500 from PARD commit 6f279bf, wrote a `mt_bench.jsonl` in the same format from the first
+turns of FastChat's MT-Bench questions, and ran the script with transformers 4.51.3 (PARD's
+pin) on the target's original tokenizer. `pard_bench` runs both arms on every prompt, prints
+a `PARD MISMATCH` line for any output difference, then one line per prompt set and a pooled
+line; `--limit N` and `--sets a,b` select prompts, and `--eos` and `--mask` default to Llama
+3.1's end tokens and the PARD drafter's mask token.
+
+#### Switches and checks
+
+Environment variables of the CUDA runtime (`generate` only where noted):
+
+| variable | effect |
+|---|---|
+| `TRAPETUM_ATTN=seq` | the previous sequential decode attention instead of split-KV |
+| `TRAPETUM_FUSE=0` | the separate kernels instead of the fused ones (a bit mask; unset means every fusion) |
+| `TRAPETUM_TC=0` | the FMA 4-bit GEMV instead of the tensor-core one, with the previous bits |
+| `TRAPETUM_SPARSITY=<file>` | `generate`: opt-in, lossy activation sparsity; thresholds from `model/teal_sparsity.py` (for example `--sparsities 0.25`) |
+| `TRAPETUM_SWEEP=<N>` | `generate`: decode greedily up to position N and print the mean time per 128-position bin |
+| `TRAPETUM_NLL=1` | `generate`: print the mean negative log-likelihood of the prompt |
+
+Checks: `bin/attn_split_check` (decode attention against an f64 CPU reference),
+`bin/verify_check` (verify rows against decode steps, bit for bit, then timing),
+`model/cbk_ppl.py` (perplexity of a `.cbk` file in both harnesses, with integrity checks) and
+`model/cbk_audit.py` (codebook usage).
 
 ## Reproducing
 
@@ -360,10 +665,11 @@ cuBLAS fp16 dense (an upper bound on dense throughput) on synthetic data.
 
 ## Limitations
 
-- **Accuracy ceiling.** Llama-2 7B is now quantized end to end (PPL 5.83 -> 6.34 at
-  4-bit, memory 2.9x), but the scalar codebook trails activation-aware and vector
-  methods, and three calibration / VQ attempts to close the gap fail (see *Model-level
-  results*). Zero-shot `lm-eval-harness` is still not run.
+- **Accuracy ceiling.** Llama-2 7B is now quantized end to end (PPL 5.83 -> 6.10 at
+  4-bit with the new exporter, 6.79 for the legacy file, the app's current format;
+  memory 2.9x), but the scalar codebook still trails activation-aware and vector methods;
+  three calibration / VQ attempts to close the gap failed, and only the E[x^2]-weighted
+  k-means helped (see *Model-level results*). Zero-shot `lm-eval-harness` is still not run.
 - **Synthetic data.** Codebooks and indices are random (`mt19937(0)`). Real
   weight/index distributions (and their effect on cache behaviour and bank
   conflicts) may differ.
@@ -387,8 +693,10 @@ To turn this into a defensible research comparison:
 
 1. Quantize a real model with this codebook scheme; report wikitext PPL and
    `lm-eval-harness` zero-shot, at matched effective bits. *Partly done:* Llama-2 7B
-   is quantized to 4-bit (PPL 5.83 -> 6.34, memory 2.9x); calibration and VQ attempts
-   to lift accuracy are documented negative results. `lm-eval-harness` still pending.
+   is quantized to 4-bit (PPL 5.83 -> 6.10 with the new exporter, 6.79 for the legacy
+   file; memory 2.9x); the calibration and VQ attempts to lift accuracy are documented
+   negative results, except the E[x^2]-weighted k-means the exporter now uses.
+   `lm-eval-harness` still pending.
 2. Benchmark decode/prefill against Marlin, FLUTE, VQ-LLM and the QuIP#/QTIP
    kernels **at matched accuracy** (the only fair speed axis).
 3. Port the kernels to Hopper. *Partly done:* the 4-bit decode kernel now compiles

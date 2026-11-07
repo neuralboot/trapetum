@@ -89,7 +89,7 @@ On an RTX 4090, decoding from `"The capital of France is"`:
 | decode throughput | 7.4 ms/token (**135 tok/s**) |
 
 The runtime reproduces HuggingFace's greedy generation exactly, token for token, from the
-same quantized weights, in pure Rust on the device. The `.cbk` is 3.5 GB (vs 13 GB fp16).
+same quantized weights, in pure Rust on the device. The `.cbk` is 3.66 GB (vs 13.48 GB fp16).
 
 ## Roadmap
 

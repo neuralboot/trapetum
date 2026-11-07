@@ -21,7 +21,7 @@ single-run gross figure; it is refreshed to gross+/-std and net on the next GPU 
 | aqlm-2bit (official kernel) | 2.0 | 2.15 | 7.01 | 24.2 | 3.86 | 0.054 / 0.43 |
 | **codebook-4bit (ours, Rust runtime)** | 4.05 | 4.73* | 5.92 | **81** | **2.58** | **0.036 / 0.29** |
 
-\* 4.73 GB measured peak (3.5 GB weights + KV cache + activations).
+\* 4.73 GB measured peak (3.66 GB weights + KV cache + activations).
 
 ### Hardened energy re-measurement (3 runs, +/-std, trapezoidal integral, idle-subtracted)
 
@@ -43,13 +43,13 @@ wrapper, a working AQLM-kernel build) is future work.
 ## Honest reading
 
 - **Energy is the headline, and it holds iso-context.** Over the *same* 512-token
-  generation, the pure-Rust runtime runs the *same* 4-bit weights at **2.58 J/token —
+  generation, the pure-Rust runtime runs the *same* 4-bit weights at **2.58 J/token,
   2.1x less than fp16 (5.45)** and ~1.5x less than the Python-wrapped kernel (4.00). It is
   also the fastest quantized path (81 vs 28-45 tok/s).
 - **J/token is context-dependent** (it drops for every method at longer context: attention
   over the KV cache is memory-bound and lower-power). That is exactly why we measure all
   rows at the same 512-token generation rather than comparing across context lengths.
-- **Speed:** our 4-bit *via a Python op* is slower than fp16 (28.4 vs 45.2 tok/s) — Python
+- **Speed:** our 4-bit *via a Python op* is slower than fp16 (28.4 vs 45.2 tok/s): Python
   per-op dispatch (224 calls/token), not the kernel. The *same weights* in Rust run at
   81 tok/s (1.8x fp16 at this context, 135 short-context). The Python->Rust gap *is* the
   overhead, and it is the strongest single result here.
