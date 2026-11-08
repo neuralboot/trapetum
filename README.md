@@ -16,6 +16,8 @@ file is 3.66 GB instead of 13.48 GB in fp16, 3.7x smaller (the new exporter's fi
 3.75 GB, 3.6x). The same runtime serves Llama-2-70B in 2 bits on one RTX 4090: 38.4 tok/s at
 positions 6 to 22, wikitext-2 perplexity 4.49 on the full test set, against 5.72 for the new
 7B 4-bit file and 5.47 for fp16 Llama-2-7B ([details](#llama-2-70b-in-2-bits-on-one-rtx-4090)).
+Its PV-tuned 1x16 version scores 4.02 and decodes at 22.5 tok/s with exact speculative
+decoding, a 2-bit Llama-2-7B drafting ([details](#llama-2-70b-pv-tuned-in-1x16-with-exact-speculative-decoding)).
 
 > **Correction, November 2026.** The 4-bit Llama-2-7B perplexity published here until now
 > (wikitext-2 PPL 6.34) came from a research script, not from the runtime's 4-bit file,
@@ -47,10 +49,11 @@ Y[m, j]     = sum_i  X[m, i] * W_deq[i, j]
 | tensor-core 4-bit GEMV, batch-invariant verify | 194.5 tok/s (512-token benchmark); verifying 16 tokens costs 1.21x a decode step at short context |
 | PARD speculative decoding, Llama-3.1-8B-Instruct | 2.51x end to end (165.5 to 415.6 tok/s); 520 of 520 outputs identical to plain greedy decoding of the same 4-bit target |
 | Llama-2-70B in 2 bits (AQLM 2x8, 17.96 GB file) on one RTX 4090 | wikitext-2 PPL 4.49 on the full test set (4.68 on 30 windows), against 5.72 (6.10) for the new 7B 4-bit file; 38.4 tok/s at positions 6 to 22; greedy 16/16 against the Hugging Face reference |
+| Llama-2-70B PV-tuned in 2 bits (AQLM 1x16, 18.54 GB file) on one RTX 4090 | wikitext-2 PPL 4.02 on the full test set (4.17 on 30 windows); 8.5 tok/s plain, 22.5 tok/s end to end with exact speculative decoding (2-bit Llama-2-7B drafter, K = 7); 36 of 36 outputs (K = 3, 7 and 15) identical to plain greedy decoding |
 
 Setup, caveats, per-step details and how to reproduce:
 [November 2026 update](#november-2026-update), under *Benchmarks*. The kernel changes are CUDA
-only (Apple Metal is unchanged). The code is on `main` (commits 2e8c170 to fb8795f); the
+only (Apple Metal is unchanged). The code is on `main` (commits 2e8c170 to 2051728); the
 desktop app's downloadable models are not updated.
 
 ## Repository layout
@@ -314,8 +317,9 @@ it saved about 0.6 ms per token in both formats, and the remaining fixed cost wa
 kernels plus the batch-1 attention, which grew with context (the November kernels address
 both, though the 2-bit path gets only the RoPE and KV-append fusion). Only four
 PV checkpoints exist in the 2x8 format (Llama-2 7B, Llama-3.1 8B Instruct, Llama-3.2 3B and
-3B Instruct); the 2-bit path is CUDA only (no Metal AVQ kernel yet), and its decode sums
-partials with atomics, so its logits vary in the last digits from run to run.
+3B Instruct; since 7 November 2026 the runtime also serves the 1x16 format, see
+[the 1x16 Llama-2-70B](#llama-2-70b-pv-tuned-in-1x16-with-exact-speculative-decoding)); the 2-bit path is CUDA only (no Metal AVQ kernel yet), and
+its 2x8 decode sums partials with atomics, so its logits vary in the last digits from run to run.
 
 ```sh
 python model/export_aqlm.py --model ISTA-DASLab/Llama-2-7b-AQLM-PV-2Bit-2x8-hf --out /root/cbk4 --gen 16
@@ -328,7 +332,9 @@ scalar 4-bit (7.63 vs 6.34 for the research script's codebook, 6.79 for the lega
 file) though at *half* the bits, and far better than scalar *2-bit*,
 which diverges. The accuracy-competitive AQLM is `1x16`
 (K = 65536), whose 256 KB-per-group LUT does not fit shared memory and needs a different,
-slower kernel (which is why AQLM decode is slow). We tested the `4x8` path (M=4, 4 bits). The kernel stays fast (M=4 decodes at **x2.39**
+slower kernel (which is why AQLM decode is slow). Since 7 November 2026 the runtime has such a
+kernel: it gathers each codebook entry from L2 instead of building a LUT
+([the 1x16 Llama-2-70B](#llama-2-70b-pv-tuned-in-1x16-with-exact-speculative-decoding)). We tested the `4x8` path (M=4, 4 bits). The kernel stays fast (M=4 decodes at **x2.39**
 on the A40, GT=4, verified). On accuracy, a *greedy* additive fit only ties the scalar
 4-bit codebook of the research script (PPL 6.32 vs 6.34): the additive *structure* alone
 does not beat scalar,
@@ -375,8 +381,8 @@ experiment (`prof11.cu`) shows the wmma API is *not* the bottleneck (raw
 
 Measured on 5, 6 and 7 November 2026. Code: commits 2e8c170 (exporter), 04a8b60 (split-KV
 attention, fused kernels), e9b97d6 (activation sparsity), d0c4e23 (tensor-core GEMV,
-batch-invariant verify), 2ca5d97 (PARD) and fb8795f (2-bit exporter options for
-Llama-2-70B), on `main`. The raw logs of these runs are not
+batch-invariant verify), 2ca5d97 (PARD), fb8795f (2-bit exporter options for
+Llama-2-70B) and 2051728 (AQLM 1x16 decode and its exact speculative decoding), on `main`. The raw logs of these runs are not
 in the repository; the results are summarized here.
 
 **Setup.** Rented RunPod GPUs, one GPU per run, each run on a fresh pod, so hosts differ
@@ -387,8 +393,8 @@ Image `pytorch/pytorch:2.4.0-cuda12.1-cudnn9-devel` (Python 3.11.9, PyTorch 2.4.
 4090 hosts that log it. Batch 1, greedy, CUDA-graph decode (`TRAPETUM_GRAPH=1`) unless marked
 eager. Three timing windows: the mean per 128-position bin of one long greedy decode
 (`TRAPETUM_SWEEP`), the 16-token continuation after a 6-token prompt (positions 6 to 22, the
-window of the CBK4 table above), and a 512-token decode benchmark (the Llama-2-70B run also
-reports a 256-token decode). Each per-step gain below
+window of the CBK4 table above), and a 512-token decode benchmark (the Llama-2-70B 2x8 run also
+reports a 256-token decode, and the 1x16 speculative runs an end-to-end throughput with prefill). Each per-step gain below
 is a same-host A/B; figures from different steps come from different hosts (for scale, one
 decode path measured 184.6, 185.5 and 187.8 tok/s at positions 6 to 22 on three RTX 4090
 hosts). From step 1 on, every Llama-2-7B 4-bit speed is measured on the new exporter's file.
@@ -482,7 +488,7 @@ python model/cbk_ppl.py --cbk /root/cbk_new/model.cbk --ref-dir /root/cbk_new --
   the separate kernels (checked on an RTX 4090 and on an A40), greedy 16/16 in every run, and
   a GQA model with head_dim 64 matches a CPU reference (relative error 7.9e-4, top-1 5/5). On
   an A40: 10.49 to 9.31 ms per token. The 2-bit path gets only the RoPE and KV-append fusion
-  (about 1.5% on an A40, 7.17 to 7.06 ms); its decode sums partials with atomics, so its
+  (about 1.5% on an A40, 7.17 to 7.06 ms); its 2x8 decode sums partials with atomics, so its
   logits vary slightly from run to run, and the bit-identity results apply to the 4-bit path.
 - **Step 4, activation sparsity** (TEAL-style; off by default, lossy, CUDA only).
   `TRAPETUM_SPARSITY=<file>` loads per-layer thresholds; inputs of the q/k/v, o, gate/up and
@@ -634,12 +640,12 @@ Decode is batch 1 with CUDA graphs on an RTX 4090; the two models ran on differe
   decode, 37.5 near 1,024 to 1,152 positions. About 17.4 GB of weights are read per token, so
   about 670 GB/s, two thirds of the card's 1,008 GB/s. On the same host the 7B 2-bit PV file
   decodes at 213.4 and 213.9 tok/s.
-- **Limits.** One run on one host. The checkpoint is 2x8 and not PV-tuned (no PV-tuned 2x8 Llama-2-70B is published): at context 4,096 the model cards give 4.21 for it, 3.83 for the 1x16 checkpoint and 3.78 for the PV-tuned 1x16 one, a layout the runtime does not decode yet. The 4.06 of the 2-bit 70B in
+- **Limits.** One run on one host. The checkpoint is 2x8 and not PV-tuned (no PV-tuned 2x8 Llama-2-70B is published): at context 4,096 the model cards give 4.21 for it, 3.83 for the 1x16 checkpoint and 3.78 for the PV-tuned 1x16 one, which the runtime now also serves ([next section](#llama-2-70b-pv-tuned-in-1x16-with-exact-speculative-decoding)). The 4.06 of the 2-bit 70B in
   [`bench/README.md`](bench/README.md) is that 1x16 checkpoint (not PV-tuned), run in Python,
   not this file. The perplexities are computed in Python on the served weights (AQLM codes and
-  the 8-bit head); the runtime's NLL was compared on the first window only. 2-bit decode sums
-  partials with atomics, so its logits vary slightly from run to run, and it has no speculative
-  path. The weights are not redistributed (Llama 2 Community License).
+  the 8-bit head); the runtime's NLL was compared on the first window only. The 2x8 decode sums
+  partials with atomics, so its logits vary slightly from run to run, and it has no exact
+  speculative path (the 1x16 path below has one). The weights are not redistributed (Llama 2 Community License).
 
 Reproduce (CUDA; the export loads the AQLM model on the GPU, about 18.2 GB, with `aqlm[gpu]`;
 the run used transformers 4.44.2 and aqlm 1.1.7, and peaked at 20,315 MiB with the perplexity):
@@ -658,6 +664,70 @@ TRAPETUM_NLL=1 ./target/release/generate /root/c70/model.cbk /root/c70/wt2_w0.bi
 memory) so that it fits next to the 70B; `--ppl 166` prints the running perplexity after
 window 1 and every 10 windows (the 30-window value included) and the full-test value, and
 `--ppl-window0-out` writes the first window's tokens for the `TRAPETUM_NLL` check.
+
+#### Llama-2-70B PV-tuned in 1x16, with exact speculative decoding
+
+The PV-tuned Llama-2-70B is published only in AQLM's 1x16 layout,
+[`ISTA-DASLab/Llama-2-70b-AQLM-PV-2Bit-1x16-hf`](https://huggingface.co/ISTA-DASLab/Llama-2-70b-AQLM-PV-2Bit-1x16-hf)
+(AQLM, Egiazarian et al., ICML 2024; PV-Tuning, Malinovskii et al., NeurIPS 2024): each weight
+matrix has one codebook of 65,536 entries of 8 fp16 values and one 16-bit code per group of
+8 weights, still 2 bits per weight. `model/export_aqlm.py` copies these codes, codebooks and
+scales bit for bit too (CBK4 with `avq_m = 1`, 8-bit LM head as above), an 18.54 GB file.
+A 1 MiB codebook does not fit in shared memory, so, like AQLM's own 1x16 CUDA kernel, the decode kernel (`avq16_gemv`) gives each output row to one warp and gathers every codebook entry from the L2 cache; it computes the products in f32 rather than fp16 and uses no atomics, so its results are the same bits from run to run, eagerly and in CUDA graphs. Measured on 7 November 2026 on one RTX 4090, in two runs, each against a rule fixed
+before it.
+
+| Llama-2, 2-bit AQLM | file | wikitext-2 PPL, 30 windows | full test set | decode tok/s |
+|---|---:|---:|---:|---:|
+| 13B PV, 1x16 | 4.00 GB | 5.74 | 5.40 | 42.6 |
+| 70B, 2x8 (above) | 17.96 GB | 4.68 | 4.49 | 38.4 |
+| **70B PV, 1x16** | **18.54 GB** | **4.17** | **4.02** | 8.5 |
+| **70B PV, 1x16, speculative (K = 7)** | **+ 2.05 GB drafter** | **4.17** | **4.02** | **22.5** |
+
+Decode is batch 1 with CUDA graphs, positions 6 to 22, except the speculative row: end-to-end throughput, prefill included, over 12 prompts of 8 to 65 tokens with up to 128 generated tokens each (plain decoding in the same harness: 8.1 tok/s). For scale, the new 7B 4-bit file (3.75 GB) scores 6.10 and 5.72. The 2x8 row comes from
+another host.
+
+- **Agreement with the reference.** Prompt logits are within 1.62e-3 relative error of the
+  Hugging Face AQLM model on its dequantize-then-matmul path (top-1 6/6), and the 16-token
+  greedy continuation matches in eager and CUDA-graph mode. Against its default path the gap is 5.91e-3: aqlm 1.1.7 runs a prompt of 6 tokens or fewer through its GEMV kernel, which adds the 8 products of each group in fp16, and that path is itself 4.96e-3 away from the dequantized one (`--ref-gemm` writes the
+  second reference). On the first 2,048 wikitext-2 test tokens the runtime's mean NLL is
+  1.132485 nats per token against 1.132619 for the reference (13B: 1.362944 against
+  1.362946). Peak memory: 17,930 MiB with a 1,024-position KV cache (18,560 MiB with the
+  2,112-position cache of the NLL check).
+- **Plain decode is slow.** 8.5 tok/s at positions 6 to 22, and 8.4 up to 1,152 positions:
+  every group of 8 weights costs a random 16-byte codebook read that L2 serves as a 32-byte sector, and counting the whole decode step the 7B PV 1x16 and the 70B move about 2.0 and 2.3 TB/s of such sectors. On the same host the 7B PV 1x16 decodes at 78 tok/s against 215 for its 2x8 version.
+- **Exact speculative decoding** (`runtime/src/bin/spec_ar.rs`). The 2-bit
+  [`ISTA-DASLab/Llama-2-7b-AQLM-PV-2Bit-2x8-hf`](https://huggingface.co/ISTA-DASLab/Llama-2-7b-AQLM-PV-2Bit-2x8-hf)
+  (2.05 GB, same tokenizer) drafts K tokens with CUDA-graph decode steps; the 70B verifies the
+  K + 1 rows in one pass with `avq16_gemv_v`, which gives every row the decode kernel's bits
+  and reads each code and codebook entry once for all rows (at short context 8 rows cost 1.11 decode steps and 16 rows 1.81; near 1,050 to 1,070 positions, 1.14 and 1.87). `verify_check` finds
+  the verify rows identical to decode steps at three bases, for M = 1, 2, 4, 8 and 16, eager
+  and CUDA graph. Over 12 prompts (`model/prep_prompts_llama2.py`: 8 windows of 64 wikitext-2
+  test tokens and 4 short prompts, BOS included), 128 greedy tokens each at most, the outputs
+  equal plain greedy decoding in 36 of 36 runs (K = 3, 7, 15). The throughput, end to end from the start of the prefill to the last token (the drafter's prefill, one decode step per prompt token, included), is 22.5 tok/s at K = 7 against 8.1 for plain decoding in the same harness (2.79x, 4.49 tokens per verify pass), 18.3 at K = 3 and 17.1 at K = 15. Peak memory with both
+  models and the verify buffers: 21,295 MiB.
+- **Rules.** The first run met its criteria of fit, top-1, greedy, NLL agreement and quality (full-test perplexity at most 4.20) but not its speed criterion (at least 10 tok/s), and its logits criterion (5e-3) failed against the default reference only. The second run met all four of its criteria: identical outputs, verify rows identical to decode steps, at least 12 tok/s at K = 7, and logits within 5e-3 of the dequantized reference.
+- **Limits.** One run per result on one host each, greedy decoding only. The speculative speed depends on how many drafts are accepted and on the prompts: at K = 7, 22.16 tok/s on the wikitext windows (4.68 tokens per verify pass, 65-token prompts whose prefill is timed) and 23.15 on the short prompts (4.13). The perplexities are computed in Python on the served weights; the runtime's NLL was compared on the first window only. The 4.06 in
+  [`bench/README.md`](bench/README.md) is the 1x16 checkpoint that is not PV-tuned, run in
+  Python, not this file. The 2x8 path keeps its atomics and has no exact speculative
+  decoding. The weights are not redistributed (Llama 2 Community License).
+
+Reproduce (CUDA, transformers 4.44.2 and aqlm 1.1.7 as above; the export with the perplexity
+peaked at 20,869 MiB):
+
+```sh
+python model/export_aqlm.py --model ISTA-DASLab/Llama-2-70b-AQLM-PV-2Bit-1x16-hf --out /root/c70 \
+    --lm-k 256 --lm-chunk 4096 --ppl 166 --ppl-tokenizer NousResearch/Llama-2-7b-hf \
+    --ppl-window0-out /root/c70/wt2_w0.bin --ref-gemm
+python model/export_aqlm.py --model ISTA-DASLab/Llama-2-7b-AQLM-PV-2Bit-2x8-hf --out /root/c7 --lm-k 256
+python model/prep_prompts_llama2.py /root/prompts.jsonl
+cd runtime && cargo build --release --bin generate --bin verify_check --bin spec_ar
+./target/release/generate /root/c70/model.cbk /root/c70/prompt.bin /root/c70/ref_gemm.bin /root/c70/cont.bin
+TRAPETUM_GRAPH=1 ./target/release/generate /root/c70/model.cbk /root/c70/prompt.bin \
+    /root/c70/ref.bin /root/c70/cont.bin 256
+TRAPETUM_NLL=1 ./target/release/generate /root/c70/model.cbk /root/c70/wt2_w0.bin - -
+./target/release/verify_check /root/c70/model.cbk /root/c70/prompt.bin /root/c70/cont.bin 16
+./target/release/spec_ar /root/c70/model.cbk /root/c7/model.cbk /root/prompts.jsonl --k 3,7,15 --n 128 --eos 2
+```
 
 #### Switches and checks
 
