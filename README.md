@@ -18,6 +18,9 @@ positions 6 to 22, wikitext-2 perplexity 4.49 on the full test set, against 5.72
 7B 4-bit file and 5.47 for fp16 Llama-2-7B ([details](#llama-2-70b-in-2-bits-on-one-rtx-4090)).
 Its PV-tuned 1x16 version scores 4.02 and decodes at 22.5 tok/s with exact speculative
 decoding, a 2-bit Llama-2-7B drafting ([details](#llama-2-70b-pv-tuned-in-1x16-with-exact-speculative-decoding)).
+Llama-3.1-70B-Instruct, a conversational 70B, also PV-tuned in 1x16, reaches 21.3 tok/s on chat
+prompts with exact speculative decoding from a 2-bit Llama-3.1-8B-Instruct drafter
+([details](#llama-31-70b-instruct-on-one-rtx-4090-with-exact-speculative-decoding)).
 
 > **Correction, November 2026.** The 4-bit Llama-2-7B perplexity published here until now
 > (wikitext-2 PPL 6.34) came from a research script, not from the runtime's 4-bit file,
@@ -50,10 +53,11 @@ Y[m, j]     = sum_i  X[m, i] * W_deq[i, j]
 | PARD speculative decoding, Llama-3.1-8B-Instruct | 2.51x end to end (165.5 to 415.6 tok/s); 520 of 520 outputs identical to plain greedy decoding of the same 4-bit target |
 | Llama-2-70B in 2 bits (AQLM 2x8, 17.96 GB file) on one RTX 4090 | wikitext-2 PPL 4.49 on the full test set (4.68 on 30 windows), against 5.72 (6.10) for the new 7B 4-bit file; 38.4 tok/s at positions 6 to 22; greedy 16/16 against the Hugging Face reference |
 | Llama-2-70B PV-tuned in 2 bits (AQLM 1x16, 18.54 GB file) on one RTX 4090 | wikitext-2 PPL 4.02 on the full test set (4.17 on 30 windows); 8.5 tok/s plain, 22.5 tok/s end to end with exact speculative decoding (2-bit Llama-2-7B drafter, K = 7); 36 of 36 outputs (K = 3, 7 and 15) identical to plain greedy decoding |
+| Llama-3.1-70B-Instruct PV-tuned in 2 bits (AQLM 1x16, 21.00 GB file) on one RTX 4090 | 21.3 tok/s end to end with exact speculative decoding over 16 chat prompts (2-bit Llama-3.1-8B-Instruct drafter, K = 7), 7.9 plain in the same harness; 32 of 32 outputs (K = 3 and 7) identical to plain greedy decoding; wikitext-2 PPL 6.28 on the full test set (6.62 on 30 windows; Llama 3 tokenizer, not comparable with the Llama 2 rows) |
 
 Setup, caveats, per-step details and how to reproduce:
 [November 2026 update](#november-2026-update), under *Benchmarks*. The kernel changes are CUDA
-only (Apple Metal is unchanged). The code is on `main` (commits 2e8c170 to 2051728); the
+only (Apple Metal is unchanged). The code is on `main` (commits 2e8c170 to 6b8cb42); the
 desktop app's downloadable models are not updated.
 
 ## Repository layout
@@ -379,10 +383,11 @@ experiment (`prof11.cu`) shows the wmma API is *not* the bottleneck (raw
 
 ### November 2026 update
 
-Measured on 5, 6 and 7 November 2026. Code: commits 2e8c170 (exporter), 04a8b60 (split-KV
+Measured from 5 to 8 November 2026. Code: commits 2e8c170 (exporter), 04a8b60 (split-KV
 attention, fused kernels), e9b97d6 (activation sparsity), d0c4e23 (tensor-core GEMV,
 batch-invariant verify), 2ca5d97 (PARD), fb8795f (2-bit exporter options for
-Llama-2-70B) and 2051728 (AQLM 1x16 decode and its exact speculative decoding), on `main`. The raw logs of these runs are not
+Llama-2-70B), 2051728 (AQLM 1x16 decode and its exact speculative decoding) and 6b8cb42
+(Llama-3.1-70B-Instruct export options), on `main`. The raw logs of these runs are not
 in the repository; the results are summarized here.
 
 **Setup.** Rented RunPod GPUs, one GPU per run, each run on a fresh pod, so hosts differ
@@ -393,8 +398,9 @@ Image `pytorch/pytorch:2.4.0-cuda12.1-cudnn9-devel` (Python 3.11.9, PyTorch 2.4.
 4090 hosts that log it. Batch 1, greedy, CUDA-graph decode (`TRAPETUM_GRAPH=1`) unless marked
 eager. Three timing windows: the mean per 128-position bin of one long greedy decode
 (`TRAPETUM_SWEEP`), the 16-token continuation after a 6-token prompt (positions 6 to 22, the
-window of the CBK4 table above), and a 512-token decode benchmark (the Llama-2-70B 2x8 run also
-reports a 256-token decode, and the 1x16 speculative runs an end-to-end throughput with prefill). Each per-step gain below
+window of the CBK4 table above), and a 512-token decode benchmark (the Llama-2-70B 2x8 and
+Llama-3.1-70B-Instruct runs also report a 256-token decode, and the speculative runs an end-to-end throughput
+with prefill). Each per-step gain below
 is a same-host A/B; figures from different steps come from different hosts (for scale, one
 decode path measured 184.6, 185.5 and 187.8 tok/s at positions 6 to 22 on three RTX 4090
 hosts). From step 1 on, every Llama-2-7B 4-bit speed is measured on the new exporter's file.
@@ -728,6 +734,58 @@ TRAPETUM_NLL=1 ./target/release/generate /root/c70/model.cbk /root/c70/wt2_w0.bi
 ./target/release/verify_check /root/c70/model.cbk /root/c70/prompt.bin /root/c70/cont.bin 16
 ./target/release/spec_ar /root/c70/model.cbk /root/c7/model.cbk /root/prompts.jsonl --k 3,7,15 --n 128 --eos 2
 ```
+
+#### Llama-3.1-70B-Instruct on one RTX 4090, with exact speculative decoding
+
+The same 1x16 path serves the conversational
+[`ISTA-DASLab/Meta-Llama-3.1-70B-Instruct-AQLM-PV-2Bit-1x16`](https://huggingface.co/ISTA-DASLab/Meta-Llama-3.1-70B-Instruct-AQLM-PV-2Bit-1x16)
+(PV-tuned, 1x16, vocabulary of 128,256 tokens), with
+[`ISTA-DASLab/Meta-Llama-3.1-8B-Instruct-AQLM-PV-2Bit-2x8-hf`](https://huggingface.co/ISTA-DASLab/Meta-Llama-3.1-8B-Instruct-AQLM-PV-2Bit-2x8-hf)
+(2x8, 3.46 GB file) as the drafter; the 70B file is 21.00 GB with the 8-bit LM head. The 70B checkpoint's current configuration declares no RoPE scaling (8,192 positions), unlike Meta's Llama 3.1 and the checkpoint's own first revision on Hugging Face (llama3 scaling, 131,072 positions); it is served as published: the runtime, like Hugging Face, uses plain RoPE with theta 500,000 (the 8B drafter declares llama3 scaling, which the exporter bakes into its file).
+On the 24 GB card the export keeps the 2.1 GB input embedding on the CPU (`--embed-on-cpu`),
+computes the perplexity loss over chunks of positions (`--ppl-chunk`), frees the dense LM head
+before loading its dequantized copy and transposes the head on the CPU for its quantization; its
+highest memory sample (every 300 ms, with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`) was
+23,091 MiB of 24,564. Measured on 8 November 2026 on one RTX 4090, one run, against a rule fixed before it; all seven criteria passed (fit; logits within 5e-3 of the dequantized-path reference with greedy 16/16; runtime NLL within 0.005 nats of the reference; full-test perplexity at least 15% below the drafter's; outputs identical to plain greedy decoding; verify rows identical to decode steps; at least 12 tok/s at K = 7).
+
+| Llama 3.1 Instruct, 2-bit AQLM | file | wikitext-2 PPL, 30 windows | full test set | decode tok/s |
+|---|---:|---:|---:|---:|
+| 8B PV, 2x8 (drafter) | 3.46 GB | 11.28 | 10.61 | 183.2 |
+| **70B PV, 1x16** | **21.00 GB** | **6.62** | **6.28** | 8.7 |
+| **70B PV, 1x16, speculative (K = 7)** | **+ 3.46 GB drafter** | **6.62** | **6.28** | **21.3** |
+
+Llama 3 tokenizer (141 windows of 2,048 tokens), so these perplexities do not compare with the Llama 2 ones, and no unquantized model was measured. Decode is batch 1 with CUDA graphs, positions 6 to 22, except the speculative row: end-to-end throughput, prefill included, over 16 chat prompts of 53 to 178 tokens with up to 128 generated tokens each (plain decoding in the same harness: 7.9 tok/s).
+
+- **Agreement with the reference.** Prompt logits are within 1.40e-3 relative error of the Hugging Face AQLM model on its dequantize-then-matmul path (1.61e-3 against its default path; the two paths are 2.14e-3 apart), top-1 6/6, and the 16-token greedy continuation matches in eager mode and in two CUDA-graph runs. On the first 2,048 wikitext-2 test tokens the runtime's mean NLL is 1.593123 nats per token against 1.593003 for the reference. Peak memory: 18,730 MiB with a 1,024-position KV cache (19,360 MiB with the 2,112-position cache of the NLL check), 21,774 MiB with the drafter and the verify buffers.
+- **Speed.** Plain decode: 8.7 tok/s at positions 6 to 22 (two rounds) and over a 256-token decode. Over 16 chat prompts (`model/prep_prompts.py` with a limit of 4 per set: the first 4 of PARD's gsm8k, humaneval and math_500 sets and of the MT-Bench first turns, with the Llama 3.1 chat template and the system prompt "You are a helpful assistant."), the speculative outputs equal plain greedy decoding in 32 of 32 runs (K = 3 and 7), and the end-to-end throughput is 21.3 tok/s at K = 7 against 7.9 for plain decoding in the same harness (2.7x, 5.59 tokens per verify pass), and 17.0 at K = 3. At K = 7: 22.75 tok/s on gsm8k, 20.87 on humaneval, 23.88 on math_500 and 18.67 on MT-Bench (4.10 tokens per pass). At short context a verify pass of 8 rows costs 1.13 decode steps and one of 16 rows 1.85 (1.16 and 1.92 near 1,050 to 1,070 positions), and the verify rows are identical to decode steps at three bases, for M = 1, 2, 4, 8 and 16, eager and CUDA graph. The drafter alone decodes at 183.2 tok/s.
+- **Limits.** One run on one host, greedy decoding only, 16 prompts. The perplexities are computed in Python on the served weights; the runtime's NLL was compared on the first window only. The export leaves at most 1,473 MiB of the card free (highest 300 ms sample). The plain RoPE comes from the checkpoint's current configuration; this run does not test Meta's llama3 scaling with these weights. The weights are not redistributed (Llama 3.1 Community License).
+
+Reproduce (CUDA, transformers 4.44.2 and aqlm 1.1.7 as above):
+
+```sh
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+python model/export_aqlm.py --model ISTA-DASLab/Meta-Llama-3.1-70B-Instruct-AQLM-PV-2Bit-1x16 \
+    --out /root/l70 --lm-k 256 --embed-on-cpu --lm-chunk 4096 --ppl 400 --ppl-chunk 256 \
+    --ppl-window0-out /root/l70/wt2_w0.bin --ref-gemm
+python model/export_aqlm.py --model ISTA-DASLab/Meta-Llama-3.1-8B-Instruct-AQLM-PV-2Bit-2x8-hf \
+    --out /root/l8 --lm-k 256 --ppl 400 --ppl-chunk 256
+python model/prep_prompts.py ISTA-DASLab/Meta-Llama-3.1-70B-Instruct-AQLM-PV-2Bit-1x16 /root/pard \
+    /root/chat16.jsonl "" 4
+cd runtime && cargo build --release --bin generate --bin verify_check --bin spec_ar
+./target/release/generate /root/l70/model.cbk /root/l70/prompt.bin /root/l70/ref_gemm.bin /root/l70/cont.bin
+TRAPETUM_GRAPH=1 ./target/release/generate /root/l70/model.cbk /root/l70/prompt.bin \
+    /root/l70/ref_gemm.bin /root/l70/cont.bin 256
+TRAPETUM_NLL=1 ./target/release/generate /root/l70/model.cbk /root/l70/wt2_w0.bin - -
+python -c "import numpy as np; np.arange(1000, 1064, dtype='<i4').tofile('/root/vc.bin')"
+./target/release/verify_check /root/l70/model.cbk /root/l70/prompt.bin /root/vc.bin 16
+./target/release/spec_ar /root/l70/model.cbk /root/l8/model.cbk /root/chat16.jsonl --k 3,7 --n 128 \
+    --eos 128001,128008,128009
+```
+
+`/root/pard` holds `datas/bmk/{gsm8k,humaneval,math_500}.jsonl` from AMD-AGI/PARD (commit 6f279bf)
+and `datas/bmk/mt_bench.jsonl`, one `{"data": ...}` line per first turn of FastChat's MT-Bench
+questions; `--ppl 400` covers all 141 windows; `verify_check` takes any 16 or more tokens after the
+prompt.
 
 #### Switches and checks
 
