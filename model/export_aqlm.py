@@ -40,6 +40,9 @@ The reader is Model::load_cbk / load_cbk4_body in runtime/src/lib.rs; keep the t
 Usage:
   python model/export_aqlm.py --model ISTA-DASLab/Llama-2-7b-AQLM-PV-2Bit-2x8-hf --out /root/cbk4 \
       --prompt "The capital of France is" --gen 16 --lm-k 256 --ppl 30
+Llama-3.1-70B-Instruct AQLM 1x16 (ISTA-DASLab) fit the export on one 24 GB RTX 4090 (highest memory
+sample 23,091 MiB) with --embed-on-cpu --lm-chunk 4096 --ppl-chunk 256 and
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
 No em dashes or en dashes anywhere.
 """
 import argparse, math, os, struct, sys
@@ -158,10 +161,12 @@ def walk_cbk4(path):
 
 
 @torch.no_grad()
-def ppl_windows(model, tok, n_windows, seqlen=2048, window0_out=None):
+def ppl_windows(model, tok, n_windows, seqlen=2048, window0_out=None, chunk=0):
     """wikitext-2 test PPL over the first n_windows windows of seqlen tokens. Also prints the
     running PPL after windows 1 and 30 (window 1 alone is what the runtime's TRAPETUM_NLL check
-    compares against) and, with window0_out, writes window 0's token ids (i32) for that check."""
+    compares against) and, with window0_out, writes window 0's token ids (i32) for that check.
+    chunk > 0 computes each window's loss over chunks of that many positions (less GPU memory for a
+    large vocabulary: the f32 logits of 2,048 positions of Llama-3 alone are 1.05 GB)."""
     from datasets import load_dataset
     data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     enc = tok("\n\n".join(data["text"]), return_tensors="pt").input_ids
@@ -172,10 +177,16 @@ def ppl_windows(model, tok, n_windows, seqlen=2048, window0_out=None):
     lf = torch.nn.CrossEntropyLoss(reduction="sum")
     tot, nt = 0.0, 0
     for i in range(n):
-        ids = enc[:, i * seqlen:(i + 1) * seqlen].to(model.device)
+        ids = enc[:, i * seqlen:(i + 1) * seqlen].cuda()
         o = model(ids).logits
-        tot += lf(o[:, :-1, :].reshape(-1, o.size(-1)).float(), ids[:, 1:].reshape(-1)).item()
+        if chunk > 0:
+            lo, tg = o[0, :-1, :], ids[0, 1:]
+            for s in range(0, lo.size(0), chunk):
+                tot += lf(lo[s:s + chunk].float(), tg[s:s + chunk]).item()
+        else:
+            tot += lf(o[:, :-1, :].reshape(-1, o.size(-1)).float(), ids[:, 1:].reshape(-1)).item()
         nt += ids[:, 1:].numel()
+        del o
         if i + 1 in (1, 30) or (i + 1) % 10 == 0:
             print(f"  PPL_RUNNING windows={i + 1} mean_nll={tot / nt:.6f} ppl={math.exp(tot / nt):.4f}", flush=True)
     return math.exp(tot / nt), n
@@ -193,6 +204,12 @@ def main():
     ap.add_argument("--ppl-window0-out", default=None, help="with --ppl: write window 0's token ids (i32) here")
     ap.add_argument("--lm-chunk", type=int, default=16384,
                     help="LM-head quantization: output columns per GPU chunk (smaller = less GPU memory, same result)")
+    ap.add_argument("--ppl-chunk", type=int, default=0,
+                    help="with --ppl: compute the loss over chunks of this many positions (less GPU memory for "
+                         "a large vocabulary; 0 = one pass)")
+    ap.add_argument("--embed-on-cpu", action="store_true",
+                    help="keep the input embedding table on the CPU during the export (each forward moves its "
+                         "rows to the GPU): frees vocab*hidden fp16 bytes of GPU memory, 2.1 GB on Llama-3.1-70B")
     ap.add_argument("--ref-gemm", action="store_true",
                     help="also write ref_gemm.bin: the prompt logits with every AQLM layer forced onto its "
                          "dequantize-then-matmul path (aqlm 1.1.7 runs prompts of 6 tokens or fewer through its "
@@ -205,6 +222,12 @@ def main():
     print("loading", args.model, flush=True)
     tok = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16, device_map="cuda").eval()
+    if args.embed_on_cpu:
+        emb = model.model.embed_tokens.to("cpu")
+        emb.register_forward_pre_hook(lambda m, inp: tuple(t.to("cpu") if torch.is_tensor(t) else t for t in inp))
+        emb.register_forward_hook(lambda m, inp, out: out.to("cuda"))
+        torch.cuda.empty_cache()
+        print(f"input embedding kept on the CPU ({emb.weight.numel() * 2 / 1e9:.2f} GB of fp16 off the GPU)", flush=True)
     cfg = model.config
     hidden, n_heads = cfg.hidden_size, cfg.num_attention_heads
     n_kv = getattr(cfg, "num_key_value_heads", None) or n_heads
@@ -269,8 +292,9 @@ def main():
 
     # The reference runs the AQLM model with the SAME quantized LM head as the .cbk. A fresh
     # Parameter (not .data=) so a tied embedding (e.g. Llama-3.2) keeps its dense weights.
-    dev = model.lm_head.weight.device
-    model.lm_head.weight = torch.nn.Parameter(w_dq[:vocab].to(dev, torch.float16), requires_grad=False)
+    model.lm_head.weight = None  # free the dense head before its dequantized copy lands on the GPU
+    torch.cuda.empty_cache()
+    model.lm_head.weight = torch.nn.Parameter(w_dq[:vocab].to("cuda", torch.float16), requires_grad=False)
 
     ids = tok(args.prompt, return_tensors="pt").input_ids.cuda()
     print("prompt:", repr(args.prompt), "->", ids.tolist(), flush=True)
@@ -308,7 +332,7 @@ def main():
 
     if args.ppl > 0:
         ptok = AutoTokenizer.from_pretrained(args.ppl_tokenizer) if args.ppl_tokenizer else tok
-        p, n = ppl_windows(model, ptok, args.ppl, window0_out=args.ppl_window0_out)
+        p, n = ppl_windows(model, ptok, args.ppl, window0_out=args.ppl_window0_out, chunk=args.ppl_chunk)
         print(f"PPL of the exported model (AQLM codes + {args.lm_k}-entry LM head), wikitext-2 {n}x2048 = {p:.4f}", flush=True)
 
 

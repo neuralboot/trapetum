@@ -155,7 +155,9 @@ def quantize(weight, chunk=16384, k=K, recipe="legacy", row_w=None):
     # large LM head (big vocab): chunk over output columns so the k-means workspace stays bounded.
     # chunk must be even so the K=16 nibble-pairing (cols 2j, 2j+1) never straddles a boundary.
     # The row weights belong to the input rows, so every column chunk uses all of them.
-    Wt_full = weight.t().contiguous().float().cpu()        # [in, out] on CPU, fed to GPU per chunk
+    # [in, out] f32 on CPU, fed to the GPU per chunk; moved to the CPU first, so the transposed f32
+    # copy (4.2 GB for a 128,256 x 8,192 head) never sits on the GPU (same values: both steps are exact)
+    Wt_full = weight.detach().cpu().t().contiguous().float()
     packs, cbs, dqs = [], [], []
     for s in range(0, out_dim, chunk):
         p, c, d = _quant_block(Wt_full[:, s:s + chunk].cuda(), k, recipe, row_w)
