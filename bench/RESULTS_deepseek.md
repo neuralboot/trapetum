@@ -1,4 +1,4 @@
-# DeepSeek-V2/V3 (MLA + MoE) support — end-to-end result
+# DeepSeek-V2/V3 (MLA + MoE) support: end-to-end result
 
 DeepSeek-V2-Lite (16B: MLA attention + 64-expert MoE, 2.4B active) runs **end-to-end in
 the pure-Rust runtime** (RTX 4090), no Python at inference. Measured July 2026.
@@ -44,6 +44,25 @@ pure-Rust runtime on a single node. **Current result (session H, below): the ful
 model serves at 2.46 tok/s steady state via the CPU-experts inversion, a x10.2 gain
 over the 0.24 tok/s disk-offload baseline. The sections below are the chronological
 measured journey to it.**
+
+> **Correction (10 November 2026).** Six claims, each repeated further down, are corrected here;
+> the measurements themselves are unchanged.
+> - The 0.24 tok/s that the x10.2 (and the x5.5 and x7 of sessions 5 and G3) is measured against is
+>   the first CPU-experts run on the same node type, a g6e.16xlarge (64 vCPU, one L40S, 497 GB RAM),
+>   not a disk-offload run. Each session ran on a fresh instance of that type. GPU offload on it was
+>   logged at 0.3 tok/s (2.9 s/token), so 2.46 tok/s is about 7x that. The disk-bound 0.24 tok/s run
+>   was on a different machine, an RTX 4090 host with 48 GB RAM.
+> - "No datacenter" (sessions 5 and H) is wrong: the node is a rented AWS g6e.16xlarge with one
+>   data-center GPU (L40S). What the runs avoid is a multi-GPU server.
+> - "Lossless 4-bit" is wrong: on DeepSeek-V2-Lite, exported by `model/export_deepseek.py`, plain
+>   4-bit costs +7.1% wikitext-2 perplexity (ctx 2048, table below). The 671B itself was not measured.
+> - "Torch-free" overstates the streaming exporter `model/export_deepseek_stream.py`: it needs
+>   PyTorch for its optional GPU k-means (`EXPORT_DEV=cuda`) and its optional `--experts-avq` path,
+>   and the export log does not record whether GPU k-means was used.
+> - The codebook decode is one 16-byte `tbl` or `pshufb` per 16 weights, not per 32: the lut8 kernel
+>   makes two 128-bit shuffles per 16 packed bytes (`runtime/src/cpu_experts.rs`, `decode_lane`).
+> - "The largest open-source model" is wrong: DeepSeek-R1 is an open-weight model, and Kimi K2
+>   (about 1T parameters, open weights since July 2025) is larger.
 
 Prompt:  "The capital of France is"
 Output:  " Paris. Paris is located in northern France and is known for its iconic

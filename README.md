@@ -69,22 +69,27 @@ desktop app's downloadable models are not updated.
   integration that realizes the 2.0x/2.45x end-to-end decode speedup, the AQLM-style
   additive-VQ training that beats the unweighted scalar codebook, the accuracy probes, and the
   **torch-free exporter** (`export_safetensors.py`): it reads `safetensors` directly
-  (no PyTorch, no transformers) and compresses any Llama- or Phi-3-architecture model
+  (no transformers; PyTorch only for its optional GPU k-means) and compresses any Llama- or Phi-3-architecture model
   to the runtime's format: this is how Phi-4 (14B) was exported and run at 79.9 tok/s.
   Nine architectures run end-to-end in pure Rust, including Gemma-2-9B, Phi-4 and
   DeepSeek-V2-Lite (MLA + MoE); see [`bench/RESULTS_models.md`](bench/RESULTS_models.md).
   Scale result: **DeepSeek-R1 671B** (full V3 architecture), 1.34 TB bf16 compressed to
-  a 350 GB 4-bit artifact, serves the **full model at 2.46 tok/s** on a single commodity
-  node (64 vCPU, one L40S, 497 GB RAM), a **x10.2** gain over the 0.24 tok/s disk-offload
-  baseline. The lever is **inversion**: the routed experts stay resident in host RAM and
-  are decoded in place on the CPU (one `vpshufb` per 32 weights on AVX2), while the GPU
-  holds only MLA attention and the dense layers (20.9 GB VRAM). At batch one only the
+  a 350 GB 4-bit artifact (exported by the streaming Python script `model/export_deepseek_stream.py`),
+  serves the **full model at 2.46 tok/s** on a single cloud node with one GPU (64 vCPU, one L40S,
+  497 GB RAM): **10.2x** its first CPU-experts run on the same node type (0.24 tok/s) and about 7x GPU
+  offload on that node type (about 0.3 tok/s, 2.9 s/token); an earlier disk-bound run on an RTX 4090 host also gave 0.24 tok/s. The lever is **inversion**: the routed experts stay resident in host RAM and
+  are decoded in place on the CPU (one 128-bit `vpshufb` per 16 weights on AVX2), while the GPU
+  holds MLA attention, the dense layers and the shared experts (VRAM was not logged in these
+  runs; an earlier disk-fed run of the same artifact on one RTX 4090 peaked at 20.9 GB). At batch one only the
   ~10 GB of routed-expert bytes per token matter, and they no longer travel to the GPU.
-  The gain came from removing eight measured walls: 0.24, 0.44, 0.96, 1.31, 1.35, 1.67,
-  1.84, 2.46 tok/s. Routed decode reaches ~67 GB/s aggregate, near the memory read floor.
-  Quality (wikitext-2 PPL): full 8-bit is essentially lossless at +0.03% vs fp16 (5.70);
+  The gain came in seven measured steps: 0.24, 0.44, 0.96, 1.31, 1.35, 1.67,
+  1.84, 2.46 tok/s. Routed decode reached ~67 GB/s aggregate, near the memory read floor; at
+  2.46 tok/s each 407 ms token splits into about 150 ms of routed decode on the CPU, 164 ms of
+  GPU attention and 90 ms of work stealing.
+  Quality (wikitext-2 PPL, measured on DeepSeek-V2-Lite with its own exporter,
+  `model/export_deepseek.py`; the 671B itself was not measured): full 8-bit is essentially lossless at +0.03% vs fp16 (5.70);
   4-bit costs +7.1% (6.10); a mixed-precision variant (shared experts + lm_head at 8-bit)
-  captures most of the recovery at **+1.5%** (5.78) for +0.7% size.
+  captures most of the recovery at **+1.5%** (5.78), for a projected +0.7% size on the 671B.
   See [`bench/RESULTS_deepseek.md`](bench/RESULTS_deepseek.md).
 - [`bench/`](bench/): a fair single-harness speed vs accuracy vs memory benchmark of
   fp16, AWQ and AQLM (the `pareto`/`mem70` figures and `results*.json`).
@@ -123,13 +128,13 @@ Trapetum runs on any modern **NVIDIA** GPU with CUDA, and on **Apple Silicon** w
 (4-bit only). For NVIDIA, recompile the kernel for your architecture with one `-arch` flag, or
 ship a multi-arch build that covers them all in a single binary. The 4-bit memory saving is
 universal; only the speedup depends on the card (the bandwidth law: largest on the most
-bandwidth-limited cards, 2.34x on an A40 and up to 2.2x on consumer GPUs, parity on an H100).
+bandwidth-limited cards, 2.34x on an A40 and up to 2.2x on consumer GPUs, parity on an H100 PCIe).
 
 | Your GPU | Arch | Memory win | Decode speed |
 |---|---|---|---|
 | RTX 30 / 40 (3060, 3090, 4070, 4090, ...) | `sm_86` / `sm_89` | 3.6-3.7x disk / 2.9x VRAM | strong, up to 2.2x |
 | A100 / A40 / L40 | `sm_80` / `sm_86` / `sm_89` | 3.6-3.7x disk / 2.9x VRAM | largest, 2.34x on A40 |
-| H100 / H200 | `sm_90` | 3.6-3.7x disk / 2.9x VRAM | parity (fp16 already near roofline) |
+| H100 PCIe (H200 untested) | `sm_90` | 3.6-3.7x disk / 2.9x VRAM | parity (fp16 already near roofline) |
 | Turing and older (GTX 16, RTX 20, V100) | `sm_70` / `sm_75` | 3.6-3.7x disk / 2.9x VRAM | untested, rebuild needed |
 | Apple Silicon (M1 to M4; measured on an M4) | Metal | same 4-bit file, in unified memory | supported for 4-bit; the 2-bit path and the November 2026 kernels are CUDA only |
 | AMD GPUs, CPU-only machines | - | - | not supported (an NVIDIA or Apple GPU is required) |
@@ -179,11 +184,12 @@ cuBLAS fp16 GEMV on three GPUs (same `4096x4096`, batch 1, seed 0, rel. err ~3e-
 |---|---|---:|
 | RTX 4090 (`sm_89`) | ~1.0 TB/s | **x2.20** |
 | A40 (`sm_86`) | ~0.7 TB/s | **x2.34** |
-| H100 PCIe (`sm_90`) | ~3.3 TB/s | x0.99 (tie) |
+| H100 PCIe (`sm_90`) | ~2.0 TB/s | x0.99 (tie) |
 
 **The more bandwidth-limited the GPU, the bigger the win**, because the kernel reads
-1/4 the weight bytes. On consumer / bandwidth-bound GPUs that is a ~2.2-2.3x decode
-speedup for 4x less memory. On a bandwidth-rich H100, fp16 GEMV is already
+1/4 the weight bytes. On bandwidth-bound GPUs (A40, RTX 4090) that is a ~2.2-2.3x decode
+speedup, for about 4x fewer weight bytes per matrix (3.6-3.7x smaller on disk at model
+level). On a bandwidth-rich H100 PCIe, fp16 GEMV is already
 near-roofline, so the kernel only ties cuBLAS and the gain there is memory, not speed.
 
 A recorded **negative result**: a Hopper variant that staged the codebook in
