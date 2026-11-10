@@ -119,26 +119,29 @@ matmul so the dequantization adds no extra global traffic.
 
 ## Does it run on your GPU?
 
-Trapetum is CUDA, so it runs on any modern **NVIDIA** GPU. Recompile the kernel for your
-architecture with one `-arch` flag, or ship a multi-arch build that covers them all in a
-single binary. The 4-bit memory saving is universal; only the speedup depends on the card
-(the bandwidth law: largest on bandwidth-bound consumer GPUs, parity on an H100).
+Trapetum runs on any modern **NVIDIA** GPU with CUDA, and on **Apple Silicon** with Metal
+(4-bit only). For NVIDIA, recompile the kernel for your architecture with one `-arch` flag, or
+ship a multi-arch build that covers them all in a single binary. The 4-bit memory saving is
+universal; only the speedup depends on the card (the bandwidth law: largest on the most
+bandwidth-limited cards, 2.34x on an A40 and up to 2.2x on consumer GPUs, parity on an H100).
 
 | Your GPU | Arch | Memory win | Decode speed |
 |---|---|---|---|
-| RTX 30 / 40 (3060, 3090, 4070, 4090, ...) | `sm_86` / `sm_89` | 3.6-3.7x disk / 2.9x VRAM | largest, up to 2.2x |
-| A100 / A40 / L40 | `sm_80` / `sm_86` / `sm_89` | 3.6-3.7x disk / 2.9x VRAM | strong, 2.34x on A40 |
+| RTX 30 / 40 (3060, 3090, 4070, 4090, ...) | `sm_86` / `sm_89` | 3.6-3.7x disk / 2.9x VRAM | strong, up to 2.2x |
+| A100 / A40 / L40 | `sm_80` / `sm_86` / `sm_89` | 3.6-3.7x disk / 2.9x VRAM | largest, 2.34x on A40 |
 | H100 / H200 | `sm_90` | 3.6-3.7x disk / 2.9x VRAM | parity (fp16 already near roofline) |
 | Turing and older (GTX 16, RTX 20, V100) | `sm_70` / `sm_75` | 3.6-3.7x disk / 2.9x VRAM | untested, rebuild needed |
-| AMD, Apple Silicon, CPU | - | - | not supported (CUDA only) |
+| Apple Silicon (M1 to M4; measured on an M4) | Metal | same 4-bit file, in unified memory | supported for 4-bit; the 2-bit path and the November 2026 kernels are CUDA only |
+| AMD GPUs, CPU-only machines | - | - | not supported (an NVIDIA or Apple GPU is required) |
 
 Memory, labeled (both hold, they measure different things): **3.6x to 3.7x smaller on disk**
 (a 3.75 GB `.cbk` codebook file from the new exporter, 3.66 GB from the legacy one, vs
 13.48 GB fp16) and **2.9x less VRAM at runtime** (13.6 GB -> 4.7 GB peak).
 
 The memory win (a 7B in 3.66 to 3.75 GB, so it fits an 8 GB card) holds on every NVIDIA GPU.
-Validated on Ampere, Ada and Hopper (`sm_80` to `sm_90`); pre-Ampere is untested, and the
-`mma.sync` / `cp.async` prefill paths require `sm_80+`.
+The June 2026 kernels were validated on Ampere, Ada and Hopper (`sm_80` to `sm_90`); every
+November 2026 kernel was measured on an RTX 4090 (`sm_89`), the fused decode kernels also on an
+A40. Pre-Ampere is untested, and the `mma.sync` / `cp.async` prefill paths require `sm_80+`.
 
 ## Benchmarks
 
