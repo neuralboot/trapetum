@@ -1,6 +1,7 @@
 # Trapetum one-line installer for Windows.
 #   irm get.neuralboot.com/install.ps1 | iex
-# Self-elevates, downloads the .msi, installs the background service, starts on :8088.
+# Self-elevates, downloads the current .msi named in cdn.neuralboot.com/dist/latest.json,
+# checks its SHA-256 against that manifest, installs the background service, starts on :8088.
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -17,13 +18,22 @@ if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
   Write-Warning "nvidia-smi not found. Trapetum needs an NVIDIA GPU (Ampere/Ada/Hopper) with a recent driver."
 }
 
-$msi = Join-Path $env:TEMP "trapetum-0.1.0-x64.msi"
-Write-Host "Downloading Trapetum installer..."
-Invoke-WebRequest -UseBasicParsing "https://cdn.neuralboot.com/dist/trapetum-0.1.0-x64.msi" -OutFile $msi
+$man = Invoke-RestMethod -UseBasicParsing "https://cdn.neuralboot.com/dist/latest.json"
+if (-not ($man.url -like "https://cdn.neuralboot.com/dist/*.msi") -or -not $man.sha256) {
+  Write-Error "Unexpected update manifest; nothing was installed."; return
+}
+$msi = Join-Path $env:TEMP ([IO.Path]::GetFileName($man.url))
+Write-Host "Downloading Trapetum $($man.version)..."
+Invoke-WebRequest -UseBasicParsing $man.url -OutFile $msi
+$got = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLower()
+if ($got -ne $man.sha256.ToLower()) {
+  Remove-Item $msi -ErrorAction SilentlyContinue
+  Write-Error "Checksum mismatch: the download was deleted and nothing was installed."; return
+}
 
 Write-Host "Installing..."
 $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qb /norestart" -Wait -PassThru
-if ($p.ExitCode -ne 0) { Write-Error "Installer exited with code $($p.ExitCode)."; return }
+if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Write-Error "Installer exited with code $($p.ExitCode)."; return }
 
 Write-Host "Waiting for the server to come up..."
 $up = $false
@@ -34,7 +44,7 @@ for ($i = 0; $i -lt 25; $i++) {
 Write-Host ""
 if ($up) { Write-Host "Trapetum is installed and RUNNING at  http://localhost:8088" }
 else     { Write-Host "Trapetum is installed. The server is starting; open http://localhost:8088 in a moment." }
-Write-Host "  next   : add your first model in the Admin page  ->  http://localhost:8088/admin"
+Write-Host "  next   : add your first model in the Models page  ->  http://localhost:8088/settings"
 Write-Host "  manage : taskschd.msc (task 'Trapetum')"
 Write-Host "  remove : Control Panel > Programs and Features"
 # desktop shortcut so the user can reopen the app anytime

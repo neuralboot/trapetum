@@ -151,7 +151,7 @@ fn load_model(root: &str, name: &str) -> Result<Loaded, String> {
         .unwrap_or_else(|| {
             // DeepSeek first: R1-distills sit on Qwen/Llama vocabs (which also carry
             // <|im_start|>/<|eot_id|>), but were fine-tuned on the DeepSeek template
-            // with <think> priming — ChatML on them skips reasoning and never stops.
+            // with <think> priming: ChatML on them skips reasoning and never stops.
             if tok.token_to_id("<\u{FF5C}User\u{FF5C}>").is_some()
                 && tok.token_to_id("<\u{FF5C}Assistant\u{FF5C}>").is_some()
             {
@@ -379,6 +379,7 @@ fn generate(cur: &mut Loaded, prompt: &str, max_new: usize, penalty: f32, temper
 }
 
 // ---------------- model catalog + energy/CO2 metrics ----------------
+#[allow(dead_code)] // hf and template document each entry; installs now come from the registry manifest
 struct CatItem {
     id: &'static str,
     hf: &'static str,
@@ -396,52 +397,76 @@ const CATALOG: &[CatItem] = &[
     CatItem { id: "qwen25-7b", hf: "Qwen/Qwen2.5-7B-Instruct", label: "Qwen2.5 7B Instruct", params_b: 7.6, template: "chatml" },
     CatItem { id: "llama31-8b", hf: "unsloth/Meta-Llama-3.1-8B-Instruct", label: "Llama-3.1 8B Instruct", params_b: 8.0, template: "llama3" },
 ];
-// ---- real-time grid carbon intensity: geo-locate the GPU, then live data, cached 30 min ----
-fn region_estimate(cc: &str) -> f64 {
-    // location-based fallback (recent yearly averages, gCO2eq/kWh) used only if no live token
-    match cc {
+// ---- grid carbon intensity for the energy and CO2 figures, cached 30 min ----
+// Since 0.1.0-beta.2 there is no IP geolocation: the operator sets a country code or an
+// Electricity Maps zone in Settings. Without one the figures use a world average, labelled
+// as such. A live value is fetched from Electricity Maps only when the operator has set both
+// a zone and their own token.
+const WORLD_AVG_G_PER_KWH: f64 = 480.0;
+fn region_estimate(cc: &str) -> Option<f64> {
+    // recent yearly averages, gCO2eq/kWh, used when no live token is set
+    Some(match cc {
         "SE" | "NO" | "IS" => 30.0, "CH" => 45.0, "FR" => 56.0, "CA" => 120.0,
         "BR" => 100.0, "ES" => 170.0, "GB" => 230.0, "IT" => 330.0, "US" => 370.0,
         "DE" => 380.0, "NL" => 360.0, "JP" => 480.0, "AU" => 520.0, "CN" => 580.0,
-        "IN" => 630.0, "PL" => 660.0, "ZA" => 710.0, _ => 480.0,
-    }
+        "IN" => 630.0, "PL" => 660.0, "ZA" => 710.0, _ => return None,
+    })
 }
 
-fn fetch_carbon() -> (f64, String) {
-    use std::process::Command;
-    // 1. geo-locate the machine running the GPU (free, no key)
-    let geo = Command::new("curl").args(["-s", "--max-time", "8", "http://ip-api.com/json"]).output();
-    let g: serde_json::Value = geo.ok().and_then(|o| serde_json::from_slice(&o.stdout).ok()).unwrap_or_default();
-    let cc = g.get("countryCode").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let region = format!("{}, {}", g.get("regionName").and_then(|v| v.as_str()).unwrap_or("?"), if cc.is_empty() { "?" } else { &cc });
-    // 2. live carbon intensity from ElectricityMaps at that lat/lon (token from config or env)
-    let token = {
-        let t = cfg().carbon_token;
-        if t.is_empty() { std::env::var("TRAPETUM_CARBON_TOKEN").unwrap_or_default() } else { t }
+// country code (FR) or Electricity Maps zone (US-CAL-CISO, DK-DK1): uppercase letters, digits, - and _
+fn valid_zone(z: &str) -> bool {
+    let b = z.as_bytes();
+    (2..=32).contains(&b.len())
+        && b[0].is_ascii_uppercase()
+        && b[1].is_ascii_uppercase()
+        && (b.len() == 2 || b[2] == b'-' || b[2] == b'_')
+        && b.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
+}
+
+fn carbon_settings() -> (String, String) {
+    let c = cfg();
+    let zone = c.carbon_zone.trim().to_ascii_uppercase();
+    let token = if c.carbon_token.trim().is_empty() {
+        std::env::var("TRAPETUM_CARBON_TOKEN").unwrap_or_default().trim().to_string()
+    } else {
+        c.carbon_token.trim().to_string()
     };
-    if let (Some(lat), Some(lon), false) = (
-        g.get("lat").and_then(|v| v.as_f64()),
-        g.get("lon").and_then(|v| v.as_f64()),
-        token.is_empty(),
-    ) {
-        let url = format!("https://api.electricitymap.org/v3/carbon-intensity/latest?lat={}&lon={}", lat, lon);
-        let out = Command::new("curl").args(["-s", "--max-time", "8", "-H", &format!("auth-token: {}", token), &url]).output();
-        if let Some(ci) = out.ok().and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok()).and_then(|v| v.get("carbonIntensity").and_then(|x| x.as_f64())) {
-            return (ci, format!("live · ElectricityMaps · {}", region));
+    (zone, token)
+}
+
+fn fetch_carbon(zone: &str, token: &str) -> (f64, String) {
+    if zone.is_empty() || !valid_zone(zone) {
+        return (WORLD_AVG_G_PER_KWH, "world average, set your country in Settings".into());
+    }
+    if !token.is_empty() {
+        let url = format!("https://api.electricitymap.org/v3/carbon-intensity/latest?zone={}", zone);
+        let out = std::process::Command::new("curl")
+            .args(["-s", "--max-time", "8", "-H", &format!("auth-token: {}", token), &url])
+            .output();
+        if let Some(ci) = out.ok()
+            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+            .and_then(|v| v.get("carbonIntensity").and_then(|x| x.as_f64()))
+        {
+            return (ci, format!("live, Electricity Maps, zone {}", zone));
         }
     }
-    // 3. fallback: real intensity of the geo-located grid (not a flat global constant)
-    (region_estimate(&cc), format!("{} grid average", region))
+    let cc = &zone[..2];
+    match region_estimate(cc) {
+        Some(g) => (g, format!("{} grid, recent yearly average", cc)),
+        None => (WORLD_AVG_G_PER_KWH, format!("world average, no yearly figure for {}", cc)),
+    }
 }
 
 fn carbon_g_per_kwh() -> (f64, String) {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<(f64, String, Option<std::time::Instant>)>> = std::sync::OnceLock::new();
-    let cell = CACHE.get_or_init(|| std::sync::Mutex::new((480.0, "world average".into(), None)));
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<(f64, String, Option<std::time::Instant>, String)>> = std::sync::OnceLock::new();
+    let (zone, token) = carbon_settings();
+    let key = format!("{}|{}", zone, token);
+    let cell = CACHE.get_or_init(|| std::sync::Mutex::new((WORLD_AVG_G_PER_KWH, "world average".into(), None, String::new())));
     let mut c = cell.lock().unwrap();
-    let stale = c.2.map(|t| t.elapsed().as_secs() > 1800).unwrap_or(true);
+    let stale = c.3 != key || c.2.map(|t| t.elapsed().as_secs() > 1800).unwrap_or(true);
     if stale {
-        let (g, src) = fetch_carbon();
-        *c = (g, src, Some(std::time::Instant::now()));
+        let (g, src) = fetch_carbon(&zone, &token);
+        *c = (g, src, Some(std::time::Instant::now()), key);
     }
     (c.0, c.1.clone())
 }
@@ -469,6 +494,7 @@ fn metrics(params_b: f64, carbon: f64) -> serde_json::Value {
 
 fn catalog_json(root: &str) -> serde_json::Value {
     let (carbon, source) = carbon_g_per_kwh();
+    let entries = registry_manifest();
     let items: Vec<serde_json::Value> = CATALOG
         .iter()
         .map(|c| {
@@ -479,11 +505,12 @@ fn catalog_json(root: &str) -> serde_json::Value {
                 o.insert("label".into(), serde_json::json!(c.label));
                 o.insert("params_b".into(), serde_json::json!(c.params_b));
                 o.insert("installed".into(), serde_json::json!(installed));
+                o.insert("available".into(), serde_json::json!(registry_find(&entries, c.id, "").is_some()));
             }
             m
         })
         .collect();
-    serde_json::json!({ "models": items, "carbon_g_per_kwh": (carbon * 10.0).round() / 10.0, "carbon_source": source })
+    serde_json::json!({ "models": items, "registry_ok": !entries.is_empty(), "carbon_g_per_kwh": (carbon * 10.0).round() / 10.0, "carbon_source": source })
 }
 
 #[derive(Clone, Default)]
@@ -496,18 +523,104 @@ struct InstallStatus {
     error: String,
 }
 
-// download from HuggingFace + quantize (per-layer progress) + register, on a background thread
-fn start_install(root: String, name: String, hf: String, template: String, label: String, force: bool, status: std::sync::Arc<std::sync::Mutex<InstallStatus>>) {
+// ---- model registry: pre-compressed 4-bit models on cdn.neuralboot.com ----
+// Since 0.1.0-beta.2 the server installs only models listed in the registry manifest.
+// Compression runs ahead of time on our side, never on this machine, and nothing taken from a
+// request is passed to a shell or an interpreter.
+const REGISTRY_URL: &str = "https://cdn.neuralboot.com";
+
+fn valid_registry_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    !b.is_empty()
+        && b.len() <= 64
+        && b[0].is_ascii_alphanumeric()
+        && !id.contains("..")
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'_' | b'-'))
+}
+
+// Hugging Face repo id: owner/name, letters, digits, '.', '_' and '-' only
+fn valid_hf_id(id: &str) -> bool {
+    let part_ok = |p: &str| {
+        let b = p.as_bytes();
+        !b.is_empty()
+            && b.len() <= 96
+            && b[0].is_ascii_alphanumeric()
+            && !p.contains("..")
+            && b.iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+    };
+    let mut parts = id.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(a), Some(b), None) => part_ok(a) && part_ok(b),
+        _ => false,
+    }
+}
+
+// registry manifest, cached 10 minutes; fetched only when the Models page or an install needs it
+fn registry_manifest() -> Vec<serde_json::Value> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<(Vec<serde_json::Value>, Option<Instant>)>> = std::sync::OnceLock::new();
+    let cell = CACHE.get_or_init(|| std::sync::Mutex::new((Vec::new(), None)));
+    let mut c = cell.lock().unwrap();
+    if c.1.map(|t| t.elapsed().as_secs() < 600).unwrap_or(false) {
+        return c.0.clone();
+    }
+    let out = std::process::Command::new("curl")
+        .args(["-fsSL", "--max-time", "15", &format!("{}/manifest.json", REGISTRY_URL)])
+        .output();
+    let entries: Vec<serde_json::Value> = out.ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| serde_json::from_slice(&o.stdout).ok())
+        .unwrap_or_default();
+    let entries: Vec<serde_json::Value> = entries
+        .into_iter()
+        .filter(|e| {
+            e.get("id").and_then(|v| v.as_str()).map(valid_registry_id).unwrap_or(false)
+                && e.get("sha256").and_then(|v| v.as_str())
+                    .map(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .unwrap_or(false)
+        })
+        .collect();
+    if !entries.is_empty() {
+        *c = (entries.clone(), Some(Instant::now())); // a failed fetch is retried on the next call
+    }
+    entries
+}
+
+fn registry_find<'a>(entries: &'a [serde_json::Value], id: &str, hf: &str) -> Option<&'a serde_json::Value> {
+    entries.iter().find(|e| {
+        (!id.is_empty() && e.get("id").and_then(|v| v.as_str()) == Some(id))
+            || (!hf.is_empty() && e.get("hf").and_then(|v| v.as_str()) == Some(hf))
+    })
+}
+
+// streaming SHA-256 of a file, in process (no sha256sum, shasum or certutil needed)
+fn sha256_hex(path: &str) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+// download a registry model on a background thread: small files first, then model.cbk into
+// model.cbk.part, checked against the manifest SHA-256 and only then renamed to model.cbk
+// (the server lists a model only once model.cbk exists, so an unchecked file is never served)
+fn start_install(root: String, entry: serde_json::Value, status: std::sync::Arc<std::sync::Mutex<InstallStatus>>) {
     std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader};
-        use std::process::{Command, Stdio};
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into());
-        let cck = format!("{}/cuda-codebook", home);
-        let raw = format!("{}/models/{}", home, name);
-        let out = format!("{}/{}", root, name);
+        use std::process::Command;
+        let rid = entry.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let want = entry.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_ascii_lowercase();
+        let total = entry.get("cbk_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
         let set = |phase: &str, pct: f64| {
             let mut s = status.lock().unwrap();
-            s.model = name.clone();
+            s.model = rid.clone();
             s.phase = phase.into();
             s.pct = pct;
         };
@@ -518,93 +631,81 @@ fn start_install(root: String, name: String, hf: String, template: String, label
             s.error = err.into();
             s.pct = pct;
         };
-        // 0. unless the user forced recompression, look for a pre-compressed copy in the Trapetum registry
-        if !force {
-            set("Checking the Trapetum model registry…", 2.0);
-            let reg = "https://cdn.neuralboot.com";
-            let man = Command::new("curl").args(["-sL", "--max-time", "15", &format!("{}/manifest.json", reg)]).output();
-            let entries: Vec<serde_json::Value> = man.ok().and_then(|o| serde_json::from_slice(&o.stdout).ok()).unwrap_or_default();
-            let hit = entries.into_iter().find(|e| {
-                e.get("id").and_then(|v| v.as_str()) == Some(name.as_str())
-                    || e.get("hf").and_then(|v| v.as_str()) == Some(hf.as_str())
-            });
-            if let Some(e) = hit {
-                let rid = e.get("id").and_then(|v| v.as_str()).unwrap_or(name.as_str()).to_string();
-                let base = format!("{}/{}", reg, rid);
-                set("Pre-compressed model found, downloading (no GPU needed)…", 12.0);
-                let _ = std::fs::create_dir_all(&out);
-                let ok_cbk = Command::new("curl")
-                    .args(["-sL", "--max-time", "1800", "-o", &format!("{}/model.cbk", out), &format!("{}/model.cbk", base)])
-                    .status().map(|s| s.success()).unwrap_or(false);
-                for f in ["tokenizer.json", "config.json", "meta.json"] {
-                    let _ = Command::new("curl").args(["-sL", "--max-time", "180", "-o", &format!("{}/{}", out, f), &format!("{}/{}", base, f)]).status();
-                }
-                set("Verifying checksum…", 96.0);
-                let want = e.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let got = Command::new("sha256sum").arg(format!("{}/model.cbk", out)).output().ok()
-                    .and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(String::from)).unwrap_or_default();
-                if ok_cbk && (want.is_empty() || got == want) {
-                    finish(true, "", 100.0);
-                    return;
-                }
-                let _ = std::fs::remove_file(format!("{}/model.cbk", out));
-                set("Registry copy unusable, compressing instead…", 3.0);
-            }
-        }
-        set("Downloading from HuggingFace…", 3.0);
-        let dl = Command::new("python3")
-            .args(["-c", &format!("from huggingface_hub import snapshot_download; snapshot_download('{}', local_dir='{}', allow_patterns=['*.safetensors','*.json','tokenizer*','*.model'])", hf, raw)])
-            .status();
-        if dl.map(|s| !s.success()).unwrap_or(true) {
-            finish(false, "download failed", 3.0);
+        if !valid_registry_id(&rid) || want.len() != 64 {
+            finish(false, "invalid registry entry", 1.0);
             return;
         }
-        set("Loading model on GPU…", 12.0);
-        let _ = std::fs::create_dir_all(&out);
-        let _ = std::fs::remove_file(format!("{}/model.cbk", out));
-        let mut child = match Command::new("python3")
-            .args([&format!("{}/model/export_runtime.py", cck), "--model", &raw, "--out", &out, "--gen", "16"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+        let base = format!("{}/{}", REGISTRY_URL, rid);
+        let out = format!("{}/{}", root, rid);
+        let cbk = format!("{}/model.cbk", out);
+        let part = format!("{}/model.cbk.part", out);
+        if std::fs::create_dir_all(&out).is_err() {
+            finish(false, "cannot create the model folder", 1.0);
+            return;
+        }
+        set("Downloading tokenizer and config…", 3.0);
+        for f in ["tokenizer.json", "config.json", "meta.json"] {
+            let ok = Command::new("curl")
+                .args(["-fsSL", "--connect-timeout", "20", "--max-time", "600", "-o", &format!("{}/{}", out, f), &format!("{}/{}", base, f)])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                finish(false, &format!("download failed: {}", f), 3.0);
+                return;
+            }
+        }
+        // the large file has no overall time limit (4.9 GB takes hours on a slow line):
+        // curl gives up only if the transfer stays below 20 kB/s for two minutes
+        set("Downloading the 4-bit model from the Trapetum registry…", 5.0);
+        let _ = std::fs::remove_file(&part);
+        let mut child = match Command::new("curl")
+            .args(["-fsSL", "--connect-timeout", "20", "--speed-limit", "20000", "--speed-time", "120", "-o", &part, &format!("{}/model.cbk", base)])
             .spawn()
         {
             Ok(c) => c,
             Err(_) => {
-                finish(false, "export failed to start", 12.0);
+                finish(false, "curl not found", 5.0);
                 return;
             }
         };
-        if let Some(o) = child.stdout.take() {
-            for line in BufReader::new(o).lines().map_while(Result::ok) {
-                if let Some(rest) = line.trim().strip_prefix("layer ") {
-                    if let Some((d, n)) = rest.split_whitespace().next().and_then(|f| f.split_once('/')) {
-                        if let (Ok(d), Ok(n)) = (d.parse::<f64>(), n.parse::<f64>()) {
-                            if n > 0.0 {
-                                set(&format!("Quantizing layer {}/{} to 4-bit", d as i64, n as i64), 12.0 + 80.0 * d / n);
-                            }
-                        }
+        let ok_dl = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break st.success(),
+                Ok(None) => {
+                    if total > 0 {
+                        let got = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+                        set("Downloading the 4-bit model from the Trapetum registry…", 5.0 + 85.0 * (got as f64 / total as f64).min(1.0));
                     }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
                 }
+                Err(_) => break false,
             }
-        }
-        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-        let sz = std::fs::metadata(format!("{}/model.cbk", out)).map(|m| m.len()).unwrap_or(0);
-        if !ok || sz < 100_000_000 {
-            let _ = std::fs::remove_file(format!("{}/model.cbk", out));
-            finish(false, "quantization incomplete (OOM/disk?)", 12.0);
+        };
+        if !ok_dl {
+            let _ = std::fs::remove_file(&part);
+            finish(false, "download failed or stalled (network?)", 5.0);
             return;
         }
-        set("Finalizing…", 95.0);
-        for f in ["tokenizer.json", "config.json", "generation_config.json"] {
-            let _ = std::fs::copy(format!("{}/{}", raw, f), format!("{}/{}", out, f));
+        set("Verifying SHA-256…", 92.0);
+        match sha256_hex(&part) {
+            Ok(got) if got == want => {}
+            Ok(_) => {
+                let _ = std::fs::remove_file(&part);
+                finish(false, "checksum mismatch, the file was deleted", 92.0);
+                return;
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&part);
+                finish(false, "could not read the downloaded file", 92.0);
+                return;
+            }
         }
-        let meta = if template == "auto" {
-            format!("{{\"label\":\"{}\"}}", label)
-        } else {
-            format!("{{\"template\":\"{}\",\"label\":\"{}\"}}", template, label)
-        };
-        let _ = std::fs::write(format!("{}/meta.json", out), meta);
-        let _ = std::fs::remove_dir_all(&raw);
+        if std::fs::rename(&part, &cbk).is_err() {
+            let _ = std::fs::remove_file(&part);
+            finish(false, "could not move the model into place", 96.0);
+            return;
+        }
         finish(true, "", 100.0);
     });
 }
@@ -674,6 +775,7 @@ fn detect_vram() -> f64 {
 }
 fn search_hf(query: &str, vram: f64, root: &str) -> serde_json::Value {
     let (carbon, _) = carbon_g_per_kwh();
+    let entries = registry_manifest();
     let q = if query.trim().is_empty() { "llama".to_string() } else { query.to_string() };
     let url = format!(
         "https://huggingface.co/api/models?search={}&filter=text-generation&sort=lastModified&direction=-1&limit=40&expand%5B%5D=safetensors&expand%5B%5D=downloads&expand%5B%5D=likes&expand%5B%5D=tags&expand%5B%5D=gated&expand%5B%5D=config&expand%5B%5D=lastModified",
@@ -693,7 +795,8 @@ fn search_hf(query: &str, vram: f64, root: &str) -> serde_json::Value {
         let gated = match m.get("gated") { Some(v) => v.is_string() || v.as_bool() == Some(true), None => false };
         if gated { continue; }   // gated repos need HF auth and always fail to download here, so hide them
         let params = m.get("safetensors").and_then(|s| s.get("total")).and_then(|v| v.as_f64()).filter(|t| *t > 0.0).map(|t| (t / 1e9 * 100.0).round() / 100.0).or_else(|| params_from_id(&id));
-        let name = id.replace('/', "_");
+        let reg = registry_find(&entries, "", &id).and_then(|e| e.get("id").and_then(|v| v.as_str()).map(String::from));
+        let name = reg.clone().unwrap_or_else(|| id.replace('/', "_"));
         let installed = std::path::Path::new(&format!("{}/{}/model.cbk", root, name)).exists();
         // compatibility: our export/runtime handle the Llama module structure (Llama, Mistral,
         // CodeLlama, DeepSeek-Coder, Vicuna…). Qwen (attn bias), Gemma, Phi, GPT etc. are not.
@@ -715,7 +818,7 @@ fn search_hf(query: &str, vram: f64, root: &str) -> serde_json::Value {
         } else {
             String::new()
         };
-        let mut obj = serde_json::json!({"id": id, "name": name, "downloads": downloads, "likes": likes, "gated": gated, "blurb": blurb_for(&id, &tags), "installed": installed, "compatible": compatible, "arch": if mtype.is_empty() { arch } else { mtype }, "reason": reason});
+        let mut obj = serde_json::json!({"id": id, "name": name, "downloads": downloads, "likes": likes, "gated": gated, "blurb": blurb_for(&id, &tags), "installed": installed, "ready": reg.is_some(), "compatible": compatible, "arch": if mtype.is_empty() { arch } else { mtype }, "reason": reason});
         if let Some(p) = params {
             let q4 = p * 0.55;
             let fit = if q4 <= vram * 0.85 { "fits" } else if q4 <= vram { "tight" } else { "toobig" };
@@ -751,16 +854,17 @@ struct Config {
     max_tokens_cap: u32,
     rate_limit_rpm: u32,
     log_prompts: bool,
-    carbon_token: String,
-    license_key: String,        // commercial license key (empty = free/local tier, never phones home)
+    carbon_token: String,       // optional Electricity Maps token (live intensity for carbon_zone)
+    carbon_zone: String,        // country code or Electricity Maps zone (empty = world average)
+    license_key: String,        // commercial license key (empty = free/local tier, no activation request)
     activation_consent: bool,   // explicit opt-in to disclosed commercial-license activation
-    auto_update: bool,          // check for and install newer builds in the background
+    auto_update: bool,          // Windows: install the newer build found by the 6-hourly check (other OSes: notice only)
 }
 impl Default for Config {
     fn default() -> Self {
         Config {
             port: 8088,
-            bind: "0.0.0.0".into(),
+            bind: "127.0.0.1".into(),
             admin_key: String::new(),
             api_tokens: Vec::new(),
             default_model: String::new(),
@@ -769,6 +873,7 @@ impl Default for Config {
             rate_limit_rpm: 0,
             log_prompts: true,
             carbon_token: String::new(),
+            carbon_zone: String::new(),
             license_key: String::new(),
             activation_consent: false,
             auto_update: true,
@@ -776,8 +881,10 @@ impl Default for Config {
     }
 }
 // Disclosed commercial-license activation. ONLY fires when a commercial license key is
-// set AND the operator has explicitly consented. The free/local tier never contacts us.
-// Records license key, IP (server-side), timestamp, version, os; 24-month retention.
+// set AND the operator has explicitly consented; without a key nothing is sent for activation.
+// (Every build still makes the update check and, on demand, the registry and Hugging Face
+// requests described in the privacy policy.) Sends the license key, version, OS and host name;
+// the server records the IP address and time; 24-month retention.
 const ACTIVATION_URL: &str = "https://6gv6hyuxneqr2qqz4m7ntqrcve0yntmz.lambda-url.eu-west-1.on.aws/";
 fn activate_license(root: &str, c: &Config) {
     if c.license_key.trim().is_empty() || !c.activation_consent { return; }
@@ -887,6 +994,36 @@ fn api_ok(req: &Request, tokens: &[ApiToken]) -> bool {
 }
 fn is_local(req: &Request) -> bool {
     req.remote_addr().map(|a| a.ip().is_loopback()).unwrap_or(false)
+}
+// Host header naming this machine: localhost, *.localhost or a loopback address, any port
+fn loopback_host(h: &str) -> bool {
+    let h = h.trim().to_ascii_lowercase();
+    let host = if let Some(rest) = h.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((ip, _)) => ip.to_string(),
+            None => return false,
+        }
+    } else {
+        match h.rsplit_once(':') {
+            Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name.to_string(),
+            _ => h.clone(),
+        }
+    };
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+// Without an admin key the admin endpoints are open to this machine only. Such a request must
+// also come from this server's own pages: a page of another website (Origin header) or a
+// DNS-rebinding domain (Host header) is refused, so a site open in the browser cannot drive them.
+fn same_machine_page(req: &Request) -> bool {
+    let get = |name: &'static str| req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string());
+    let host_ok = get("Host").map(|h| loopback_host(&h)).unwrap_or(false);
+    let origin_ok = match get("Origin") {
+        None => true,
+        Some(o) => o.to_ascii_lowercase().strip_prefix("http://").map(loopback_host).unwrap_or(false),
+    };
+    host_ok && origin_ok
 }
 fn gen_token() -> String {
     let mut b = [0u8; 18];
@@ -1012,8 +1149,8 @@ fn main() {
         save_config(&root, &cfg0);
     }
     let _ = CONFIG.set(std::sync::Mutex::new(cfg0.clone()));
-    activate_license(&root, &cfg0);   // disclosed + consent-gated; free/local tier never phones home
-    spawn_updater();                  // background: check for and install newer builds
+    activate_license(&root, &cfg0);   // disclosed + consent-gated; nothing sent without a license key and consent
+    spawn_updater();                  // background: update check every 6 h (Windows may install, other OSes notify)
     load_usage(&root);
     let addr = format!("{}:{}", cfg0.bind, cfg0.port);
     let server = Server::http(&addr).expect("failed to bind port");
@@ -1039,7 +1176,7 @@ fn main() {
             || url.starts_with("/search")
             || url.starts_with("/install");
         if manage {
-            let allowed = if conf.admin_key.is_empty() { is_local(&req) } else { auth_ok(&req, &conf.admin_key) };
+            let allowed = if conf.admin_key.is_empty() { is_local(&req) && same_machine_page(&req) } else { auth_ok(&req, &conf.admin_key) };
             if !allowed {
                 let is_page = method == Method::Get
                     && (url == "/admin" || url.starts_with("/admin?") || url == "/settings" || url.starts_with("/settings?"));
@@ -1048,7 +1185,7 @@ fn main() {
                         .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap());
                     let _ = req.respond(r);
                 } else {
-                    let _ = req.respond(json_resp(serde_json::json!({"error": "admin only — provide the admin key"}).to_string()).with_status_code(tiny_http::StatusCode(401)));
+                    let _ = req.respond(json_resp(serde_json::json!({"error": "admin only: provide the admin key"}).to_string()).with_status_code(tiny_http::StatusCode(401)));
                 }
                 continue;
             }
@@ -1076,6 +1213,7 @@ fn main() {
                 o.insert("update_available".into(), serde_json::json!(update_status()));
                 o.insert("build".into(), serde_json::json!(build_no()));
                 o.insert("version".into(), serde_json::json!(env!("CARGO_PKG_VERSION")));
+                o.insert("os".into(), serde_json::json!(std::env::consts::OS));
             }
             let _ = req.respond(json_resp(v.to_string()));
             continue;
@@ -1094,7 +1232,15 @@ fn main() {
             if let Some(x) = inc.get("max_tokens_cap").and_then(|v| v.as_u64()) { c.max_tokens_cap = x as u32; }
             if let Some(x) = inc.get("rate_limit_rpm").and_then(|v| v.as_u64()) { c.rate_limit_rpm = x as u32; }
             if let Some(x) = inc.get("log_prompts").and_then(|v| v.as_bool()) { c.log_prompts = x; }
-            if let Some(x) = inc.get("carbon_token").and_then(|v| v.as_str()) { c.carbon_token = x.into(); }
+            if let Some(x) = inc.get("carbon_token").and_then(|v| v.as_str()) { c.carbon_token = x.trim().into(); }
+            if let Some(x) = inc.get("carbon_zone").and_then(|v| v.as_str()) {
+                let z = x.trim().to_ascii_uppercase();
+                if !z.is_empty() && !valid_zone(&z) {
+                    let _ = req.respond(json_resp(serde_json::json!({"ok": false, "error": "Grid zone: use a 2-letter country code (FR) or an Electricity Maps zone (US-CAL-CISO)."}).to_string()));
+                    continue;
+                }
+                c.carbon_zone = z;
+            }
             if let Some(x) = inc.get("license_key").and_then(|v| v.as_str()) { c.license_key = x.into(); }
             if let Some(x) = inc.get("activation_consent").and_then(|v| v.as_bool()) { c.activation_consent = x; }
             if let Some(x) = inc.get("auto_update").and_then(|v| v.as_bool()) { c.auto_update = x; }
@@ -1197,24 +1343,38 @@ fn main() {
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
             let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
-            cur = None; // free the GPU so the export's model load has room
-            let force = v.get("force_recompress").and_then(|x| x.as_bool()).unwrap_or(false);
-            let parsed = if let Some(hfid) = v.get("hf").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
-                let tmpl = v.get("template").and_then(|x| x.as_str()).unwrap_or("auto").to_string();
-                Some((hfid.replace('/', "_"), hfid.to_string(), tmpl, hfid.to_string()))
-            } else if let Some(cid) = v.get("model").and_then(|x| x.as_str()) {
-                CATALOG.iter().find(|c| c.id == cid).map(|c| (c.id.to_string(), c.hf.to_string(), c.template.to_string(), c.label.to_string()))
-            } else {
-                None
-            };
-            match parsed {
-                Some((name, hf, template, label)) => {
-                    *install.lock().unwrap() = InstallStatus { model: name.clone(), phase: "Starting…".into(), pct: 1.0, ..Default::default() };
-                    start_install(root.clone(), name, hf, template, label, force, install.clone());
+            let hf = v.get("hf").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let mid = v.get("model").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let err = |m: &str| json_resp(serde_json::json!({"error": m}).to_string());
+            if hf.is_empty() && mid.is_empty() {
+                let _ = req.respond(err("no model specified"));
+                continue;
+            }
+            if (!hf.is_empty() && !valid_hf_id(&hf)) || (!mid.is_empty() && !valid_registry_id(&mid)) {
+                let _ = req.respond(err("invalid model id").with_status_code(tiny_http::StatusCode(400)));
+                continue;
+            }
+            {
+                let st = install.lock().unwrap();
+                if !st.phase.is_empty() && !st.done {
+                    let _ = req.respond(err("an install is already running"));
+                    continue;
+                }
+            }
+            let entries = registry_manifest();
+            if entries.is_empty() {
+                let _ = req.respond(err("the Trapetum registry (cdn.neuralboot.com) could not be reached"));
+                continue;
+            }
+            match registry_find(&entries, &mid, &hf).cloned() {
+                Some(e) => {
+                    let rid = e.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    *install.lock().unwrap() = InstallStatus { model: rid, phase: "Starting…".into(), pct: 1.0, ..Default::default() };
+                    start_install(root.clone(), e, install.clone());
                     let _ = req.respond(json_resp(serde_json::json!({"started": true}).to_string()));
                 }
                 None => {
-                    let _ = req.respond(json_resp(serde_json::json!({"error": "no model specified"}).to_string()));
+                    let _ = req.respond(err("not in the Trapetum registry yet: compression runs ahead of time on our side, not on this machine"));
                 }
             }
             continue;
@@ -1228,13 +1388,6 @@ fn main() {
             continue;
         }
         if method == Method::Post && url.starts_with("/v1/chat/completions") {
-            {
-                let s = install.lock().unwrap();
-                if !s.phase.is_empty() && !s.done {
-                    let _ = req.respond(json_resp(serde_json::json!({"error": "a model is being compressed — please wait"}).to_string()));
-                    continue;
-                }
-            }
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
             let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
@@ -1275,7 +1428,7 @@ fn main() {
                         continue;
                     }
                     Err(_) => {
-                        let _ = req.respond(json_resp(serde_json::json!({"error": format!("model '{want}' is corrupt (truncated .cbk) — re-export needed")}).to_string()));
+                        let _ = req.respond(json_resp(serde_json::json!({"error": format!("model '{want}' is corrupt (truncated .cbk): reinstall it from the Models tab")}).to_string()));
                         continue;
                     }
                 }
@@ -1430,16 +1583,15 @@ button:disabled{opacity:.5;cursor:default}
 </style></head><body>
 <header><a href="https://neuralboot.com" target="_blank" rel="noopener" style="text-decoration:none"><span class="org">neural<span class="bt">boot</span><span class="cur"></span></span></a><h1>Trapetum · Models</h1><nav style="margin-left:auto;display:flex;gap:15px;align-items:center;font-size:13px"><a href="/" style="color:var(--sub);text-decoration:none">Chat</a><a href="/admin" class="kl" style="color:var(--sub);text-decoration:none">Settings</a><a href="/admin/dashboard" class="kl" style="color:var(--sub);text-decoration:none">Usage</a><a href="/settings" class="kl" style="color:var(--fg);text-decoration:none;font-weight:700">Models</a><a href="/docs" style="color:var(--sub);text-decoration:none">API</a><a href="/help" style="color:var(--sub);text-decoration:none">Help</a></nav></header>
 <div class="wrap">
-<p class="lead">Search HuggingFace, pick a model — Trapetum downloads it and compresses it to 4-bit on your GPU, live. Watch the space, memory and CO2 you save.</p>
+<p class="lead">Install a model from the Trapetum registry: the server downloads its pre-compressed 4-bit file from cdn.neuralboot.com and checks its SHA-256 before using it. Search HuggingFace to see which models fit your GPU. A model that is not in the registry yet cannot be installed here: compression runs ahead of time on our side, not on your machine.</p>
 <div class="searchrow">
   <input id="q" placeholder="Search HuggingFace (llama, qwen, mistral, code…)"/>
   <button id="go">Search</button>
   <label><input type="checkbox" id="compat" checked/> only compatible</label>
   <label><input type="checkbox" id="fits" checked/> only fits my GPU</label>
-  <label title="By default a pre-compressed copy is downloaded if one exists. Tick this to compress on your own GPU instead."><input type="checkbox" id="force"/> recompress on my GPU</label>
 </div>
 <div id="hf"></div>
-<div class="sec">Recommended · tested compatible</div>
+<div class="sec">Trapetum registry · pre-compressed, checked by SHA-256</div>
 <div id="cat"></div>
 <p class="note" id="note"></p>
 </div>
@@ -1449,14 +1601,18 @@ const key=new URLSearchParams(location.search).get('key')||'';
 const ah=key?{'Authorization':'Bearer '+key}:{};
 document.querySelectorAll('a.kl').forEach(a=>{a.href=a.href.split('?')[0]+(key?'?key='+encodeURIComponent(key):'');});
 let pid=null;
+const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function card(m,isHF){
   const fitT={fits:'fits ✓',tight:'tight',toobig:'too big',unknown:'size ?'}[m.fit]||'';
   const gated=m.gated?'<span class="g2">🔒 gated</span>':'';
   const size=m.q4_gb!=null?`${m.fp16_gb}→${m.q4_gb} GB`:'size ?';
-  const meta=isHF?`${m.blurb||''} · ${size} · ⬇${fmt(m.downloads)} ★${fmt(m.likes)} · ${fitT}`:`${m.params_b}B · ${size}`;
+  const meta=isHF?`${esc(m.blurb)} · ${size} · ⬇${fmt(m.downloads)} ★${fmt(m.likes)} · ${fitT}`:`${esc(m.params_b)}B · ${size}`;
   const stats=m.q4_gb!=null?`<div class="stats"><div class="stat"><div class="v g">-${m.saved_pct}%</div><div class="l">smaller</div></div><div class="stat"><div class="v g">${m.energy_ratio}×</div><div class="l">less energy</div></div><div class="stat"><div class="v g">${Math.round(m.co2_saved_g_1m)} g</div><div class="l">CO2/1M tok</div></div></div>`:'<div class="stats"></div>';
-  const act=m.installed?'<span class="badge">Installed ✓</span>':(isHF&&m.compatible===false?`<span class="g2" style="background:rgba(255,92,124,.14);color:#ff6b81">✗ ${m.reason||m.arch||'?'} not supported</span>`:`<button data-${isHF?'hf':'model'}="${m.id}" data-name="${m.name||m.id}" ${m.fit==='toobig'?'disabled':''}>Compress &amp; install</button>`);
-  return `<div class="card"><div><div class="name">${m.label||m.id} ${gated}</div><div class="sub">${meta}</div></div>${stats}${act}<div class="prog" id="p-${m.name||m.id}"></div></div>`;
+  const nr='<span class="g2">Not in the registry yet</span>';
+  const act=m.installed?'<span class="badge">Installed ✓</span>':
+    (isHF&&!m.ready?(m.compatible===false?`<span class="g2" style="background:rgba(255,92,124,.14);color:#ff6b81">✗ ${esc(m.reason||m.arch||'?')} not supported</span>`:nr):
+    (!isHF&&m.available===false?nr:`<button data-${isHF?'hf':'model'}="${esc(m.id)}" data-name="${esc(m.name||m.id)}" ${m.fit==='toobig'?'disabled':''}>Install</button>`));
+  return `<div class="card"><div><div class="name">${esc(m.label||m.id)} ${gated}</div><div class="sub">${meta}</div></div>${stats}${act}<div class="prog" id="p-${esc(m.name||m.id)}"></div></div>`;
 }
 function wire(){
   document.querySelectorAll('button[data-hf]').forEach(b=>b.addEventListener('click',()=>go({hf:b.dataset.hf},b.dataset.name,b)));
@@ -1464,7 +1620,7 @@ function wire(){
 }
 async function loadCat(){
   const j=await(await fetch('/catalog',{headers:ah})).json();
-  document.getElementById('note').textContent=`Energy & CO2 from measured net decode energy (RTX 4090) scaled by model size, at ${j.carbon_g_per_kwh} g CO2/kWh (${j.carbon_source}), per 1M generated tokens. Memory figures are exact. Only Llama / Mistral / Qwen architectures compress correctly.`;
+  document.getElementById('note').textContent=`Energy & CO2 from measured net decode energy (RTX 4090) scaled by model size, at ${j.carbon_g_per_kwh} g CO2/kWh (${j.carbon_source}), per 1M generated tokens. Memory figures are exact. Installable models are the ones in the Trapetum registry.`+(j.registry_ok===false?' The registry could not be reached.':'');
   document.getElementById('cat').innerHTML=j.models.map(m=>card(m,false)).join('');wire();
 }
 async function search(){
@@ -1477,9 +1633,9 @@ async function search(){
 }
 async function go(body,name,btn){
   btn.disabled=true;btn.textContent='Starting…';
-  body.force_recompress=!!document.getElementById('force').checked;
-  await fetch('/install',{method:'POST',headers:{'Content-Type':'application/json',...ah},body:JSON.stringify(body)});
-  document.getElementById('p-'+name).innerHTML=`<div class="ph" id="ph-${name}">…</div><div class="bar"><div class="fill" id="f-${name}"></div></div>`;
+  let d={};try{d=await(await fetch('/install',{method:'POST',headers:{'Content-Type':'application/json',...ah},body:JSON.stringify(body)})).json();}catch(e){d={error:'request failed'};}
+  if(d.error){document.getElementById('p-'+name).innerHTML=`<div class="ph">Failed: ${esc(d.error)}</div>`;btn.disabled=false;btn.textContent='Retry';return;}
+  document.getElementById('p-'+name).innerHTML=`<div class="ph" id="ph-${esc(name)}">…</div><div class="bar"><div class="fill" id="f-${esc(name)}"></div></div>`;
   if(pid)clearInterval(pid);
   pid=setInterval(async()=>{
     const s=await(await fetch('/install/status',{headers:ah})).json();
@@ -1487,7 +1643,7 @@ async function go(body,name,btn){
     const ph=document.getElementById('ph-'+name),f=document.getElementById('f-'+name);
     if(ph)ph.textContent=s.phase+' · '+Math.round(s.pct)+'%'; if(f)f.style.width=s.pct+'%';
     if(s.done){clearInterval(pid);pid=null;
-      if(s.ok){if(ph)ph.textContent='Done ✓ compressed & installed';setTimeout(()=>{loadCat();search();},1200);}
+      if(s.ok){if(ph)ph.textContent='Done ✓ installed';setTimeout(()=>{loadCat();search();},1200);}
       else{if(ph)ph.textContent='Failed: '+s.error;btn.disabled=false;btn.textContent='Retry';}}
   },1500);
 }
@@ -1525,13 +1681,13 @@ button{background:var(--rust);color:#fff;border:0;border-radius:10px;padding:11p
 
   <div class="sec">Network</div>
   <div class="row"><label>Listen port</label><input id="port" type="number" min="1" max="65535"/></div>
-  <div class="row"><label>Bind address</label><select id="bind"><option value="127.0.0.1">127.0.0.1 — local only (secure)</option><option value="0.0.0.0">0.0.0.0 — expose on the network</option></select></div>
+  <div class="row"><label>Bind address</label><select id="bind"><option value="127.0.0.1">127.0.0.1 (local only, secure)</option><option value="0.0.0.0">0.0.0.0 (expose on the network)</option></select></div>
   <div class="row"><label>CORS allowed origin</label><input id="cors_origins" placeholder="* or https://app.example.com"/></div>
 
   <div class="sec">Access &amp; security</div>
   <div class="row"><label>Admin key (locks these settings)</label><input id="admin_key" placeholder="empty = local-only access"/></div>
 
-  <div class="sec">API tokens <span style="font-weight:400;text-transform:none;color:var(--sub)">— for /v1 clients · <a href="/docs" style="color:var(--blue)">API docs ↗</a></span></div>
+  <div class="sec">API tokens <span style="font-weight:400;text-transform:none;color:var(--sub)">: for /v1 clients · <a href="/docs" style="color:var(--blue)">API docs ↗</a></span></div>
   <div id="tokens"></div>
   <div class="row" style="margin-top:8px"><input id="newlabel" placeholder="token label (e.g. mobile-app)"/><button id="gen" style="margin-top:0">Generate token</button></div>
 
@@ -1542,37 +1698,40 @@ button{background:var(--rust);color:#fff;border:0;border-radius:10px;padding:11p
   <div class="sec">Governance</div>
   <div class="row"><label>Rate limit (req/min per IP)</label><input id="rate_limit_rpm" type="number" min="0" placeholder="0 = unlimited"/></div>
   <div class="row"><label>Log prompts</label><input id="log_prompts" type="checkbox"/><span style="font-size:12px;color:var(--sub)">off = privacy / GDPR (prompts never written to logs)</span></div>
-  <div class="row"><label>Carbon token (ElectricityMaps)</label><input id="carbon_token" placeholder="empty = geo-located grid average"/></div>
+  <div class="row"><label>Grid zone for CO2 figures</label><input id="carbon_zone" placeholder="country code (FR) or Electricity Maps zone (US-CAL-CISO); empty = world average"/></div>
+  <div class="row"><label>Carbon token (Electricity Maps)</label><input id="carbon_token" placeholder="optional: live intensity for the zone above"/></div>
   <div class="row"><label>Commercial license</label><input id="license_key" placeholder="TRP-XXXX-XXXX-XXXX (leave empty for free / local use)"/></div>
-  <div class="row" style="align-items:flex-start"><label>Activation consent</label><div style="flex:1"><input id="activation_consent" type="checkbox"/> <span style="font-size:12px;color:var(--sub)">Commercial licenses only. When checked with a license key set, activation contacts neuralboot once and records your license key, IP address, timestamp, version and OS to validate the license (stored in the EU, kept 24 months, then deleted). The free / local build never sends anything. See the <a href="https://neuralboot.com/trapetum/privacy-policy.html" target="_blank" rel="noopener">privacy policy</a>.</span></div></div>
-  <div class="row"><label>Automatic updates</label><input id="auto_update" type="checkbox"/><span style="font-size:12px;color:var(--sub)">Check for new builds in the background and install them automatically.</span></div>
+  <div class="row" style="align-items:flex-start"><label>Activation consent</label><div style="flex:1"><input id="activation_consent" type="checkbox"/> <span style="font-size:12px;color:var(--sub)">Commercial licenses only. When checked with a license key set, the server contacts neuralboot once per version to validate the license: it sends the key, the version, the OS and this machine's host name, and our server records your IP address and the time (stored in the EU, kept 24 months, then deleted). Without a license key nothing is sent for activation; the update check and model downloads are described in the <a href="https://trapetum.neuralboot.com/privacy-policy.html" target="_blank" rel="noopener">privacy policy</a>.</span></div></div>
+  <div class="row"><label>Automatic updates</label><input id="auto_update" type="checkbox"/><span style="font-size:12px;color:var(--sub)">Every 6 hours the server asks cdn.neuralboot.com whether a newer build exists (this check always runs). When checked, Windows downloads it, verifies its SHA-256 and installs it; Linux and macOS only show a notice.</span></div>
   <div id="upd-banner" style="display:none;margin:6px 0 0;padding:9px 12px;border:1px solid #2ea043;background:rgba(63,185,80,.1);border-radius:8px;color:#e6edf3;font-size:12.5px"></div>
 
   <div><button id="save">Save settings</button><span id="msg"></span></div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
+const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const urlKey=new URLSearchParams(location.search).get('key'); if(urlKey)$('key').value=urlKey;
 const ah=()=>{const k=$('key').value.trim();return k?{'Authorization':'Bearer '+k}:{}};
 const setdash=()=>{const k=$('key').value.trim()||urlKey||'';document.querySelectorAll('a.kl').forEach(a=>{const b=a.getAttribute('data-b')||a.getAttribute('href').split('?')[0];a.setAttribute('data-b',b);a.href=b+(k?'?key='+encodeURIComponent(k):'');});};
 setdash();$('key').addEventListener('input',setdash);
 async function loadTokens(){
   try{const t=await(await fetch('/admin/tokens',{headers:ah()})).json();
-    $('tokens').innerHTML=(t||[]).map(x=>`<div class="row"><label>${x.label}</label><input readonly value="${x.token}" style="font-family:monospace;font-size:12px"/><button data-tok="${x.token}" style="margin-top:0;background:#30363d">Revoke</button></div>`).join('')||'<p style="color:var(--sub);font-size:12.5px;margin:4px 2px">No tokens yet — /v1 is open until you create one.</p>';
+    $('tokens').innerHTML=(t||[]).map(x=>`<div class="row"><label>${esc(x.label)}</label><input readonly value="${esc(x.token)}" style="font-family:monospace;font-size:12px"/><button data-tok="${esc(x.token)}" style="margin-top:0;background:#30363d">Revoke</button></div>`).join('')||'<p style="color:var(--sub);font-size:12.5px;margin:4px 2px">No tokens yet: /v1 is open until you create one.</p>';
     document.querySelectorAll('button[data-tok]').forEach(b=>b.onclick=async()=>{await fetch('/admin/token-revoke',{method:'POST',headers:{'Content-Type':'application/json',...ah()},body:JSON.stringify({token:b.dataset.tok})});loadTokens();});
   }catch(e){}
 }
 async function load(){
-  try{const m=await(await fetch('/v1/models',{headers:ah()})).json();$('default_model').innerHTML='<option value="">(first available)</option>'+(m.data||[]).map(x=>`<option>${x.id}</option>`).join('');}catch(e){}
+  try{const m=await(await fetch('/v1/models',{headers:ah()})).json();$('default_model').innerHTML='<option value="">(first available)</option>'+(m.data||[]).map(x=>`<option>${esc(x.id)}</option>`).join('');}catch(e){}
   const r=await fetch('/admin/config',{headers:ah()});
   if(r.status===401){$('msg').className='err';$('msg').textContent='Enter the admin key above, then reload.';return;}
   const c=await r.json();
   $('port').value=c.port;$('bind').value=c.bind;$('cors_origins').value=c.cors_origins;$('admin_key').value=c.admin_key;
   $('default_model').value=c.default_model;$('max_tokens_cap').value=c.max_tokens_cap;$('rate_limit_rpm').value=c.rate_limit_rpm;
-  $('log_prompts').checked=c.log_prompts;$('carbon_token').value=c.carbon_token;
+  $('log_prompts').checked=c.log_prompts;$('carbon_token').value=c.carbon_token;$('carbon_zone').value=c.carbon_zone||'';
   $('license_key').value=c.license_key||'';$('activation_consent').checked=!!c.activation_consent;
   $('auto_update').checked=c.auto_update!==false;
-  if(c.update_available){var _b=$('upd-banner');_b.style.display='block';_b.textContent='Update available: '+c.update_available+(c.auto_update!==false?' — installing automatically in the background.':' — turn on Automatic updates to install it.');}
+  if(c.update_available){var _b=$('upd-banner');_b.style.display='block';
+    _b.textContent='Update available: '+c.update_available+'. '+(c.os==='windows'?(c.auto_update!==false?'Windows installs it automatically in the background.':'Turn on Automatic updates to install it, or download it from trapetum.neuralboot.com.'):'Download the new package from trapetum.neuralboot.com (this system does not update itself).');}
   loadTokens();
 }
 $('gen').onclick=async()=>{
@@ -1582,12 +1741,12 @@ $('gen').onclick=async()=>{
 $('save').onclick=async()=>{
   const body={port:+$('port').value,bind:$('bind').value,cors_origins:$('cors_origins').value,admin_key:$('admin_key').value,
     default_model:$('default_model').value,max_tokens_cap:+$('max_tokens_cap').value,rate_limit_rpm:+$('rate_limit_rpm').value,
-    log_prompts:$('log_prompts').checked,carbon_token:$('carbon_token').value,
+    log_prompts:$('log_prompts').checked,carbon_token:$('carbon_token').value,carbon_zone:$('carbon_zone').value.trim(),
     license_key:$('license_key').value,activation_consent:$('activation_consent').checked,auto_update:$('auto_update').checked};
   const r=await fetch('/admin/save',{method:'POST',headers:{'Content-Type':'application/json',...ah()},body:JSON.stringify(body)});
-  if(r.status===401){$('msg').className='err';$('msg').textContent='Unauthorized — wrong admin key.';return;}
-  const d=await r.json();$('msg').className='';
-  $('msg').textContent=d.restart_needed?'Saved ✓  port/bind change needs: sudo systemctl restart trapetum':'Saved ✓  applied live.';
+  if(r.status===401){$('msg').className='err';$('msg').textContent='Unauthorized: wrong admin key.';return;}
+  const d=await r.json();if(d.error){$('msg').className='err';$('msg').textContent=d.error;return;}$('msg').className='';
+  $('msg').textContent=d.restart_needed?'Saved ✓  restart the server to apply the port or bind change.':'Saved ✓  applied live.';
 };
 load();
 </script></body></html>"##;
@@ -1668,7 +1827,7 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--green)}
     <p class="lead">Everything is reached from the tabs at the top of every page.</p>
     <div class="grid">
       <div class="card"><b>Chat</b><p>Talk to your models in a ChatGPT-style interface. Switch model from the dropdown.</p></div>
-      <div class="card"><b>Models</b><p>Search HuggingFace, filter by GPU fit and compatibility, then compress and install a model on your machine. Admin only.</p></div>
+      <div class="card"><b>Models</b><p>Install pre-compressed models from the Trapetum registry, and search HuggingFace to see which models fit your GPU. Admin only.</p></div>
       <div class="card"><b>Settings</b><p>Server configuration: port, network binding, admin password, API tokens, CORS, rate limit, default model, prompt logging. Admin only.</p></div>
       <div class="card"><b>Usage</b><p>Graphs of requests, tokens, compression and energy or CO2 saved per model. Admin only.</p></div>
       <div class="card"><b>API</b><p>OpenAI-compatible endpoints with interactive Swagger docs.</p></div>
@@ -1677,7 +1836,7 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--green)}
 
   <section>
     <h2>How to install</h2>
-    <div class="req">Requirements: an NVIDIA GPU with the CUDA runtime. During install you set an <b>admin password</b> that locks the Settings, Models and Usage pages.</div>
+    <div class="req">Requirements: an NVIDIA GPU with the CUDA runtime (Linux, Windows) or an Apple Silicon Mac (Metal). You can set an <b>admin password</b> that locks the Settings, Models and Usage pages, during the Linux install or later in Settings.</div>
     <h3>Linux (systemd service)</h3>
     <pre>tar xzf trapetum-linux.tar.gz
 sudo ./trapetum-linux/install-linux.sh
@@ -1687,7 +1846,7 @@ sudo ./trapetum-linux/install-linux.sh
     <h3>Windows (background service)</h3>
     <pre>powershell -ExecutionPolicy Bypass -File install-windows.ps1
 # run in an elevated PowerShell, prompts for an admin password
-# manage in services.msc, or: nssm start|stop|restart Trapetum</pre>
+# manage in Task Scheduler (task "Trapetum"), or: Start-ScheduledTask Trapetum</pre>
     <p>The server starts on boot and serves the web UI on <code>http://localhost:8088</code>. Models are compressed ahead of time, so the install stays light.</p>
   </section>
 
@@ -1712,7 +1871,7 @@ sudo ./trapetum-linux/install-linux.sh
 
   <section>
     <h2>Adding models</h2>
-    <p class="lead">Open the <a href="/settings">Models</a> tab, search HuggingFace, and click Compress &amp; install. Compatible architectures are <b>Llama, Mistral and Qwen</b> (the filter hides the rest). Compression runs on your GPU and shows the space, memory and CO2 saved.</p>
+    <p class="lead">Open the <a href="/settings">Models</a> tab and click Install on a model of the Trapetum registry. The server downloads its pre-compressed 4-bit file from cdn.neuralboot.com and checks its SHA-256 before serving it. Compression runs ahead of time on our side, never on your machine: a model that is not in the registry yet cannot be installed from here.</p>
   </section>
 
 </div>
@@ -1763,7 +1922,7 @@ td.g{color:var(--green)}
   <div class="charts">
     <div class="card"><h3>Tokens generated per model</h3><canvas id="c1"></canvas></div>
     <div class="card"><h3>CO2 saved vs fp16 (g)</h3><canvas id="c2"></canvas></div>
-    <div class="card" style="grid-column:1/3"><h3>Footprint per model — fp16 vs compressed 4-bit (GB)</h3><canvas id="c3" height="90"></canvas></div>
+    <div class="card" style="grid-column:1/3"><h3>Footprint per model: fp16 vs compressed 4-bit (GB)</h3><canvas id="c3" height="90"></canvas></div>
   </div>
   <table id="tbl"></table>
   <p class="note" id="note"></p>
@@ -1779,7 +1938,7 @@ async function load(){
   const d=await(await fetch('/admin/usage',{headers:ah})).json();
   G('kpis').innerHTML=[['Requests',fmt(d.total_requests),''],['Tokens',fmt(d.total_tokens),''],['CO2 saved',fmt(d.total_co2_saved_g)+' g','g'],['Energy saved',d.total_kwh_saved+' kWh','g'],['CO2 emitted',fmt(d.total_co2_used_g)+' g','']].map(c=>`<div class="kpi"><div class="v ${c[2]}">${c[1]}</div><div class="l">${c[0]}</div></div>`).join('');
   const m=d.models||[];const labels=m.map(x=>x.model);
-  if(!m.length){G('note').textContent='No usage yet — chat with a model and refresh.';return;}
+  if(!m.length){G('note').textContent='No usage yet: chat with a model and refresh.';return;}
   new Chart(G('c1'),{type:'bar',data:{labels,datasets:[{label:'tokens',data:m.map(x=>x.tokens),backgroundColor:'#f74c00'}]},options:axes(false)});
   new Chart(G('c2'),{type:'bar',data:{labels,datasets:[{label:'CO2 saved (g)',data:m.map(x=>x.co2_saved_g),backgroundColor:'#3fb950'}]},options:axes(false)});
   new Chart(G('c3'),{type:'bar',data:{labels,datasets:[{label:'fp16 GB',data:m.map(x=>x.fp16_gb),backgroundColor:'#6e7681'},{label:'4-bit GB',data:m.map(x=>x.q4_gb),backgroundColor:'#f74c00'}]},options:axes(true)});
@@ -1788,3 +1947,74 @@ async function load(){
 }
 load();
 </script></body></html>"##;
+
+#[cfg(test)]
+mod beta2_tests {
+    use super::*;
+
+    #[test]
+    fn hf_ids() {
+        assert!(valid_hf_id("Qwen/Qwen2.5-7B-Instruct"));
+        assert!(valid_hf_id("unsloth/Meta-Llama-3.1-8B-Instruct"));
+        assert!(!valid_hf_id("x', local_dir='/tmp') if 0 else __import__('os').system('id') #"));
+        assert!(!valid_hf_id("a/b/c"));
+        assert!(!valid_hf_id("../etc"));
+        assert!(!valid_hf_id("a/.."));
+        assert!(!valid_hf_id("a\\b/c"));
+        assert!(!valid_hf_id("/abs"));
+        assert!(!valid_hf_id(""));
+    }
+
+    #[test]
+    fn registry_ids() {
+        for ok in ["tinyllama", "qwen25-1.5b", "llama31-8b", "deepseek-coder-6.7b"] {
+            assert!(valid_registry_id(ok), "{}", ok);
+        }
+        for bad in ["", "..", "../x", "a/b", "A", "x\\y", ".hidden", "a b"] {
+            assert!(!valid_registry_id(bad), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn zones() {
+        for ok in ["FR", "DE", "US-CAL-CISO", "DK-DK1", "US_NY"] {
+            assert!(valid_zone(ok), "{}", ok);
+        }
+        for bad in ["", "F", "fr", "FRA", "F1", "US CAL", "FR&lat=1", "../FR"] {
+            assert!(!valid_zone(bad), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn hosts() {
+        for ok in ["localhost:8088", "LOCALHOST", "127.0.0.1:8088", "127.1.2.3", "[::1]:8088", "trapetum.localhost:8088"] {
+            assert!(loopback_host(ok), "{}", ok);
+        }
+        for bad in ["evil.com:8088", "localhost.evil.com", "192.168.1.10:8088", "0.0.0.0:8088", "[::]:8088", "", "127.0.0.1.nip.io"] {
+            assert!(!loopback_host(bad), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn sha256_known_vector() {
+        let p = std::env::temp_dir().join("trapetum-beta2-sha-test.bin");
+        std::fs::write(&p, b"abc").unwrap();
+        assert_eq!(
+            sha256_hex(p.to_str().unwrap()).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn carbon_without_zone_is_labelled_world_average() {
+        let (g, src) = fetch_carbon("", "");
+        assert_eq!(g, WORLD_AVG_G_PER_KWH);
+        assert!(src.starts_with("world average"));
+        let (g, src) = fetch_carbon("FR", "");
+        assert_eq!(g, 56.0);
+        assert!(src.contains("FR grid"));
+        let (_, src) = fetch_carbon("XX", "");
+        assert!(src.starts_with("world average"));
+    }
+}

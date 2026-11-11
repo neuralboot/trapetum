@@ -28,9 +28,18 @@ fn main() {
             "ios" => "iphoneos",
             _ => "macosx",
         };
+        // Pin the macOS the Metal library targets: without it, xcrun metal targets the
+        // build machine's macOS and older systems refuse to load the library. 13.0 is the
+        // Metal 3 baseline; TRAPETUM_METAL_MACOS_MIN overrides it.
+        let mut metal_args: Vec<String> = ["-sdk", sdk, "metal", "-std=metal3.0", "-O2"]
+            .iter().map(|s| s.to_string()).collect();
+        if sdk == "macosx" {
+            let min = env::var("TRAPETUM_METAL_MACOS_MIN").unwrap_or_else(|_| "13.0".into());
+            metal_args.push(format!("-mmacosx-version-min={min}"));
+        }
+        metal_args.extend(["-c", "metal/kernels.metal", "-o", &air].iter().map(|s| s.to_string()));
         let ok = Command::new("xcrun")
-            .args(["-sdk", sdk, "metal", "-std=metal3.0", "-O2",
-                   "-c", "metal/kernels.metal", "-o", &air])
+            .args(&metal_args)
             .status().expect("failed to spawn xcrun metal (Xcode command line tools?)")
             .success();
         assert!(ok, "metal shader compilation failed");
@@ -41,6 +50,7 @@ fn main() {
         assert!(ok, "metallib link failed");
         println!("cargo:warning=trapetum: built Metal shaders for SDK {sdk}");
         println!("cargo:rerun-if-changed=metal/kernels.metal");
+        println!("cargo:rerun-if-env-changed=TRAPETUM_METAL_MACOS_MIN");
         println!("cargo:rerun-if-changed=build.rs");
         return;
     }

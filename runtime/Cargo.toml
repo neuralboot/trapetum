@@ -19,6 +19,7 @@ half = "2"   # only for the CPU reference (emulate the fp16 rounding the GPU doe
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 tiny_http = "0.12"
 serde_json = "1"
+sha2 = "0.10"   # in-process SHA-256 of downloaded registry models (0.1.0-beta.2)
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 getrandom = "0.2"

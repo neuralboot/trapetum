@@ -4,7 +4,18 @@
 $ErrorActionPreference = "Stop"
 $Here       = Split-Path -Parent $MyInvocation.MyCommand.Path
 $InstallDir = $Here
-$Models     = Join-Path $env:LOCALAPPDATA "Trapetum\models"
+# Machine-wide models folder (the task runs as SYSTEM). 0.1.0-beta.1 used $env:LOCALAPPDATA here,
+# which for SYSTEM is C:\Windows\System32\config\systemprofile\AppData\Local: move it once.
+$Models     = Join-Path $env:ProgramData "Trapetum\models"
+$Old        = Join-Path $env:LOCALAPPDATA "Trapetum\models"
+if ((Test-Path $Old) -and -not (Test-Path $Models)) {
+  try {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Models) | Out-Null
+    Move-Item -Path $Old -Destination $Models
+  } catch {
+    $Models = $Old   # keep serving from the old folder rather than failing the install
+  }
+}
 New-Item -ItemType Directory -Force -Path $Models | Out-Null
 
 $cfgPath = Join-Path $Models "config.toml"
@@ -35,6 +46,6 @@ $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGo
              -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
 
 Register-ScheduledTask -TaskName "Trapetum" -Action $action -Trigger $trigger `
-  -Principal $principal -Settings $settings -Description "Local 4-bit LLM inference server (neuralboot.com/trapetum)" -Force | Out-Null
+  -Principal $principal -Settings $settings -Description "Local 4-bit LLM inference server (trapetum.neuralboot.com)" -Force | Out-Null
 Start-ScheduledTask -TaskName "Trapetum"
 exit 0
