@@ -36,4 +36,4 @@ if (Test-Path $dir) { Remove-Item -Recurse -Force $dir 2>$null }
 Write-Host ""
 if (Test-Path $dir) { Write-Warning "Some files remain in $dir (a file may be in use). Reboot and delete the folder." }
 else { Write-Host "Trapetum is fully removed." }
-Write-Host "Your downloaded models under $env:ProgramData\Trapetum were kept (0.1.0-beta.1 kept them under the SYSTEM profile, C:\Windows\System32\config\systemprofile\AppData\Local\Trapetum). Delete that folder to remove them too."
+Write-Host "Your downloaded models were kept: C:\Windows\System32\config\systemprofile\AppData\Local\Trapetum (.msi install, the service runs as SYSTEM) or %LOCALAPPDATA%\Trapetum (portable .zip install). Delete that folder to remove them too."

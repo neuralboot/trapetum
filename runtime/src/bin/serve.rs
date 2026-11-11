@@ -531,10 +531,15 @@ const REGISTRY_URL: &str = "https://cdn.neuralboot.com";
 
 fn valid_registry_id(id: &str) -> bool {
     let b = id.as_bytes();
+    let stem = id.split('.').next().unwrap_or("");
+    let reserved = matches!(stem, "con" | "prn" | "aux" | "nul")
+        || ((stem.starts_with("com") || stem.starts_with("lpt")) && stem.len() == 4 && stem.as_bytes()[3].is_ascii_digit());
     !b.is_empty()
         && b.len() <= 64
         && b[0].is_ascii_alphanumeric()
+        && !id.ends_with('.')
         && !id.contains("..")
+        && !reserved
         && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'_' | b'-'))
 }
 
@@ -555,16 +560,19 @@ fn valid_hf_id(id: &str) -> bool {
     }
 }
 
-// registry manifest, cached 10 minutes; fetched only when the Models page or an install needs it
+// registry manifest, fetched only when the Models page or an install needs it. A good list is
+// reused 10 minutes and a failure 1 minute: requests are served one at a time, so an unreachable
+// CDN must not stall the chat on every Models request.
 fn registry_manifest() -> Vec<serde_json::Value> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<(Vec<serde_json::Value>, Option<Instant>)>> = std::sync::OnceLock::new();
     let cell = CACHE.get_or_init(|| std::sync::Mutex::new((Vec::new(), None)));
     let mut c = cell.lock().unwrap();
-    if c.1.map(|t| t.elapsed().as_secs() < 600).unwrap_or(false) {
+    let ttl = if c.0.is_empty() { 60 } else { 600 };
+    if c.1.map(|t| t.elapsed().as_secs() < ttl).unwrap_or(false) {
         return c.0.clone();
     }
     let out = std::process::Command::new("curl")
-        .args(["-fsSL", "--max-time", "15", &format!("{}/manifest.json", REGISTRY_URL)])
+        .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--max-time", "10", &format!("{}/manifest.json", REGISTRY_URL)])
         .output();
     let entries: Vec<serde_json::Value> = out.ok()
         .filter(|o| o.status.success())
@@ -579,9 +587,7 @@ fn registry_manifest() -> Vec<serde_json::Value> {
                     .unwrap_or(false)
         })
         .collect();
-    if !entries.is_empty() {
-        *c = (entries.clone(), Some(Instant::now())); // a failed fetch is retried on the next call
-    }
+    *c = (entries.clone(), Some(Instant::now()));
     entries
 }
 
@@ -643,14 +649,24 @@ fn start_install(root: String, entry: serde_json::Value, status: std::sync::Arc<
             finish(false, "cannot create the model folder", 1.0);
             return;
         }
+        // every file goes to <name>.part first and is renamed only once model.cbk matched its
+        // SHA-256, so a failed or partial install never mixes with a working copy
+        let small = ["tokenizer.json", "config.json", "meta.json"];
+        let clean = || {
+            for f in small.iter().map(|f| f.to_string()).chain(std::iter::once("model.cbk".to_string())) {
+                let _ = std::fs::remove_file(format!("{}/{}.part", out, f));
+            }
+        };
         set("Downloading tokenizer and config…", 3.0);
-        for f in ["tokenizer.json", "config.json", "meta.json"] {
+        for f in small {
             let ok = Command::new("curl")
-                .args(["-fsSL", "--connect-timeout", "20", "--max-time", "600", "-o", &format!("{}/{}", out, f), &format!("{}/{}", base, f)])
+                .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "20", "--max-time", "600",
+                       "--max-filesize", "67108864", "-o", &format!("{}/{}.part", out, f), &format!("{}/{}", base, f)])
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !ok {
+                clean();
                 finish(false, &format!("download failed: {}", f), 3.0);
                 return;
             }
@@ -659,12 +675,19 @@ fn start_install(root: String, entry: serde_json::Value, status: std::sync::Arc<
         // curl gives up only if the transfer stays below 20 kB/s for two minutes
         set("Downloading the 4-bit model from the Trapetum registry…", 5.0);
         let _ = std::fs::remove_file(&part);
-        let mut child = match Command::new("curl")
-            .args(["-fsSL", "--connect-timeout", "20", "--speed-limit", "20000", "--speed-time", "120", "-o", &part, &format!("{}/model.cbk", base)])
-            .spawn()
-        {
+        let mut args: Vec<String> = ["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "20",
+                                     "--speed-limit", "20000", "--speed-time", "120"].iter().map(|a| a.to_string()).collect();
+        if total > 0 {
+            args.push("--max-filesize".into());
+            args.push(total.to_string());
+        }
+        args.push("-o".into());
+        args.push(part.clone());
+        args.push(format!("{}/model.cbk", base));
+        let mut child = match Command::new("curl").args(&args).spawn() {
             Ok(c) => c,
             Err(_) => {
+                clean();
                 finish(false, "curl not found", 5.0);
                 return;
             }
@@ -683,7 +706,7 @@ fn start_install(root: String, entry: serde_json::Value, status: std::sync::Arc<
             }
         };
         if !ok_dl {
-            let _ = std::fs::remove_file(&part);
+            clean();
             finish(false, "download failed or stalled (network?)", 5.0);
             return;
         }
@@ -691,18 +714,26 @@ fn start_install(root: String, entry: serde_json::Value, status: std::sync::Arc<
         match sha256_hex(&part) {
             Ok(got) if got == want => {}
             Ok(_) => {
-                let _ = std::fs::remove_file(&part);
-                finish(false, "checksum mismatch, the file was deleted", 92.0);
+                clean();
+                finish(false, "checksum mismatch, the files were deleted", 92.0);
                 return;
             }
             Err(_) => {
-                let _ = std::fs::remove_file(&part);
+                clean();
                 finish(false, "could not read the downloaded file", 92.0);
                 return;
             }
         }
+        // verified: the small files first, model.cbk last (a model is listed once model.cbk exists)
+        for f in small {
+            if std::fs::rename(format!("{}/{}.part", out, f), format!("{}/{}", out, f)).is_err() {
+                clean();
+                finish(false, "could not move the model files into place", 96.0);
+                return;
+            }
+        }
         if std::fs::rename(&part, &cbk).is_err() {
-            let _ = std::fs::remove_file(&part);
+            clean();
             finish(false, "could not move the model into place", 96.0);
             return;
         }
@@ -929,7 +960,7 @@ fn sha256_file(path: &str) -> String {
 }
 fn check_update(auto: bool) {
     let out = std::process::Command::new("curl").args(["-sL", "--max-time", "20", UPDATE_URL]).output();
-    let man: serde_json::Value = match out.ok().and_then(|o| serde_json::from_slice(&o.stdout).ok()) {
+    let man: serde_json::Value = match out.ok().and_then(|o| serde_json::from_slice(o.stdout.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&o.stdout[..])).ok()) {
         Some(v) => v, None => return,
     };
     let build = man.get("build").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1014,16 +1045,27 @@ fn loopback_host(h: &str) -> bool {
         || host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
 }
 // Without an admin key the admin endpoints are open to this machine only. Such a request must
-// also come from this server's own pages: a page of another website (Origin header) or a
-// DNS-rebinding domain (Host header) is refused, so a site open in the browser cannot drive them.
+// also come from this server's own pages: the Host header must name this machine (no
+// DNS-rebinding domain), the browser must not mark the request cross-site or same-site (a page
+// on another local port is same-site), and an Origin header, when present, must be this origin.
+fn local_page_headers(host: Option<&str>, origin: Option<&str>, fetch_site: Option<&str>) -> bool {
+    let host = match host {
+        Some(h) if loopback_host(h) => h.trim().to_ascii_lowercase(),
+        _ => return false,
+    };
+    let site = fetch_site.unwrap_or("").trim().to_ascii_lowercase();
+    if site == "cross-site" || site == "same-site" {
+        return false;
+    }
+    match origin.map(|o| o.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(o) if o == "null" => site == "same-origin",
+        Some(o) => o == format!("http://{}", host),
+    }
+}
 fn same_machine_page(req: &Request) -> bool {
     let get = |name: &'static str| req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string());
-    let host_ok = get("Host").map(|h| loopback_host(&h)).unwrap_or(false);
-    let origin_ok = match get("Origin") {
-        None => true,
-        Some(o) => o.to_ascii_lowercase().strip_prefix("http://").map(loopback_host).unwrap_or(false),
-    };
-    host_ok && origin_ok
+    local_page_headers(get("Host").as_deref(), get("Origin").as_deref(), get("Sec-Fetch-Site").as_deref())
 }
 fn gen_token() -> String {
     let mut b = [0u8; 18];
@@ -1418,6 +1460,11 @@ fn main() {
                     continue;
                 }
             };
+            // only an installed model, by its exact folder name: a requested name is never used as a path
+            if !list_models(&root).iter().any(|(n, _)| *n == want) {
+                let _ = req.respond(json_resp(serde_json::json!({"error": "unknown model"}).to_string()).with_status_code(tiny_http::StatusCode(404)));
+                continue;
+            }
             if cur.as_ref().map(|c| c.name != want).unwrap_or(true) {
                 eprintln!("loading {want} ...");
                 let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_model(&root, &want)));
@@ -1535,7 +1582,7 @@ const log=document.getElementById('log'),t=document.getElementById('t'),b=docume
 let msgs=[];
 async function loadModels(){try{const r=await fetch('/v1/models');const j=await r.json();sel.innerHTML='';(j.data||[]).forEach(m=>{const o=document.createElement('option');o.value=m.id;o.textContent=m.label||m.id;sel.appendChild(o);});}catch(e){}}
 function add(role,text){const d=document.createElement('div');d.className='msg '+(role==='user'?'user':'bot');d.textContent=text;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
-sel.addEventListener('change',()=>{msgs=[];log.innerHTML='<div class="hint">Switched to '+sel.options[sel.selectedIndex].text+'. New conversation.</div>';});
+sel.addEventListener('change',()=>{msgs=[];log.innerHTML='';const h=document.createElement('div');h.className='hint';h.textContent='Switched to '+sel.options[sel.selectedIndex].text+'. New conversation.';log.appendChild(h);});
 f.addEventListener('submit',async(e)=>{e.preventDefault();const q=t.value.trim();if(!q)return;
   if(log.querySelector('.hint'))log.innerHTML='';
   add('user',q);msgs.push({role:'user',content:q});t.value='';b.disabled=true;
@@ -1932,6 +1979,7 @@ const key=new URLSearchParams(location.search).get('key')||'';
 const ah=key?{'Authorization':'Bearer '+key}:{};
 const fmt=n=>n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':Math.round(n);
 const G=id=>document.getElementById(id);
+const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const axes=t=>({responsive:true,plugins:{legend:{display:t,labels:{color:'#e6edf3'}}},scales:{x:{ticks:{color:'#8b949e'},grid:{color:'#21262d'}},y:{ticks:{color:'#8b949e'},grid:{color:'#21262d'}}}});
 async function load(){
   document.querySelectorAll('a.kl').forEach(function(a){a.href=a.href.split('?')[0]+(key?'?key='+encodeURIComponent(key):'');});
@@ -1942,7 +1990,7 @@ async function load(){
   new Chart(G('c1'),{type:'bar',data:{labels,datasets:[{label:'tokens',data:m.map(x=>x.tokens),backgroundColor:'#f74c00'}]},options:axes(false)});
   new Chart(G('c2'),{type:'bar',data:{labels,datasets:[{label:'CO2 saved (g)',data:m.map(x=>x.co2_saved_g),backgroundColor:'#3fb950'}]},options:axes(false)});
   new Chart(G('c3'),{type:'bar',data:{labels,datasets:[{label:'fp16 GB',data:m.map(x=>x.fp16_gb),backgroundColor:'#6e7681'},{label:'4-bit GB',data:m.map(x=>x.q4_gb),backgroundColor:'#f74c00'}]},options:axes(true)});
-  G('tbl').innerHTML='<tr><th>Model</th><th>Requests</th><th>Tokens</th><th>Compression</th><th>kWh used</th><th>CO2 saved</th></tr>'+m.map(x=>`<tr><td>${x.model}</td><td>${x.requests}</td><td>${fmt(x.tokens)}</td><td class="g">-${x.saved_pct}%</td><td>${x.kwh_used}</td><td class="g">${fmt(x.co2_saved_g)} g</td></tr>`).join('');
+  G('tbl').innerHTML='<tr><th>Model</th><th>Requests</th><th>Tokens</th><th>Compression</th><th>kWh used</th><th>CO2 saved</th></tr>'+m.map(x=>`<tr><td>${esc(x.model)}</td><td>${x.requests}</td><td>${fmt(x.tokens)}</td><td class="g">-${x.saved_pct}%</td><td>${x.kwh_used}</td><td class="g">${fmt(x.co2_saved_g)} g</td></tr>`).join('');
   G('note').textContent='CO2 computed at '+d.carbon_g_per_kwh+' g/kWh ('+d.carbon_source+'). Energy from measured 4-bit decode scaled by model size; savings vs fp16. Estimates for guidance only, not a certified carbon measurement.';
 }
 load();
@@ -1993,6 +2041,29 @@ mod beta2_tests {
         for bad in ["evil.com:8088", "localhost.evil.com", "192.168.1.10:8088", "0.0.0.0:8088", "[::]:8088", "", "127.0.0.1.nip.io"] {
             assert!(!loopback_host(bad), "{}", bad);
         }
+    }
+
+    #[test]
+    fn local_page_guard() {
+        // the server's own pages
+        assert!(local_page_headers(Some("localhost:8088"), None, None));
+        assert!(local_page_headers(Some("localhost:8088"), Some("http://localhost:8088"), Some("same-origin")));
+        assert!(local_page_headers(Some("127.0.0.1:8088"), Some("http://127.0.0.1:8088"), None));
+        assert!(local_page_headers(Some("localhost:8088"), None, Some("none")));
+        assert!(local_page_headers(Some("localhost:8088"), Some("null"), Some("same-origin")));
+        // refused
+        assert!(!local_page_headers(Some("localhost:8088"), Some("http://localhost:3000"), None));
+        assert!(!local_page_headers(Some("localhost:8088"), Some("https://evil.example"), None));
+        assert!(!local_page_headers(Some("localhost:8088"), Some("null"), None));
+        assert!(!local_page_headers(Some("localhost:8088"), None, Some("cross-site")));
+        assert!(!local_page_headers(Some("localhost:8088"), None, Some("same-site")));
+        assert!(!local_page_headers(Some("rebind.evil.example:8088"), Some("http://rebind.evil.example:8088"), Some("same-origin")));
+        assert!(!local_page_headers(None, None, None));
+        // Windows device names and a trailing dot
+        for bad in ["con", "nul", "aux.json", "com1", "lpt9", "tinyllama."] {
+            assert!(!valid_registry_id(bad), "{}", bad);
+        }
+        assert!(valid_registry_id("console-7b") && valid_registry_id("com10") && valid_registry_id("qwen25-1.5b"));
     }
 
     #[test]
