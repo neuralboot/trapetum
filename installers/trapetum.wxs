@@ -1,19 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Trapetum Windows installer (WiX v3). Double-click .msi wizard.
-     Installs serve.exe + cudart + nssm to Program Files\Trapetum, then registers
-     and starts the Trapetum service (localhost, no password by default). -->
+     Installs serve.exe + cudart to Program Files\Trapetum, then registers and starts
+     the Trapetum scheduled task (localhost, no password by default).
+     ProductVersion comes from build-windows.ps1 (candle -dProductVersion=0.1.<build>):
+     MajorUpgrade compares only the first three fields, so each build needs a larger one.
+     0.1.0-beta.1 shipped as 0.1.0. -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
      xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
-  <Product Id="*" Name="Trapetum" Language="1033" Version="0.1.0"
+  <Product Id="*" Name="Trapetum" Language="1033" Version="$(var.ProductVersion)"
            Manufacturer="neuralboot" UpgradeCode="153667E0-F14B-4F10-B527-D12A5D832648">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
-             Description="Trapetum — local 4-bit LLM inference server" Manufacturer="neuralboot" />
+             Description="Trapetum: local 4-bit LLM inference server" Manufacturer="neuralboot" />
     <MajorUpgrade DowngradeErrorMessage="A newer version of Trapetum is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Icon Id="trapetum.ico" SourceFile="trapetum.ico" />
     <Property Id="ARPPRODUCTICON" Value="trapetum.ico" />
-    <Property Id="ARPURLINFOABOUT" Value="https://neuralboot.com/trapetum/" />
+    <Property Id="ARPURLINFOABOUT" Value="https://trapetum.neuralboot.com/" />
     <Property Id="ARPHELPLINK" Value="mailto:contact@neuralboot.com" />
 
     <Directory Id="TARGETDIR" Name="SourceDir">

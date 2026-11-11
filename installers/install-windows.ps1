@@ -5,14 +5,14 @@
 $ErrorActionPreference = "Stop"
 $Here       = Split-Path -Parent $MyInvocation.MyCommand.Path
 $InstallDir = Join-Path $env:ProgramFiles "Trapetum"
-$Models     = Join-Path $env:LOCALAPPDATA "Trapetum\models"
+$Models     = Join-Path $env:ProgramData "Trapetum\models"   # machine-wide: the task runs as SYSTEM
 
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
          ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $admin) { Write-Error "Please run this installer in an elevated (Administrator) PowerShell."; exit 1 }
 
 if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
-  Write-Warning "nvidia-smi not found — Trapetum needs an NVIDIA GPU + CUDA runtime."
+  Write-Warning "nvidia-smi not found: Trapetum needs an NVIDIA GPU + CUDA runtime."
 }
 
 New-Item -ItemType Directory -Force -Path $InstallDir, $Models | Out-Null

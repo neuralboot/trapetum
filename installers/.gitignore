@@ -1,0 +1,9 @@
+# build outputs (never committed: binaries go to the CDN)
+dist/
+stage/
+pkg/
+*.msi
+*.wixobj
+*.wixpdb
+*.zip
+latest.json

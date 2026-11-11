@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Trapetum Linux installer — installs the local inference server as a systemd service.
+# Trapetum Linux installer: installs the local inference server as a systemd service.
 # Usage:  sudo ./install-linux.sh [path-to-serve-binary]
 # The service starts on boot, restarts on failure, and serves the web UI on http://localhost:8088
 set -euo pipefail
@@ -21,7 +21,7 @@ echo "  binary      : $INSTALL_DIR/serve"
 echo "  models dir  : $MODELS_DIR"
 command -v nvidia-smi >/dev/null 2>&1 \
   && echo "  GPU         : $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)" \
-  || echo "  GPU         : WARNING — nvidia-smi not found; Trapetum needs an NVIDIA GPU + CUDA runtime."
+  || echo "  GPU         : WARNING: nvidia-smi not found; Trapetum needs an NVIDIA GPU + CUDA runtime."
 
 # install binary + models dir
 mkdir -p "$INSTALL_DIR"
