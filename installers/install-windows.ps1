@@ -5,7 +5,7 @@
 $ErrorActionPreference = "Stop"
 $Here       = Split-Path -Parent $MyInvocation.MyCommand.Path
 $InstallDir = Join-Path $env:ProgramFiles "Trapetum"
-$Models     = Join-Path $env:ProgramData "Trapetum\models"   # machine-wide: the task runs as SYSTEM
+$Models     = Join-Path $env:LOCALAPPDATA "Trapetum\models"
 
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
          ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)

@@ -6,4 +6,4 @@ Stop-ScheduledTask       -TaskName "Trapetum" 2>$null
 Unregister-ScheduledTask -TaskName "Trapetum" -Confirm:$false 2>$null
 Get-Process serve -ErrorAction SilentlyContinue | Stop-Process -Force 2>$null
 Remove-Item -Recurse -Force $InstallDir 2>$null
-Write-Host "Trapetum removed. Models under $env:ProgramData\Trapetum were kept."
+Write-Host "Trapetum removed. Models under %LOCALAPPDATA%\Trapetum were kept."

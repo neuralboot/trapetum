@@ -14,9 +14,12 @@ before serving it. The download buttons live on the web page (trapetum.neuralboo
 ## Requirements
 - Linux or Windows: NVIDIA GPU + CUDA runtime (driver providing `libcudart`).
   macOS: Apple Silicon (M1 to M4), macOS 13 or later.
-- Models directory: `~/.trapetum` on Linux and macOS, `%ProgramData%\Trapetum\models` on Windows
-  (0.1.0-beta.2 and later; 0.1.0-beta.1 used the SYSTEM profile), each model as
-  `<name>/model.cbk` + `tokenizer.json` + `config.json` + `meta.json`.
+- Models directory: `~/.trapetum` on Linux and macOS. On Windows, `%LOCALAPPDATA%\Trapetum\models` of
+  the account that runs the service: `C:\Windows\System32\config\systemprofile\AppData\Local\Trapetum\models`
+  for the .msi (scheduled task as SYSTEM; only SYSTEM and administrators can read it, since
+  `config.toml` holds the admin key and API tokens), the installing administrator's
+  `%LOCALAPPDATA%` for the portable .zip. Each model is `<name>/model.cbk` + `tokenizer.json`
+  + `config.json` + `meta.json`.
 
 ## Version numbers
 Every published build gets a new build number N and the label `0.1.0-beta.N`. N is stamped into

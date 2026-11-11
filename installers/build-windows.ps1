@@ -22,6 +22,11 @@ param(
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ($Build -lt 2) { throw "-Build must be 2 or more: build 1 (MSI 0.1.0) is already published" }
+# A build number is used once: two MSIs with the same ProductVersion install side by side.
+try {
+  $published = (Invoke-RestMethod -UseBasicParsing "https://cdn.neuralboot.com/dist/latest.json").build
+  if ($Build -le [int]$published) { throw "-Build $Build is not above the published build $published" }
+} catch [System.Net.WebException] { Write-Warning "could not read the published latest.json; check the build number by hand" }
 $Label   = "$Ver-beta.$Build"                     # e.g. 0.1.0-beta.2
 $MsiVer  = "0.1.$Build"                           # MSI ProductVersion
 $MsiName = "trapetum-$Label-x64.msi"
@@ -86,7 +91,7 @@ $manifest = Join-Path $Inst "latest.json"
   sha256   = $sha
   notes    = "Trapetum $Label"
   released = (Get-Date -Format "yyyy-MM-dd")
-} | ConvertTo-Json | Set-Content -Path $manifest -Encoding UTF8
+} | ConvertTo-Json | ForEach-Object { [IO.File]::WriteAllText($manifest, $_, (New-Object System.Text.UTF8Encoding $false)) }   # no byte-order mark: serde_json rejects it
 
 Write-Host "`nBuilt $Label (MSI ProductVersion $MsiVer):"
 Write-Host "  $msi"
