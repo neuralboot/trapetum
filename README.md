@@ -454,9 +454,8 @@ kept in fp16), not from that file. Measured from the files on 5 November 2026 on
   shared memory per block), and the runtime refuses such a layer at load time on Turing and
   Pascal GPUs (verified by reading the code; no Turing GPU was available to test).
 - The desktop app's model registry is not updated: its downloadable models keep the old
-  format and the old recipe, because installed apps (including the Windows beta
-  0.1.0-beta.1) cannot read the new files. A runtime release has to come before any new
-  registry entries.
+  format and the old recipe, because installed apps (the 0.1.0 betas, beta.1 and beta.2)
+  cannot read the new files. A runtime release has to come before any new registry entries.
 - `model/llama_quant.py` no longer reproduces the research script's 6.34: since commit
   c9d8b72 (2026-06-28) it starts its centroids from a min-to-max grid and gives 6.41.
 
