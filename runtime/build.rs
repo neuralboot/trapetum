@@ -133,8 +133,14 @@ fn main() {
         println!("cargo:rustc-link-search=native={out}");
         println!("cargo:rustc-link-lib=static=codebook_gemv");
         println!("cargo:rustc-link-search=native={cuda}/lib64");
-        println!("cargo:rustc-link-lib=dylib=cudart");
+        // CUDA runtime linked statically (0.1.0-beta.3): a machine with only the NVIDIA driver
+        // (libcuda.so.1) has no libcudart.so.12, and the package ships none, so a dynamic link
+        // left the server unable to start there. cudart_static needs dl, pthread and rt.
+        println!("cargo:rustc-link-lib=static=cudart_static");
         println!("cargo:rustc-link-lib=dylib=stdc++");
+        println!("cargo:rustc-link-lib=dylib=dl");
+        println!("cargo:rustc-link-lib=dylib=pthread");
+        println!("cargo:rustc-link-lib=dylib=rt");
     }
     println!("cargo:rerun-if-changed=cuda/codebook_gemv.cu");
     println!("cargo:rerun-if-changed=build.rs");

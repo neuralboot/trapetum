@@ -899,10 +899,10 @@ impl Default for Config {
             admin_key: String::new(),
             api_tokens: Vec::new(),
             default_model: String::new(),
-            cors_origins: "*".into(),
+            cors_origins: String::new(),   // no cross-origin access unless the owner names an origin (0.1.0-beta.3)
             max_tokens_cap: 4096,
             rate_limit_rpm: 0,
-            log_prompts: true,
+            log_prompts: false,            // prompts are not written to the logs unless the owner turns it on
             carbon_token: String::new(),
             carbon_zone: String::new(),
             license_key: String::new(),
@@ -1167,11 +1167,14 @@ fn rate_limited(ip: &str, rpm: u32) -> bool {
 }
 
 fn json_resp(body: String) -> Response<std::io::Cursor<Vec<u8>>> {
-    let mut origin = cfg().cors_origins;
-    if origin.is_empty() { origin = "*".into(); }
-    Response::from_string(body)
-        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
-        .with_header(Header::from_bytes(&b"Access-Control-Allow-Origin"[..], origin.as_bytes()).unwrap())
+    let origin = cfg().cors_origins.trim().to_string();
+    let r = Response::from_string(body)
+        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+    // empty setting = no CORS header: other websites cannot call this server from the browser
+    if origin.is_empty() {
+        return r;
+    }
+    r.with_header(Header::from_bytes(&b"Access-Control-Allow-Origin"[..], origin.as_bytes()).unwrap())
         .with_header(Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"*"[..]).unwrap())
 }
 
@@ -1505,14 +1508,18 @@ fn main() {
             let t0 = Instant::now();
             let want_stream = v.get("stream").and_then(|x| x.as_bool()).unwrap_or(false);
             if want_stream {
-                let mut origin = cfg().cors_origins;
-                if origin.is_empty() { origin = "*".into(); }
+                let origin = cfg().cors_origins.trim().to_string();
+                let cors = if origin.is_empty() {
+                    String::new()
+                } else {
+                    format!("Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Headers: *\r\n")
+                };
                 // tiny_http has no chunked-streaming Response helper, so we take the raw
-                // connection and write the SSE response by hand (same CORS header the
-                // json_resp() path applies); Connection: close marks the stream's end.
+                // connection and write the SSE response by hand (same CORS rule as
+                // json_resp()); Connection: close marks the stream's end.
                 let mut w = req.into_writer();
                 let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Headers: *\r\n\r\n"
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n{cors}\r\n"
                 );
                 if w.write_all(head.as_bytes()).is_err() {
                     continue;
@@ -1729,7 +1736,7 @@ button{background:var(--rust);color:#fff;border:0;border-radius:10px;padding:11p
   <div class="sec">Network</div>
   <div class="row"><label>Listen port</label><input id="port" type="number" min="1" max="65535"/></div>
   <div class="row"><label>Bind address</label><select id="bind"><option value="127.0.0.1">127.0.0.1 (local only, secure)</option><option value="0.0.0.0">0.0.0.0 (expose on the network)</option></select></div>
-  <div class="row"><label>CORS allowed origin</label><input id="cors_origins" placeholder="* or https://app.example.com"/></div>
+  <div class="row"><label>CORS allowed origin</label><input id="cors_origins" placeholder="empty: no other website; or https://app.example.com; * for any"/></div>
 
   <div class="sec">Access &amp; security</div>
   <div class="row"><label>Admin key (locks these settings)</label><input id="admin_key" placeholder="empty = local-only access"/></div>
@@ -2087,5 +2094,20 @@ mod beta2_tests {
         assert!(src.contains("FR grid"));
         let (_, src) = fetch_carbon("XX", "");
         assert!(src.starts_with("world average"));
+    }
+}
+
+#[cfg(test)]
+mod beta3_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_keep_prompts_and_api_private() {
+        let c = Config::default();
+        assert!(c.cors_origins.is_empty(), "no cross-origin access by default");
+        assert!(!c.log_prompts, "prompts are not logged by default");
+        // with the default (empty) setting, no response carries a CORS header
+        let r = json_resp("{}".into());
+        assert!(!r.headers().iter().any(|h| h.field.equiv("Access-Control-Allow-Origin")));
     }
 }

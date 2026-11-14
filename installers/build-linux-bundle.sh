@@ -24,6 +24,8 @@ chmod +x "$STAGE/"*.sh "$STAGE/serve"
 
 TARBALL="$HERE/dist/trapetum-linux-$VER.tar.gz"
 tar -C "$HERE/dist" --owner=0 --group=0 -czf "$TARBALL" trapetum-linux
+(cd "$HERE/dist" && sha256sum "trapetum-linux-$VER.tar.gz" | sed "s/trapetum-linux-$VER.tar.gz/trapetum-linux.tar.gz/" > "trapetum-linux-$VER.tar.gz.sha256")
 echo "Built $TARBALL  ($(du -h "$TARBALL" | cut -f1)), build $TRAPETUM_BUILD"
+echo "SHA-256 file (publish as dist/trapetum-linux.tar.gz.sha256, read by get.neuralboot.com): $TARBALL.sha256"
 echo "Published as https://cdn.neuralboot.com/dist/trapetum-linux.tar.gz (the file get.neuralboot.com installs)."
 echo "Install with:  tar xzf trapetum-linux.tar.gz && sudo ./trapetum-linux/install-linux.sh"

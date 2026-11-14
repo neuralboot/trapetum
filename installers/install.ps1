@@ -15,7 +15,7 @@ if (-not $admin) {
 }
 
 if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
-  Write-Warning "nvidia-smi not found. Trapetum needs an NVIDIA GPU (Ampere/Ada/Hopper) with a recent driver."
+  Write-Warning "nvidia-smi not found. Trapetum needs an NVIDIA GPU (Volta, 2017, or newer) with a recent driver."
 }
 
 $man = Invoke-RestMethod -UseBasicParsing "https://cdn.neuralboot.com/dist/latest.json"
