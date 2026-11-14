@@ -23,5 +23,7 @@ chmod +x "$STAGE/trapetum" "$STAGE/install.sh"
 
 TARBALL="$HERE/dist/trapetum-macos-arm64-$VER.tar.gz"
 COPYFILE_DISABLE=1 tar -C "$HERE/dist" --no-mac-metadata --uid 0 --gid 0 --uname root --gname wheel -czf "$TARBALL" trapetum-macos
+(cd "$HERE/dist" && shasum -a 256 "trapetum-macos-arm64-$VER.tar.gz" | sed "s/trapetum-macos-arm64-$VER.tar.gz/trapetum-macos-arm64.tar.gz/" > "trapetum-macos-arm64-$VER.tar.gz.sha256")
 echo "Built $TARBALL  ($(du -h "$TARBALL" | cut -f1)), build $TRAPETUM_BUILD, Metal library for macOS >= ${TRAPETUM_METAL_MACOS_MIN:-13.0}"
+echo "SHA-256 file (publish as dist/trapetum-macos-arm64.tar.gz.sha256, read by get.neuralboot.com/mac): $TARBALL.sha256"
 echo "Published as https://cdn.neuralboot.com/dist/trapetum-macos-arm64.tar.gz (the file get.neuralboot.com/mac installs)."

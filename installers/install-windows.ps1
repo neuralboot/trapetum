@@ -12,7 +12,7 @@ $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 if (-not $admin) { Write-Error "Please run this installer in an elevated (Administrator) PowerShell."; exit 1 }
 
 if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
-  Write-Warning "nvidia-smi not found: Trapetum needs an NVIDIA GPU + CUDA runtime."
+  Write-Warning "nvidia-smi not found: Trapetum needs an NVIDIA GPU and its driver (the CUDA runtime ships with Trapetum)."
 }
 
 New-Item -ItemType Directory -Force -Path $InstallDir, $Models | Out-Null

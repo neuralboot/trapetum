@@ -33,7 +33,11 @@ $MsiName = "trapetum-$Label-x64.msi"
 if (-not $MsiUrl) { $MsiUrl = "https://cdn.neuralboot.com/dist/$MsiName" }
 
 # 1. build serve.exe (CUDA 12.6); no CUDA_ARCH, so build.rs emits the portable multi-arch fatbin
-& "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" | Out-Null
+# vcvars64.bat only changes the environment of the cmd.exe that runs it: import that environment here,
+# so nvcc finds cl.exe and build.rs finds lib.exe
+$vcvars = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+cmd /c "`"$vcvars`" >nul && set" | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "Env:$($matches[1])" -Value $matches[2] } }
+if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { throw "cl.exe not found after vcvars64.bat: install the VS 2022 C++ build tools" }
 $env:CUDA_PATH = $Cuda
 Remove-Item Env:CUDA_ARCH -ErrorAction SilentlyContinue
 $env:PATH = "$env:PATH;$Cuda\bin;C:\ProgramData\chocolatey\lib\rust-ms\tools\bin;C:\ProgramData\chocolatey\bin"
