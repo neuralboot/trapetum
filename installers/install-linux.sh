@@ -69,12 +69,15 @@ chown "$USER_NAME" "$CFG"
   || echo "No password set. /admin is reachable only from this machine (localhost)."
 fi
 
+# "sudo " in the printed commands only for a user who installed through sudo
+SUDO_HINT=""; [ -n "${SUDO_USER:-}" ] && SUDO_HINT="sudo "
+
 # no systemd (PID 1 is something else): files are in place, say how to start the server
 if [ ! -d /run/systemd/system ]; then
   echo ""
   echo "Installed, but not started: this system does not run systemd, so there is no service."
   echo "  start  : $INSTALL_DIR/serve $MODELS_DIR    (as $USER_NAME; then open http://localhost:8088)"
-  echo "  remove : sudo $INSTALL_DIR/uninstall-linux.sh"
+  echo "  remove : ${SUDO_HINT}$INSTALL_DIR/uninstall-linux.sh"
   exit 0
 fi
 
@@ -101,4 +104,4 @@ echo "Installed. Trapetum is running at  http://localhost:8088"
 echo "  status : systemctl status trapetum"
 echo "  logs   : journalctl -u trapetum -f"
 echo "  stop   : sudo systemctl stop trapetum     (start / restart likewise)"
-echo "  remove : sudo $INSTALL_DIR/uninstall-linux.sh   (keeps your models and settings in $MODELS_DIR)"
+echo "  remove : ${SUDO_HINT}$INSTALL_DIR/uninstall-linux.sh   (keeps your models and settings in $MODELS_DIR)"

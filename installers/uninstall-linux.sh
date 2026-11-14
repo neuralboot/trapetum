@@ -11,4 +11,4 @@ else
   pkill -f '/opt/trapetum/serve' 2>/dev/null || true
 fi
 rm -rf /opt/trapetum
-echo "Trapetum service removed. Your models in ~/.trapetum were kept."
+echo "Trapetum removed. Your models and settings in ~/.trapetum were kept."
