@@ -889,7 +889,7 @@ struct Config {
     carbon_zone: String,        // country code or Electricity Maps zone (empty = world average)
     license_key: String,        // commercial license key (empty = free/local tier, no activation request)
     activation_consent: bool,   // explicit opt-in to disclosed commercial-license activation
-    auto_update: bool,          // Windows: install the newer build found by the 6-hourly check (other OSes: notice only)
+    auto_update: bool,          // kept for older config files; unused since 0.1.0-beta.3 on Windows (notice only everywhere)
     #[serde(default)]
     settings_rev: u32,          // 0 in files written before 0.1.0-beta.3; see migrate_settings()
 }
@@ -949,6 +949,7 @@ fn update_status() -> String {
 fn build_no() -> u64 {
     option_env!("TRAPETUM_BUILD").and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
+#[allow(dead_code)]   // used by the Windows self-update removed in 0.1.0-beta.3
 fn sha256_file(path: &str) -> String {
     if cfg!(windows) {
         // certutil ships with Windows; line 2 of its output is the hex hash
@@ -970,30 +971,11 @@ fn check_update(auto: bool) {
     if build <= build_no() { return; }                       // already up to date
     let ver = man.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if let Some(m) = UPDATE_STATUS.get() { *m.lock().unwrap() = ver.clone(); }   // notify
-    if !auto || !cfg!(windows) { return; }                   // notify-only otherwise (Linux swaps differently)
-    let url = match man.get("url").and_then(|v| v.as_str()) { Some(u) => u, None => return };
-    let want = man.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-    // PathBuf::join, not format!("{}/..."): the Windows temp dir ends with a backslash, and msiexec
-    // refuses "...\SystemTemp\/trapetum-update-N.msi" (error 1324), so no build before beta.3 could update itself
-    let tmp = std::env::temp_dir().join(format!("trapetum-update-{}.msi", build)).to_string_lossy().into_owned();
-    let dl = std::process::Command::new("curl").args(["-sL", "--max-time", "1800", "-o", &tmp, url])
-        .output().map(|o| o.status.success()).unwrap_or(false);
-    if !dl { return; }
-    if want.is_empty() || sha256_file(&tmp) != want {         // verify integrity before installing
-        let _ = std::fs::remove_file(&tmp);
-        return;
-    }
-    // major upgrade: msiexec stops the old service, swaps files, restarts. It must not be our child:
-    // this server runs inside the "Trapetum" scheduled task, the upgrade stops that task and everything
-    // in it, and an msiexec started here died with it (error 1603, service removed, nothing reinstalled).
-    // A one-shot scheduled task run as SYSTEM lives outside our task, so the install completes.
-    let tr = format!("msiexec /i \"{}\" /qn /norestart", tmp);
-    let made = std::process::Command::new("schtasks")
-        .args(["/Create", "/TN", "TrapetumUpdate", "/TR", &tr, "/SC", "ONCE", "/ST", "00:00", "/RU", "SYSTEM", "/F"])
-        .output().map(|o| o.status.success()).unwrap_or(false);
-    if made {
-        let _ = std::process::Command::new("schtasks").args(["/Run", "/TN", "TrapetumUpdate"]).output();
-    }
+    // Notice only, on every system. Up to 0.1.0-beta.2 the Windows build tried to download and install the
+    // new MSI by itself; that never worked (invalid file path), and once repaired it made Windows Defender
+    // remove the unsigned server (a SYSTEM task starting an installer from a temp folder). The user installs
+    // the new version with the command of the download page.
+    let _ = auto;
 }
 fn spawn_updater() {
     UPDATE_STATUS.get_or_init(|| std::sync::Mutex::new(String::new()));
@@ -1787,7 +1769,7 @@ button{background:var(--rust);color:#fff;border:0;border-radius:10px;padding:11p
   <div class="row"><label>Carbon token (Electricity Maps)</label><input id="carbon_token" placeholder="optional: live intensity for the zone above"/></div>
   <div class="row"><label>Commercial license</label><input id="license_key" placeholder="TRP-XXXX-XXXX-XXXX (leave empty for free / local use)"/></div>
   <div class="row" style="align-items:flex-start"><label>Activation consent</label><div style="flex:1"><input id="activation_consent" type="checkbox"/> <span style="font-size:12px;color:var(--sub)">Commercial licenses only. When checked with a license key set, the server contacts neuralboot once per version to validate the license: it sends the key, the version, the OS and this machine's host name, and our server records your IP address and the time (stored in the EU, kept 24 months, then deleted). Without a license key nothing is sent for activation; the update check and model downloads are described in the <a href="https://trapetum.neuralboot.com/privacy-policy.html" target="_blank" rel="noopener">privacy policy</a>.</span></div></div>
-  <div class="row"><label>Automatic updates</label><input id="auto_update" type="checkbox"/><span style="font-size:12px;color:var(--sub)">Every 6 hours the server asks cdn.neuralboot.com whether a newer build exists (this check always runs). When checked, Windows downloads it, verifies its SHA-256 and installs it; Linux and macOS only show a notice.</span></div>
+  <div class="row"><label>Updates</label><input id="auto_update" type="checkbox" style="display:none"/><span style="font-size:12px;color:var(--sub)">Every 6 hours the server asks cdn.neuralboot.com whether a newer build exists and shows a notice here. It never downloads or installs anything by itself: install a new version with the command of the download page.</span></div>
   <div id="upd-banner" style="display:none;margin:6px 0 0;padding:9px 12px;border:1px solid #2ea043;background:rgba(63,185,80,.1);border-radius:8px;color:#e6edf3;font-size:12.5px"></div>
 
   <div><button id="save">Save settings</button><span id="msg"></span></div>
@@ -1816,7 +1798,7 @@ async function load(){
   $('license_key').value=c.license_key||'';$('activation_consent').checked=!!c.activation_consent;
   $('auto_update').checked=c.auto_update!==false;
   if(c.update_available){var _b=$('upd-banner');_b.style.display='block';
-    _b.textContent='Update available: '+c.update_available+'. '+(c.os==='windows'?(c.auto_update!==false?'Windows installs it automatically in the background.':'Turn on Automatic updates to install it, or download it from trapetum.neuralboot.com.'):'Download the new package from trapetum.neuralboot.com (this system does not update itself).');}
+    _b.textContent='Update available: '+c.update_available+'. '+'Install it with the command of trapetum.neuralboot.com/server.html (the server does not update itself).';}
   loadTokens();
 }
 $('gen').onclick=async()=>{

@@ -83,9 +83,9 @@ $zip = Join-Path $Inst "trapetum-windows-x64.zip"
 Remove-Item $zip -ErrorAction SilentlyContinue
 Compress-Archive -Path "$pkg\*" -DestinationPath $zip -Force
 
-# 7. the auto-update manifest. Publishing latest.json makes every installed Windows build with
-#    automatic updates download and install this MSI: upload the MSI first, test the upgrade
-#    (previous build to this one, as SYSTEM), and only then publish latest.json.
+# 7. the update manifest. install.ps1 installs the MSI named in latest.json, and installed builds show a
+#    notice when its build number is above theirs (they never install by themselves): upload the MSI
+#    first, test the upgrade from the previous build, and only then publish latest.json.
 $sha = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLower()
 $manifest = Join-Path $Inst "latest.json"
 [ordered]@{
@@ -102,5 +102,5 @@ Write-Host "  $msi"
 Write-Host "  $zip"
 Write-Host "  $manifest"
 Write-Host "`nPublish: upload the .msi to $MsiUrl, test the upgrade, then latest.json to"
-Write-Host "  https://cdn.neuralboot.com/dist/latest.json  (installed apps with automatic updates poll it every 6 h)."
+Write-Host "  https://cdn.neuralboot.com/dist/latest.json  (install.ps1 reads it; installed apps read it every 6 h and show a notice)."
 if (-not $Sign) { Write-Warning "UNSIGNED build. Pass -Sign once a code-signing cert is configured (see CODE-SIGNING.md)." }

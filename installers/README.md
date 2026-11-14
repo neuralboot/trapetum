@@ -60,9 +60,11 @@ scheduled task `Trapetum` that runs as SYSTEM at startup. The portable zip uses
 (`irm get.neuralboot.com/install.ps1 | iex`) installs the MSI named in `latest.json` after
 checking its SHA-256.
 
-With automatic updates on (the default), an installed Windows build downloads the MSI named in
-`latest.json`, checks its SHA-256 and installs it silently. Publish in this order: upload the new
-MSI, test the upgrade from the previous build as SYSTEM, then publish `latest.json`.
+From 0.1.0-beta.3 on, an installed build never installs anything by itself, on any system: every
+6 hours it reads `latest.json` and shows a notice when a newer build exists. (The 0.1.0-beta.1
+Windows build tried to install the MSI named there; it could not, because of an invalid file path.)
+Publish in this order: upload the new MSI, test the upgrade from the previous build with
+`install.ps1`, then publish `latest.json`, which `install.ps1` and the notice both read.
 
 ## Optional: live carbon data
 Set the grid zone (a country code such as `FR`, or an Electricity Maps zone such as
