@@ -136,7 +136,7 @@ bandwidth-limited cards, 2.34x on an A40 and up to 2.2x on consumer GPUs, parity
 | A100 / A40 / L40 | `sm_80` / `sm_86` / `sm_89` | 3.6-3.7x disk / 2.9x VRAM | largest, 2.34x on A40 |
 | H100 PCIe (H200 untested) | `sm_90` | 3.6-3.7x disk / 2.9x VRAM | parity (fp16 already near roofline) |
 | Turing and older (GTX 16, RTX 20, V100) | `sm_70` / `sm_75` | 3.6-3.7x disk / 2.9x VRAM | untested, rebuild needed |
-| Apple Silicon (M1 to M4; measured on an M4) | Metal | same 4-bit file, in unified memory | supported for 4-bit; the 2-bit path and the November 2026 kernels are CUDA only |
+| Apple Silicon (M1 or later; measured on an M4) | Metal | same 4-bit file, in unified memory | supported for 4-bit; the 2-bit path and the November 2026 kernels are CUDA only |
 | AMD GPUs, CPU-only machines | - | - | not supported (an NVIDIA or Apple GPU is required) |
 
 Memory, labeled (both hold, they measure different things): **3.6x to 3.7x smaller on disk**
@@ -454,7 +454,7 @@ kept in fp16), not from that file. Measured from the files on 5 November 2026 on
   shared memory per block), and the runtime refuses such a layer at load time on Turing and
   Pascal GPUs (verified by reading the code; no Turing GPU was available to test).
 - The desktop app's model registry is not updated: its downloadable models keep the old
-  format and the old recipe, because installed apps (the 0.1.0 betas, beta.1 and beta.2)
+  format and the old recipe, because installed apps (the 0.1.0 betas, beta.1 to beta.3)
   cannot read the new files. A runtime release has to come before any new registry entries.
 - `model/llama_quant.py` no longer reproduces the research script's 6.34: since commit
   c9d8b72 (2026-06-28) it starts its centroids from a min-to-max grid and gives 6.41.
