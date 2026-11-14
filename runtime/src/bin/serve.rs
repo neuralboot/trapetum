@@ -970,7 +970,9 @@ fn check_update(auto: bool) {
     if !auto || !cfg!(windows) { return; }                   // notify-only otherwise (Linux swaps differently)
     let url = match man.get("url").and_then(|v| v.as_str()) { Some(u) => u, None => return };
     let want = man.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-    let tmp = format!("{}/trapetum-update-{}.msi", std::env::temp_dir().display(), build);
+    // PathBuf::join, not format!("{}/..."): the Windows temp dir ends with a backslash, and msiexec
+    // refuses "...\SystemTemp\/trapetum-update-N.msi" (error 1324), so no build before beta.3 could update itself
+    let tmp = std::env::temp_dir().join(format!("trapetum-update-{}.msi", build)).to_string_lossy().into_owned();
     let dl = std::process::Command::new("curl").args(["-sL", "--max-time", "1800", "-o", &tmp, url])
         .output().map(|o| o.status.success()).unwrap_or(false);
     if !dl { return; }
