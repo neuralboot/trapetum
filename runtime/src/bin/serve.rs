@@ -890,6 +890,8 @@ struct Config {
     license_key: String,        // commercial license key (empty = free/local tier, no activation request)
     activation_consent: bool,   // explicit opt-in to disclosed commercial-license activation
     auto_update: bool,          // Windows: install the newer build found by the 6-hourly check (other OSes: notice only)
+    #[serde(default)]
+    settings_rev: u32,          // 0 in files written before 0.1.0-beta.3; see migrate_settings()
 }
 impl Default for Config {
     fn default() -> Self {
@@ -908,6 +910,7 @@ impl Default for Config {
             license_key: String::new(),
             activation_consent: false,
             auto_update: true,
+            settings_rev: SETTINGS_REV,
         }
     }
 }
@@ -1008,6 +1011,21 @@ fn cfg() -> Config {
 }
 fn config_path(root: &str) -> String {
     format!("{}/config.toml", root)
+}
+// One-time tightening for installs made before 0.1.0-beta.3, whose installer wrote cors_origins = "*"
+// (any website could call /v1 from the browser) and log_prompts = true. Values the owner sets afterwards
+// are kept: the revision number stops this from running twice.
+const SETTINGS_REV: u32 = 3;
+fn migrate_settings(c: &mut Config) -> bool {
+    if c.settings_rev >= SETTINGS_REV {
+        return false;
+    }
+    if c.cors_origins.trim() == "*" {
+        c.cors_origins = String::new();
+    }
+    c.log_prompts = false;
+    c.settings_rev = SETTINGS_REV;
+    true
 }
 fn load_config(root: &str) -> Config {
     std::fs::read_to_string(config_path(root)).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default()
@@ -1196,6 +1214,9 @@ fn main() {
     }
     let root = a[1].clone();
     let mut cfg0 = load_config(&root);
+    if std::path::Path::new(&config_path(&root)).exists() && migrate_settings(&mut cfg0) {
+        save_config(&root, &cfg0);
+    }
     // first run: seed the listen port from the CLI arg, then persist config.toml
     if !std::path::Path::new(&config_path(&root)).exists() {
         if let Some(p) = a.get(2).and_then(|s| s.parse::<u16>().ok()) {
@@ -2112,10 +2133,26 @@ mod beta3_tests {
     use super::*;
 
     #[test]
+    fn old_installer_settings_are_tightened_once() {
+        let mut c: Config = toml::from_str("port = 8088\ncors_origins = \"*\"\nlog_prompts = true\n").unwrap();
+        assert_eq!(c.settings_rev, 0);
+        assert!(migrate_settings(&mut c));
+        assert!(c.cors_origins.is_empty() && !c.log_prompts && c.settings_rev == SETTINGS_REV);
+        // a named origin is the owner's choice and stays; later choices are never touched again
+        let mut d: Config = toml::from_str("cors_origins = \"https://app.example.com\"\n").unwrap();
+        migrate_settings(&mut d);
+        assert_eq!(d.cors_origins, "https://app.example.com");
+        d.cors_origins = "*".into(); d.log_prompts = true;
+        assert!(!migrate_settings(&mut d));
+        assert!(d.cors_origins == "*" && d.log_prompts);
+    }
+
+    #[test]
     fn defaults_keep_prompts_and_api_private() {
         let c = Config::default();
         assert!(c.cors_origins.is_empty(), "no cross-origin access by default");
         assert!(!c.log_prompts, "prompts are not logged by default");
+        assert_eq!(c.settings_rev, SETTINGS_REV);
         // with the default (empty) setting, no response carries a CORS header
         let r = json_resp("{}".into());
         assert!(!r.headers().iter().any(|h| h.field.equiv("Access-Control-Allow-Origin")));
