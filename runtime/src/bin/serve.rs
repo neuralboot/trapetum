@@ -980,9 +980,17 @@ fn check_update(auto: bool) {
         let _ = std::fs::remove_file(&tmp);
         return;
     }
-    // major upgrade: msiexec stops the old service, swaps files, restarts. Detached so our
-    // own process being killed mid-swap does not abort the install.
-    let _ = std::process::Command::new("msiexec").args(["/i", &tmp, "/qn", "/norestart"]).spawn();
+    // major upgrade: msiexec stops the old service, swaps files, restarts. It must not be our child:
+    // this server runs inside the "Trapetum" scheduled task, the upgrade stops that task and everything
+    // in it, and an msiexec started here died with it (error 1603, service removed, nothing reinstalled).
+    // A one-shot scheduled task run as SYSTEM lives outside our task, so the install completes.
+    let tr = format!("msiexec /i \"{}\" /qn /norestart", tmp);
+    let made = std::process::Command::new("schtasks")
+        .args(["/Create", "/TN", "TrapetumUpdate", "/TR", &tr, "/SC", "ONCE", "/ST", "00:00", "/RU", "SYSTEM", "/F"])
+        .output().map(|o| o.status.success()).unwrap_or(false);
+    if made {
+        let _ = std::process::Command::new("schtasks").args(["/Run", "/TN", "TrapetumUpdate"]).output();
+    }
 }
 fn spawn_updater() {
     UPDATE_STATUS.get_or_init(|| std::sync::Mutex::new(String::new()));
