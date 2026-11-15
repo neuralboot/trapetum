@@ -457,7 +457,7 @@ kept in fp16), not from that file. Measured from the files on 5 November 2026 on
   format and the old recipe, because installed apps (the 0.1.0 betas, beta.1 to beta.3)
   cannot read the new files. A runtime release has to come before any new registry entries.
 - `model/llama_quant.py` no longer reproduces the research script's 6.34: since commit
-  c9d8b72 (2026-06-28) it starts its centroids from a min-to-max grid and gives 6.41.
+  c9d8b72 it starts its centroids from a min-to-max grid and gives 6.41.
 
 Reproduce (Llama-2-7B is the default `--model`):
 

@@ -27,11 +27,11 @@ warn: instead of the one inferred from the default host triple.
 info: profile set to minimal
 info: default host triple is x86_64-unknown-linux-gnu
 info: syncing channel updates for stable-x86_64-unknown-linux-gnu
-info: latest update on 2026-07-09 for version 1.97.0 (2d8144b78 2026-07-07)
+info: latest update for version 1.97.0 (2d8144b78)
 info: downloading 3 components
 info: default toolchain set to stable-x86_64-unknown-linux-gnu
 
-  stable-x86_64-unknown-linux-gnu installed - rustc 1.97.0 (2d8144b78 2026-07-07)
+  stable-x86_64-unknown-linux-gnu installed - rustc 1.97.0 (2d8144b78)
 
 
 Rust is installed now. Great!

@@ -7,7 +7,6 @@ authors:
 repository-code: "https://github.com/neuralboot/trapetum"
 license: BUSL-1.1
 version: "0.1.0"
-date-released: "2026-06-25"
 keywords:
   - CUDA
   - GPU kernels
