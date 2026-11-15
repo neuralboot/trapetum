@@ -1,6 +1,6 @@
 # CPU probes: the K=16 codebook is CPU-native (tbl/pshufb isomorphism)
 
-Measured on Apple M4 (10 cores 4P+6E, ~120 GB/s, 32 GB), 2026-07-11.
+Measured on Apple M4 (10 cores 4P+6E, ~120 GB/s, 32 GB).
 Build all: `clang -O3 -march=armv8.4-a+dotprod -o <name> <name>.c -lpthread -lm`
 
 | Probe | What it measures | Result (best clean window) |

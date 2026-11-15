@@ -148,7 +148,7 @@ is necessary but not sufficient; the expert-to-GPU transfer is the next wall. Ra
 runpod_logs/r1_671b_4bit_ram_resident.log. Caveat: A10G is a weak GPU; a 4090/A100 host
 with RAM residency would be somewhat faster, but the host->device transfer wall stands.
 
-## CPU probes S12/S13-M/S15: the inversion is measured (M4, 2026-07-11)
+## CPU probes S12/S13-M/S15: the inversion is measured (M4)
 
 The K=16 codebook decode is one NEON `tbl` (x86: `pshufb`) per 32 weights, so a
 CPU expert path is memory-bound, never decode-bound. Three probes, see
@@ -174,7 +174,7 @@ concurrently -> t_token ~ t_routed + eps. Projections (50% derate): desktop
 DDR5 ~8-10 tok/s, EPYC 12ch ~22, M3 Ultra 512GB ~15-25 end-to-end lossless.
 Next: S14 = hybrid path in the Rust runtime on V2-Lite (tok/s + greedy match).
 
-## S14: hybrid CPU-experts path, measured end-to-end on real V2-Lite (pod 4090 + 128 vCPU, 2026-07-11)
+## S14: hybrid CPU-experts path, measured end-to-end on real V2-Lite (pod 4090 + 128 vCPU)
 
 Branch s14-cpu-experts, 8 increments. TRAPETUM_CPU_EXPERTS=1 keeps routed expert
 weights host-side (never uploaded to VRAM) and executes them on CPU via a
@@ -209,7 +209,7 @@ row-major work-stealing engine; attention/router/shared/dense stay on GPU.
   volume not the 30GB container disk, pkill -f self-matches your own ssh
   command line.
 
-## The Paris bug: found, fixed, validated (2026-07-11, branch det-kernel-pool)
+## The Paris bug: found, fixed, validated (branch det-kernel-pool)
 
 Layer-bisect campaign (deliverables 4-6) on real V2-Lite, judged against HF with
 IDENTICAL dequantized 4-bit weights:
@@ -233,7 +233,7 @@ IDENTICAL dequantized 4-bit weights:
   15 worst tensors are SHARED experts -> cheap mixed-precision policy: shared
   experts + lm_head at 6-8 bit (52 tensors, negligible size, every token path).
 
-## 671B inversion, first real measure (AWS g6e.16xlarge, 2026-07-12): NEGATIVE, levers identified
+## 671B inversion, first real measure (AWS g6e.16xlarge): NEGATIVE, levers identified
 
 Setup: 64 vCPU Xeon, 497 GB RAM, L40S 48 GB, artifact RAM-resident (336 GB page
 cache verified), branch s19-mixed-precision (deliverable A CPU-experts path).
@@ -255,7 +255,7 @@ cache verified), branch s19-mixed-precision (deliverable A CPU-experts path).
 - Cost of the session: ~12 USD. Also noted: prompt.bin had a double BOS
   (tokenizer auto-adds id 0); fix the generator next run.
 
-## 671B v3 rerun with deliverable B (AWS g6e.16xlarge, 2026-07-12): 0.44 tok/s, gather is the wall
+## 671B v3 rerun with deliverable B (AWS g6e.16xlarge): 0.44 tok/s, gather is the wall
 
 - HYBRID AVX: 2271 ms/token (0.44 tok/s), thread-insensitive (32/48/60 identical).
 - Scalar A/B: 2500 ms/token: the AVX gather kernel buys only 8%.
@@ -280,7 +280,7 @@ cache verified), branch s19-mixed-precision (deliverable A CPU-experts path).
   the determinism campaign). Build both behind flags, measure, pick.
 - Session cost ~9 USD. All boxes terminated.
 
-## 671B session 3 (2026-07-12): the THIRD wall is MLA attention + both prior levers exonerated
+## 671B session 3: the THIRD wall is MLA attention + both prior levers exonerated
 
 Deliverable C fully measured (engagement + lut8), and the floor did not move:
 - Engagement A/B: futex 2316 ms/token vs spin 2201 (5%); ENGAGE_DEBUG proves
@@ -305,7 +305,7 @@ Deliverable C fully measured (engagement + lut8), and the floor did not move:
 - Session ~2h ~15 USD. Boxes terminated. Cumulative finding chain:
   disk -> RAM -> faults -> grain -> gather -> engagement -> MLA serial path.
 
-## 671B sessions 4+4b (2026-07-12): MLA fix pays x2.2 -> 0.96 tok/s; the per-core atom; F2 lesson
+## 671B sessions 4+4b: MLA fix pays x2.2 -> 0.96 tok/s; the per-core atom; F2 lesson
 
 - MLA host-absorption fix (deliverable E): attention 900 -> 290 ms/token; TOTAL
   2271 -> 1046 ms/token = 0.96 tok/s. First time under 1.1 s.
@@ -336,7 +336,7 @@ Deliverable C fully measured (engagement + lut8), and the floor did not move:
   (~2-2.5 tok/s) on this box class.
 - Session ~1.5 h ~11 USD. Program totals: ~55 USD AWS + 4 RunPod.
 
-## 671B session 5 (2026-07-12): the transpose lands -- 1.31 tok/s (x5.5 from 0.24)
+## 671B session 5: the transpose lands -- 1.31 tok/s (x5.5 from 0.24)
 
 - lut8 16x16 in-register transpose (lever #1): per-core decode atom 0.66 ->
   3.3 GB/s (x5), gate bit-exact on AVX2. But total was masked until:
@@ -361,7 +361,7 @@ Deliverable C fully measured (engagement + lut8), and the floor did not move:
   runs the full 671B at 1.31 tok/s lossless-4bit on ONE 64-vCPU box, no
   datacenter -- interactive-adjacent, x5.5 the disk-offload baseline.
 
-## 671B session G (2026-07-12): the 386ms MoE gap SPLIT -- it is ws_entry (per-call overhead), NOT the shared expert
+## 671B session G: the 386ms MoE gap SPLIT -- it is ws_entry (per-call overhead), NOT the shared expert
 
 Whole-forward instrumentation (G-inc1) at steady state (pos 17-18):
 - moe wall ~455 ms = phases(A98+RA10+C41+RC28 ~177) + ws_entry(~213) + xcopy(1.4)
@@ -382,7 +382,7 @@ Whole-forward instrumentation (G-inc1) at steady state (pos 17-18):
   tok/s. Both are orchestration/overhead, not physics: reachable.
 - Session ~1h ~8 USD. Program: ~71 USD AWS + 4 RunPod.
 
-## 671B session G2 (2026-07-12): ws_entry sub-split -- barriers NOT the wall, "setup" is ~182ms
+## 671B session G2: ws_entry sub-split -- barriers NOT the wall, "setup" is ~182ms
 
 - Persistent lut8 scratch (G-inc2) barely moved ws_entry: 213 -> 204 ms. So the
   per-call malloc theory was mostly wrong for lut8 (or the alloc wasn't the
@@ -401,7 +401,7 @@ Whole-forward instrumentation (G-inc1) at steady state (pos 17-18):
   per-layer. If setup 190->40 and attention later ->80: token ~450 = ~2.2 tok/s.
 - Session ~1h ~8 USD. Program: ~79 USD AWS + 4 RunPod. Milestone: 1.35 tok/s.
 
-## 671B session G3 (2026-07-12): prewarm confirmed -- 1.67 tok/s; attention is now the wall (49%)
+## 671B session G3: prewarm confirmed -- 1.67 tok/s; attention is now the wall (49%)
 
 - Prewarm-at-first-forward (G-inc3): recode 185 -> 0.3 ms CONFIRMED (the cold
   cache was exactly the 190ms "setup" wall; pos=15 was never steady-state).
@@ -422,7 +422,7 @@ Whole-forward instrumentation (G-inc1) at steady state (pos 17-18):
 - Session ~1h ~8 USD. Program: ~87 USD AWS + 4 RunPod. Milestone: 1.67 tok/s,
   full 671B lossless-4bit, ONE 64-vCPU box.
 
-## 671B session H (2026-07-12): attention on GPU -- 2.46 tok/s, TARGET HIT, x10 from baseline
+## 671B session H: attention on GPU -- 2.46 tok/s, TARGET HIT, x10 from baseline
 
 - GATE: mla_block_math_correct green (device MLA absorption numerically correct).
 - H-HOST control (PREP-fix only, absorption still on host): 542 ms = 1.84 tok/s
@@ -444,7 +444,7 @@ Whole-forward instrumentation (G-inc1) at steady state (pos 17-18):
   -> scratch-memset -> attention-on-host. Eleven diagnoses, ~$95 total.
 - Session ~1h ~8 USD. Program total: ~95 USD AWS + 4 RunPod.
 
-## S19 validation gates (2026-07-13): 3 of 4 pass; Paris-rank-1 is NEGATIVE (honest)
+## S19 validation gates: 3 of 4 pass; Paris-rank-1 is NEGATIVE (honest)
 
 - GATE 1 gemv8 K256 decode correctness: PASS (bit-exact, deterministic).
 - GATE 1b k256_reconstruction_beats_k16: PASS.
